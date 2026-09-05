@@ -53,8 +53,16 @@ try{
     else await api('POST','/api/tasks',t);
   }
   const tasks=(await api('GET','/api/tasks')).tasks||[];
-  const runnable=tasks.filter(t=>due(t));
-  console.log(`Due tasks: ${runnable.length}/${tasks.length}`);
+  const forceManual=process.env.GITHUB_EVENT_NAME==='workflow_dispatch';
+
+  const runnable=forceManual
+    ? tasks.filter(t=>t.enabled)
+    : tasks.filter(t=>due(t));
+  if(forceManual){
+    console.log(`Manual workflow dispatch: forcing ${runnable.length}/${tasks.length} active tasks.`);
+  }else{
+    console.log(`Due tasks: ${runnable.length}/${tasks.length}`);
+  }
   for(const task of runnable){
     console.log(`\n=== RUN ${task.task_name} ===`);
     const q=await api('POST',`/api/tasks/${task.id}/run`,{});
