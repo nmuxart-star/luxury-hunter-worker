@@ -27,7 +27,7 @@ jobs:
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       XIANYU_BASE_URL: http://127.0.0.1:8000
-      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '1' }}
+      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '2' }}
       BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
       PORT: '8200'
