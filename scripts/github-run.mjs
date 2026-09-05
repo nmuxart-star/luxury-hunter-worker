@@ -52,6 +52,13 @@ try{
     if(old) await api('PATCH',`/api/tasks/${old.id}`,t);
     else await api('POST','/api/tasks',t);
   }
+  const configuredNames=new Set((cfg.tasks||[]).map(t=>t.task_name));
+  for(const old of existing){
+    if(!configuredNames.has(old.task_name) && old.enabled){
+      await api('PATCH',`/api/tasks/${old.id}`,{...old,enabled:false});
+      console.log(`Disabled stale cloud task: ${old.task_name}`);
+    }
+  }
   const tasks=(await api('GET','/api/tasks')).tasks||[];
   const forceManual=process.env.GITHUB_EVENT_NAME==='workflow_dispatch';
 
@@ -63,11 +70,39 @@ try{
   }else{
     console.log(`Due tasks: ${runnable.length}/${tasks.length}`);
   }
+  const taskResults=[];
   for(const task of runnable){
     console.log(`\n=== RUN ${task.task_name} ===`);
-    const q=await api('POST',`/api/tasks/${task.id}/run`,{});
-    const run=await waitRun(q.runId);
-    console.log(`DONE ${task.task_name}: ${run.status}`);
+    try{
+      const q=await api('POST',`/api/tasks/${task.id}/run`,{});
+      const run=await waitRun(q.runId);
+      taskResults.push({task_id:task.id,task_name:task.task_name,status:run.status,run_id:q.runId});
+      console.log(`DONE ${task.task_name}: ${run.status}`);
+    }catch(e){
+      taskResults.push({task_id:task.id,task_name:task.task_name,status:'error',error:e?.message||String(e)});
+      console.error(`FAILED ${task.task_name}:`,e?.message||e);
+    }
+  }
+
+  const globalEmail=cfg.global_email||{};
+  try{
+    const digest=await api('POST','/api/email/global-digest',{
+      to:globalEmail.to||null,
+      force:false,
+      config:globalEmail
+    });
+    if(digest.sent){
+      console.log(`Global 3h digest sent: ${digest.subject}; opportunities=${digest.opportunities??0}`);
+    }else{
+      console.log(`Global digest not sent: ${digest.reason||'unknown'}${digest.minutes_until_due!=null?`; due in ~${digest.minutes_until_due} min`:''}`);
+    }
+  }catch(e){
+    code=1;
+    console.error('Global digest failed:',e?.stack||e);
+  }
+
+  if(taskResults.some(x=>x.status==='error')){
+    console.warn('One or more tasks failed, but the worker continues so state and the 3h digest cadence are preserved.');
   }
 }catch(e){
   code=1; console.error(e?.stack||e);
