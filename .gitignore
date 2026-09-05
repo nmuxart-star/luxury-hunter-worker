@@ -1,0 +1,9 @@
+.env
+node_modules/
+data/
+.state/
+.xianyu/
+cloud/config.json
+cloud/*.tmp
+*.log
+.DS_Store

@@ -1,0 +1,23 @@
+{
+  "name": "luxury-hunter-v1",
+  "version": "1.5.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node scripts/check.mjs",
+    "background:install": "bash scripts/install-background.sh",
+    "background:status": "bash scripts/status-background.sh",
+    "background:uninstall": "bash scripts/uninstall-background.sh",
+    "browsers:install": "npx playwright install chromium",
+    "cloud:export": "node scripts/export-cloud-config.mjs",
+    "cloud:run": "node scripts/github-run.mjs",
+    "cloud:encrypt-xianyu": "bash scripts/encrypt-xianyu-state.sh",
+    "cloud:encrypt-config": "bash scripts/encrypt-cloud-config.sh"
+  },
+  "dependencies": {
+    "bunjang-cli": "0.2.1",
+    "cheerio": "1.0.0",
+    "nodemailer": "^6.9.16"
+  }
+}

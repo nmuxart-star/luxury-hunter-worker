@@ -1,0 +1,130 @@
+name: Luxury Hunter 3h
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */3 * * *'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: luxury-hunter-scheduled
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.6-flash' }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_SECURE: ${{ secrets.SMTP_SECURE }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      XIANYU_BASE_URL: http://127.0.0.1:8000
+      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '1' }}
+      BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
+      BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
+      PORT: '8200'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decrypt Luxury Hunter cloud configuration
+        env:
+          LUXURY_CONFIG_PASSWORD: ${{ secrets.LUXURY_CONFIG_PASSWORD }}
+        shell: bash
+        run: |
+          if [ ! -f cloud/config.enc ]; then
+            echo "Missing cloud/config.enc" >&2
+            exit 1
+          fi
+          if [ -z "${LUXURY_CONFIG_PASSWORD:-}" ]; then
+            echo "Missing GitHub secret LUXURY_CONFIG_PASSWORD" >&2
+            exit 1
+          fi
+          openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/config.enc -out cloud/config.json -pass env:LUXURY_CONFIG_PASSWORD
+
+      - name: Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Restore previous Luxury Hunter state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p .state data
+          PREV_RUN="$(gh run list --workflow luxury-hunter.yml --status success --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)"
+          if [ -n "$PREV_RUN" ]; then
+            echo "Restoring state from run $PREV_RUN"
+            gh run download "$PREV_RUN" -n luxury-hunter-state -D .state || true
+          fi
+          if [ -f .state/luxury-hunter.sqlite3 ]; then
+            cp .state/luxury-hunter.sqlite3 data/luxury-hunter.sqlite3
+          fi
+
+      - name: Install Luxury Hunter dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium for Bunjang
+        run: npx playwright install --with-deps chromium
+
+      - name: Start Xianyu connector when encrypted state is configured
+        env:
+          XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
+        shell: bash
+        run: |
+          if [ ! -f cloud/xianyu-state.enc ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
+            echo "Xianyu cloud state not configured; Xianyu connector will be unavailable in this run."
+            exit 0
+          fi
+          git clone --depth 1 https://github.com/wangdaguo/ai-goofish-monitor.git .xianyu
+          cd .xianyu
+          mkdir -p state data logs images jsonl price_history
+          openssl enc -d -aes-256-cbc -pbkdf2 -in ../cloud/xianyu-state.enc -out state/Nil.json -pass env:XIANYU_STATE_PASSWORD
+          cp .env.example .env
+          # Luxury Hunter uses Xianyu only as a crawler here; central AI remains in Luxury Hunter.
+          docker pull ghcr.io/usagi-org/ai-goofish:latest
+          docker run -d --name luxury-hunter-xianyu --init -p 8000:8000 \
+            --env-file .env \
+            -e APP_DATABASE_FILE=/app/data/app.sqlite3 \
+            -v "$PWD/.env:/app/.env" \
+            -v "$PWD/data:/app/data" \
+            -v "$PWD/state:/app/state" \
+            -v "$PWD/config.json:/app/config.json" \
+            -v "$PWD/prompts:/app/prompts" \
+            -v "$PWD/jsonl:/app/jsonl" \
+            -v "$PWD/logs:/app/logs" \
+            -v "$PWD/images:/app/images" \
+            -v "$PWD/price_history:/app/price_history" \
+            ghcr.io/usagi-org/ai-goofish:latest
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then echo "Xianyu ready"; exit 0; fi
+            sleep 2
+          done
+          echo "Xianyu did not become ready. Continuing with other sources."
+          docker logs luxury-hunter-xianyu --tail 80 || true
+
+      - name: Run due tasks sequentially
+        run: node scripts/github-run.mjs
+
+      - name: Save persistent state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxury-hunter-state
+          path: data/luxury-hunter.sqlite3
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9
+
+      - name: Xianyu logs on failure
+        if: failure()
+        run: docker logs luxury-hunter-xianyu --tail 120 || true
