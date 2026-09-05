@@ -1116,22 +1116,254 @@ function qualifiesForEmail(task,item){
 }
 async function sendTaskDigest(task,runId,sessionId,items,sourceStatus){
   if(!task.email_enabled) return {sent:false,reason:'disabled'};
-  const c=smtpConfig(); if(!c.configured) return {sent:false,reason:'smtp-not-configured'};
-  let selected=items.filter(x=>qualifiesForEmail(task,x));
-  selected.sort((a,b)=>Number(b.opportunity_score||0)-Number(a.opportunity_score||0)||Number(b.net_profit_low_eur||-1)-Number(a.net_profit_low_eur||-1));
-  selected=selected.slice(0,task.notify_max_items||8);
-  if(!selected.length) return {sent:false,reason:'no-new-opportunities'};
-  const rows=selected.map(x=>`<tr><td style="padding:12px;border-bottom:1px solid #e5e7eb"><b>${htmlEsc(x.brand||'')} ${htmlEsc(x.model||x.title||'')}</b><br><span style="color:#6b7280">${htmlEsc(x.source)} · producto ${moneyEmail(x.price_eur)} · importado ${moneyEmail(x.import_costs?.importedTotalEur)}</span></td><td style="padding:12px;border-bottom:1px solid #e5e7eb"><b>${htmlEsc(x.decision||'MATCH')}</b><br>Score ${htmlEsc(x.opportunity_score??'—')}</td><td style="padding:12px;border-bottom:1px solid #e5e7eb">${moneyEmail(x.net_profit_low_eur)} – ${moneyEmail(x.net_profit_high_eur)}</td><td style="padding:12px;border-bottom:1px solid #e5e7eb"><a href="${htmlEsc(x.url||'#')}">Abrir anuncio</a></td></tr>`).join('');
-  const okSources=Object.entries(sourceStatus||{}).filter(([,v])=>v?.ok!==false).map(([k])=>k).join(', ')||'—';
-  const subject=`Luxury Hunter: ${selected.length} oportunidad${selected.length===1?'':'es'} · ${task.task_name}`;
-  const html=`<div style="font-family:Arial,sans-serif;color:#111827;max-width:860px;margin:auto"><h2>${htmlEsc(task.task_name)}</h2><p>Luxury Hunter ha terminado una búsqueda automática y ha encontrado <b>${selected.length}</b> anuncio${selected.length===1?'':'s'} que cumplen tus criterios de alerta.</p><p style="color:#6b7280">Producto: ${htmlEsc(task.product_query)} · Fuentes: ${htmlEsc(okSources)}</p><table style="width:100%;border-collapse:collapse"><thead><tr><th align="left" style="padding:10px;background:#f3f4f6">Producto</th><th align="left" style="padding:10px;background:#f3f4f6">Decisión</th><th align="left" style="padding:10px;background:#f3f4f6">Beneficio neto est.</th><th align="left" style="padding:10px;background:#f3f4f6">Link</th></tr></thead><tbody>${rows}</tbody></table><p style="margin-top:18px;color:#6b7280;font-size:12px">Autenticidad y beneficio son estimaciones de análisis; revisa el anuncio y la autenticación antes de comprar.</p></div>`;
+
+  const c=smtpConfig();
+  if(!c.configured) return {sent:false,reason:'smtp-not-configured'};
+
+  const allItems=[...(items||[])];
+
+  allItems.sort((a,b)=>
+    Number(b.opportunity_score||0)-Number(a.opportunity_score||0) ||
+    Number(b.net_profit_low_eur||-1)-Number(a.net_profit_low_eur||-1)
+  );
+
+  // Mantener aparte las oportunidades que cumplen los criterios de alerta.
+  // Solo estas se registran en notifications para no romper "solo nuevos".
+  let alertSelected=allItems.filter(x=>qualifiesForEmail(task,x));
+  alertSelected=alertSelected.slice(0,task.notify_max_items||8);
+
+  const decisionCounts={
+    'STRONG BUY':0,
+    'BUY':0,
+    'WATCH':0,
+    'REJECT':0
+  };
+
+  const sourceCounts={};
+
+  for(const x of allItems){
+    const decision=String(x.decision||'').toUpperCase();
+    if(decisionCounts[decision]!==undefined) decisionCounts[decision]++;
+
+    const source=String(x.source||'unknown');
+    sourceCounts[source]=(sourceCounts[source]||0)+1;
+  }
+
+  function reasonsForEmail(x){
+    let reasons=
+      x.reject_reasons ??
+      x.reasons ??
+      x.analysis?.reject_reasons ??
+      x.analysis?.reasons ??
+      [];
+
+    if(!Array.isArray(reasons)) reasons=[];
+
+    if(!reasons.length && x.notes){
+      reasons=[String(x.notes)];
+    }
+
+    return reasons
+      .filter(Boolean)
+      .slice(0,4)
+      .map(r=>`<li>${htmlEsc(r)}</li>`)
+      .join('');
+  }
+
+  const rows=allItems.length
+    ? allItems.map((x,index)=>{
+        const reasons=reasonsForEmail(x);
+        const imported=
+          x.import_costs?.importedTotalEur ??
+          x.landed_cost_eur ??
+          null;
+
+        const resaleLow=x.resale_low_eur;
+        const resaleHigh=x.resale_high_eur;
+
+        return `
+          <tr>
+            <td style="padding:14px;border-bottom:1px solid #e5e7eb;vertical-align:top">
+              <b>${index+1}. ${htmlEsc(x.brand||'')} ${htmlEsc(x.model||x.title||'')}</b>
+              <br>
+              <span style="color:#6b7280">
+                ${htmlEsc(x.source||'—')} · producto ${moneyEmail(x.price_eur)} · importado ${moneyEmail(imported)}
+              </span>
+              ${reasons ? `<ul style="margin:8px 0 0 18px;padding:0;color:#4b5563">${reasons}</ul>` : ''}
+            </td>
+
+            <td style="padding:14px;border-bottom:1px solid #e5e7eb;vertical-align:top">
+              <b>${htmlEsc(x.decision||'MATCH')}</b>
+              <br>Score ${htmlEsc(x.opportunity_score??'—')}
+              <br><span style="color:#6b7280">Auth: ${htmlEsc(x.authenticity_risk||'—')}</span>
+              <br><span style="color:#6b7280">Liquidez: ${htmlEsc(x.liquidity||'—')}</span>
+            </td>
+
+            <td style="padding:14px;border-bottom:1px solid #e5e7eb;vertical-align:top">
+              Reventa: ${moneyEmail(resaleLow)} – ${moneyEmail(resaleHigh)}
+              <br>
+              <b>Beneficio: ${moneyEmail(x.net_profit_low_eur)} – ${moneyEmail(x.net_profit_high_eur)}</b>
+            </td>
+
+            <td style="padding:14px;border-bottom:1px solid #e5e7eb;vertical-align:top">
+              <a href="${htmlEsc(x.url||'#')}">Abrir anuncio</a>
+            </td>
+          </tr>
+        `;
+      }).join('')
+    : `
+      <tr>
+        <td colspan="4" style="padding:18px;text-align:center;color:#6b7280">
+          No se encontraron productos en esta ejecución.
+        </td>
+      </tr>
+    `;
+
+  const sourceKeys=[
+    ...new Set([
+      ...Object.keys(sourceStatus||{}),
+      ...Object.keys(sourceCounts)
+    ])
+  ];
+
+  const sourceRows=sourceKeys.length
+    ? sourceKeys.map(source=>{
+        const status=(sourceStatus||{})[source]||{};
+        const ok=status?.ok!==false;
+
+        const message=
+          status?.warning ||
+          status?.error ||
+          status?.message ||
+          '';
+
+        return `
+          <tr>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb">
+              <b>${htmlEsc(source)}</b>
+            </td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb">
+              ${sourceCounts[source]||0} productos
+            </td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb">
+              ${ok?'✅ OK':'⚠️ Error'}
+              ${message?`<br><span style="color:#6b7280">${htmlEsc(message)}</span>`:''}
+            </td>
+          </tr>
+        `;
+      }).join('')
+    : `
+      <tr>
+        <td colspan="3" style="padding:8px;color:#6b7280">Sin datos de fuentes.</td>
+      </tr>
+    `;
+
+  const subject=
+    `Luxury Hunter · ${task.task_name} · ${allItems.length} productos · ` +
+    `${decisionCounts['STRONG BUY']} SB · ${decisionCounts['BUY']} BUY`;
+
+  const html=`
+    <div style="font-family:Arial,sans-serif;color:#111827;max-width:1000px;margin:auto">
+
+      <h2 style="margin-bottom:4px">${htmlEsc(task.task_name)}</h2>
+
+      <p style="color:#6b7280;margin-top:0">
+        Informe completo de la ejecución automática de Luxury Hunter.
+      </p>
+
+      <div style="background:#f3f4f6;padding:16px;border-radius:8px;margin:18px 0">
+        <b>Total analizados: ${allItems.length}</b>
+        <br><br>
+        STRONG BUY: <b>${decisionCounts['STRONG BUY']}</b><br>
+        BUY: <b>${decisionCounts['BUY']}</b><br>
+        WATCH: <b>${decisionCounts['WATCH']}</b><br>
+        REJECT: <b>${decisionCounts['REJECT']}</b><br>
+        <br>
+        Oportunidades que cumplen los criterios de alerta: <b>${alertSelected.length}</b>
+      </div>
+
+      <h3>Fuentes</h3>
+
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+        <thead>
+          <tr>
+            <th align="left" style="padding:8px;background:#f3f4f6">Marketplace</th>
+            <th align="left" style="padding:8px;background:#f3f4f6">Resultados</th>
+            <th align="left" style="padding:8px;background:#f3f4f6">Estado</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${sourceRows}
+        </tbody>
+      </table>
+
+      <h3>Todos los productos analizados</h3>
+
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr>
+            <th align="left" style="padding:10px;background:#f3f4f6">Producto</th>
+            <th align="left" style="padding:10px;background:#f3f4f6">Análisis</th>
+            <th align="left" style="padding:10px;background:#f3f4f6">Economía</th>
+            <th align="left" style="padding:10px;background:#f3f4f6">Link</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+
+      <p style="margin-top:20px;color:#6b7280;font-size:12px">
+        Las estimaciones de autenticidad, reventa y beneficio son orientativas.
+        Revisa siempre el anuncio y la autenticación antes de realizar una compra.
+      </p>
+
+    </div>
+  `;
+
   const {transport,config}=getMailTransport();
-  await transport.sendMail({from:config.from,to:task.email_to,subject,html,text:`${task.task_name}: ${selected.length} oportunidades nuevas. Abre Luxury Hunter para ver el detalle.`});
+
+  await transport.sendMail({
+    from:config.from,
+    to:task.email_to,
+    subject,
+    html,
+    text:
+      `${task.task_name}\n` +
+      `Total analizados: ${allItems.length}\n` +
+      `STRONG BUY: ${decisionCounts['STRONG BUY']}\n` +
+      `BUY: ${decisionCounts['BUY']}\n` +
+      `WATCH: ${decisionCounts['WATCH']}\n` +
+      `REJECT: ${decisionCounts['REJECT']}\n`
+  });
+
+  // Solo registrar como "notificados" los productos que realmente
+  // cumplen los criterios de oportunidad.
   const now=new Date().toISOString();
-  const ins=db.prepare("INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'email',?,?)");
-  for(const x of selected) ins.run(task.id,x.id,runId,task.email_to,now);
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('email','digest',`Task ${task.id}; sent ${selected.length} to ${task.email_to}`,now);
-  return {sent:true,count:selected.length,to:task.email_to};
+
+  const ins=db.prepare(
+    "INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'email',?,?)"
+  );
+
+  for(const x of alertSelected){
+    ins.run(task.id,x.id,runId,task.email_to,now);
+  }
+
+  db.prepare(
+    'INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)'
+  ).run(
+    'email',
+    'full-report',
+    `Task ${task.id}; report ${allItems.length} items; ${alertSelected.length} alerts; sent to ${task.email_to}`,
+    now
+  );
+
+  return {
+    sent:true,
+    count:allItems.length,
+    alerts:alertSelected.length,
+    to:task.email_to
+  };
 }
 
 function statusPayload() {
