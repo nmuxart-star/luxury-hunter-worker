@@ -6060,20 +6060,16 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     VALUES(0,?,?,'global-digest',?,?)
   `);
 
-  const markGlobalDigestTransaction=db.transaction(items=>{
-    for(const x of items){
-      markGlobalDigestSent.run(
-        Number(x.id),
-        Number.isFinite(Number(x._run_id))
-          ? Number(x._run_id)
-          : null,
-        recipient,
-        sentAt
-      );
-    }
-  });
-
-  markGlobalDigestTransaction(opportunities);
+  for(const x of opportunities){
+    markGlobalDigestSent.run(
+      Number(x.id),
+      Number.isFinite(Number(x._run_id))
+        ? Number(x._run_id)
+        : null,
+      recipient,
+      sentAt
+    );
+  }
 
   saveGlobalDigestState({
     last_sent_at:sentAt,

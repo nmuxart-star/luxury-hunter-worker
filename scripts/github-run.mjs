@@ -88,7 +88,7 @@ try{
   try{
     const digest=await api('POST','/api/email/global-digest',{
       to:globalEmail.to||null,
-      force:false,
+      force:forceManual,
       config:globalEmail
     });
     if(digest.sent){
