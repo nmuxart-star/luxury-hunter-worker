@@ -654,6 +654,554 @@ function runBunjangCli(args) {
 }
 function chunks(arr, n) { const out=[]; for(let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; }
 
+// BUNJANG PUBLICATION PAGE AGE V2
+// Para cada anuncio Bunjang:
+// 1. Intentar fecha real de publicación en la propia página.
+// 2. Si no existe, leer la antigüedad visible del anuncio.
+// 3. Nunca usar updatedAt como sustituto de publication time.
+
+function bunjangRelativeAgeToMs(text, nowMs=Date.now()){
+  const s=String(text||'')
+    .replace(/\s+/g,' ')
+    .trim()
+    .toLowerCase();
+
+  if(!s)return null;
+
+  if(
+    /^(방금\s*전|방금전|just\s*now|ahora|hace\s+un\s+momento)$/i.test(s)
+  ){
+    return nowMs;
+  }
+
+  const rules=[
+    {
+      patterns:[
+        /^(\d+)\s*초\s*전$/i,
+        /^hace\s+(\d+)\s*(?:segundo|segundos|s)$/i,
+        /^(\d+)\s*(?:second|seconds|sec|secs)\s*ago$/i
+      ],
+      unit:1000
+    },
+    {
+      patterns:[
+        /^(\d+)\s*분\s*전$/i,
+        /^hace\s+(\d+)\s*(?:minuto|minutos|min)$/i,
+        /^(\d+)\s*(?:minute|minutes|min|mins)\s*ago$/i
+      ],
+      unit:60*1000
+    },
+    {
+      patterns:[
+        /^(\d+)\s*시간\s*전$/i,
+        /^hace\s+(\d+)\s*(?:hora|horas|h)$/i,
+        /^(\d+)\s*(?:hour|hours|hr|hrs)\s*ago$/i
+      ],
+      unit:60*60*1000
+    },
+    {
+      patterns:[
+        /^(\d+)\s*일\s*전$/i,
+        /^hace\s+(\d+)\s*(?:día|días|dia|dias)$/i,
+        /^(\d+)\s*(?:day|days)\s*ago$/i
+      ],
+      unit:24*60*60*1000,
+      forceOlder:true
+    },
+    {
+      patterns:[
+        /^(\d+)\s*주\s*전$/i,
+        /^hace\s+(\d+)\s*(?:semana|semanas)$/i,
+        /^(\d+)\s*(?:week|weeks)\s*ago$/i
+      ],
+      unit:7*24*60*60*1000,
+      forceOlder:true
+    },
+    {
+      patterns:[
+        /^(\d+)\s*개월\s*전$/i,
+        /^hace\s+(\d+)\s*(?:mes|meses)$/i,
+        /^(\d+)\s*(?:month|months)\s*ago$/i
+      ],
+      unit:30*24*60*60*1000,
+      forceOlder:true
+    },
+    {
+      patterns:[
+        /^(\d+)\s*년\s*전$/i,
+        /^hace\s+(\d+)\s*(?:año|años|ano|anos)$/i,
+        /^(\d+)\s*(?:year|years)\s*ago$/i
+      ],
+      unit:365*24*60*60*1000,
+      forceOlder:true
+    }
+  ];
+
+  for(const rule of rules){
+    for(const pattern of rule.patterns){
+      const m=s.match(pattern);
+      if(!m)continue;
+
+      const amount=Number(m[1]);
+      if(!Number.isFinite(amount))continue;
+
+      let publishedMs=nowMs-(amount*rule.unit);
+
+      // "1 día" ya no es "menos de 24 horas".
+      if(rule.forceOlder){
+        publishedMs-=1000;
+      }
+
+      return publishedMs;
+    }
+  }
+
+  return null;
+}
+
+function bunjangFindStructuredPublication(html){
+  const patterns=[
+    /"datePublished"\s*:\s*"([^"]+)"/ig,
+    /"publishedAt"\s*:\s*"([^"]+)"/ig,
+    /"published_at"\s*:\s*"([^"]+)"/ig,
+    /"postedAt"\s*:\s*"([^"]+)"/ig,
+    /"posted_at"\s*:\s*"([^"]+)"/ig,
+    /"registeredAt"\s*:\s*"([^"]+)"/ig,
+    /"registered_at"\s*:\s*"([^"]+)"/ig
+  ];
+
+  for(const pattern of patterns){
+    let m;
+
+    while((m=pattern.exec(html))!==null){
+      const value=String(m[1]||'').trim();
+      const ms=parseMarketplacePublishedMs(value,'+09:00');
+
+      if(ms!==null){
+        return {
+          publishedMs:ms,
+          raw:value,
+          source:'structured_publication_timestamp'
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function bunjangVisibleAgeFromText(text){
+  const normalized=String(text||'')
+    .replace(/\s+/g,' ')
+    .trim();
+
+  const patterns=[
+    /방금\s*전/i,
+    /\d+\s*초\s*전/i,
+    /\d+\s*분\s*전/i,
+    /\d+\s*시간\s*전/i,
+    /\d+\s*일\s*전/i,
+    /\d+\s*주\s*전/i,
+    /\d+\s*개월\s*전/i,
+    /\d+\s*년\s*전/i,
+
+    /hace\s+\d+\s*(?:segundo|segundos|s)\b/i,
+    /hace\s+\d+\s*(?:minuto|minutos|min)\b/i,
+    /hace\s+\d+\s*(?:hora|horas|h)\b/i,
+    /hace\s+\d+\s*(?:día|días|dia|dias)\b/i,
+    /hace\s+\d+\s*(?:semana|semanas)\b/i,
+    /hace\s+\d+\s*(?:mes|meses)\b/i,
+    /hace\s+\d+\s*(?:año|años|ano|anos)\b/i,
+
+    /\d+\s*(?:second|seconds|sec|secs)\s*ago/i,
+    /\d+\s*(?:minute|minutes|min|mins)\s*ago/i,
+    /\d+\s*(?:hour|hours|hr|hrs)\s*ago/i,
+    /\d+\s*(?:day|days)\s*ago/i,
+    /\d+\s*(?:week|weeks)\s*ago/i,
+    /\d+\s*(?:month|months)\s*ago/i,
+    /\d+\s*(?:year|years)\s*ago/i
+  ];
+
+  for(const pattern of patterns){
+    const m=normalized.match(pattern);
+    if(m)return String(m[0]).trim();
+  }
+
+  return null;
+}
+
+// BUNJANG RECENCY ROBUSTNESS V1
+// BUNJANG PLAYWRIGHT PUBLICATION FALLBACK V1
+
+let bunjangPublicationBrowserPromise=null;
+
+async function getBunjangPublicationBrowser(){
+  if(!bunjangPublicationBrowserPromise){
+    bunjangPublicationBrowserPromise=(async()=>{
+      const {chromium}=await import('playwright');
+
+      return chromium.launch({
+        headless:true,
+        args:[
+          '--disable-dev-shm-usage',
+          '--no-sandbox'
+        ]
+      });
+    })().catch(e=>{
+      bunjangPublicationBrowserPromise=null;
+      throw e;
+    });
+  }
+
+  return bunjangPublicationBrowserPromise;
+}
+
+async function fetchBunjangPublicationRendered(item){
+  const id=String(item?.id||'').trim();
+
+  if(!id){
+    return {
+      publishedAt:null,
+      ageText:null,
+      source:'rendered_missing_product_id',
+      status:'UNKNOWN'
+    };
+  }
+
+  let page=null;
+
+  try{
+    const browser=await getBunjangPublicationBrowser();
+
+    page=await browser.newPage({
+      locale:'ko-KR',
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '+
+        'AppleWebKit/537.36 Chrome/150 Safari/537.36'
+    });
+
+    const url=
+      `https://m.bunjang.co.kr/products/${encodeURIComponent(id)}`;
+
+    await page.goto(url,{
+      waitUntil:'domcontentloaded',
+      timeout:25000
+    });
+
+    try{
+      await page.waitForFunction(
+        () => {
+          const t=(document.body?.innerText||'')
+            .replace(/\s+/g,' ');
+
+          return (
+            /방금\s*전/.test(t) ||
+            /\d+\s*초\s*전/.test(t) ||
+            /\d+\s*분\s*전/.test(t) ||
+            /\d+\s*시간\s*전/.test(t) ||
+            /\d+\s*일\s*전/.test(t) ||
+            /\d+\s*주\s*전/.test(t) ||
+            /\d+\s*개월\s*전/.test(t) ||
+            /\d+\s*년\s*전/.test(t) ||
+            /hace\s+\d+\s*(?:segundos?|minutos?|horas?|d[ií]as?|semanas?|mes(?:es)?|años?)/i.test(t) ||
+            /\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s*ago/i.test(t)
+          );
+        },
+        null,
+        {timeout:10000}
+      );
+    }catch{}
+
+    await page.waitForTimeout(700);
+
+    const renderedHtml=await page.content();
+
+    const structured=bunjangFindStructuredPublication(
+      renderedHtml
+    );
+
+    if(structured){
+      const ageMs=Date.now()-structured.publishedMs;
+
+      return {
+        publishedAt:
+          new Date(structured.publishedMs).toISOString(),
+        ageText:null,
+        source:'rendered_'+structured.source,
+        sourceValue:structured.raw,
+        status:
+          ageMs>=-10*60*1000 &&
+          ageMs<24*60*60*1000
+            ? 'FRESH'
+            : 'STALE'
+      };
+    }
+
+    let bodyText='';
+
+    try{
+      bodyText=await page.locator('body').innerText({
+        timeout:5000
+      });
+    }catch{}
+
+    bodyText=String(bodyText||'')
+      .replace(/\s+/g,' ')
+      .trim();
+
+    let relevantText=bodyText;
+
+    const title=String(item?.title||'')
+      .replace(/\s+/g,' ')
+      .trim();
+
+    if(title){
+      const index=bodyText.indexOf(title);
+
+      if(index>=0){
+        relevantText=bodyText.slice(
+          index,
+          index+3000
+        );
+      }
+    }
+
+    let ageText=bunjangVisibleAgeFromText(
+      relevantText
+    );
+
+    if(!ageText && relevantText!==bodyText){
+      ageText=bunjangVisibleAgeFromText(
+        bodyText.slice(0,7000)
+      );
+    }
+
+    if(!ageText){
+      return {
+        publishedAt:null,
+        ageText:null,
+        source:'rendered_visible_age_not_found',
+        status:'UNKNOWN'
+      };
+    }
+
+    const publishedMs=bunjangRelativeAgeToMs(
+      ageText
+    );
+
+    if(publishedMs===null){
+      return {
+        publishedAt:null,
+        ageText,
+        source:'rendered_visible_age_unparseable',
+        status:'UNKNOWN'
+      };
+    }
+
+    const ageMs=Date.now()-publishedMs;
+
+    return {
+      publishedAt:
+        new Date(publishedMs).toISOString(),
+      ageText,
+      source:'rendered_visible_listing_age',
+      status:
+        ageMs>=-10*60*1000 &&
+        ageMs<24*60*60*1000
+          ? 'FRESH'
+          : 'STALE'
+    };
+
+  }catch(e){
+    return {
+      publishedAt:null,
+      ageText:null,
+      source:
+        e?.name==='TimeoutError'
+          ? 'rendered_timeout'
+          : `rendered_error:${String(e?.message||e)}`,
+      status:'UNKNOWN'
+    };
+  }finally{
+    if(page){
+      try{
+        await page.close();
+      }catch{}
+    }
+  }
+}
+
+async function fetchBunjangPublication(item){
+  const id=String(item?.id||'').trim();
+
+  if(!id){
+    return {
+      publishedAt:null,
+      ageText:null,
+      source:'missing_product_id',
+      status:'UNKNOWN'
+    };
+  }
+
+  const url=
+    String(item?.url||'').trim()
+    ||
+    `https://m.bunjang.co.kr/products/${encodeURIComponent(id)}`;
+
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),15000);
+
+  try{
+    const r=await fetch(url,{
+      signal:controller.signal,
+      redirect:'follow',
+      headers:{
+        'user-agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '+
+          'AppleWebKit/537.36 Chrome/150 Safari/537.36',
+        'accept-language':'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        'accept':'text/html,application/xhtml+xml'
+      }
+    });
+
+    if(!r.ok){
+      return {
+        publishedAt:null,
+        ageText:null,
+        source:`http_${r.status}`,
+        status:'UNKNOWN'
+      };
+    }
+
+    const html=await r.text();
+
+    const structured=bunjangFindStructuredPublication(html);
+
+    if(structured){
+      const ageMs=Date.now()-structured.publishedMs;
+
+      return {
+        publishedAt:new Date(structured.publishedMs).toISOString(),
+        ageText:null,
+        source:structured.source,
+        sourceValue:structured.raw,
+        status:
+          ageMs>=-10*60*1000 &&
+          ageMs<24*60*60*1000
+            ? 'FRESH'
+            : 'STALE'
+      };
+    }
+
+    const $=loadHtml(html);
+
+    const bodyText=$('body')
+      .text()
+      .replace(/\s+/g,' ')
+      .trim();
+
+    // La antigüedad del producto suele aparecer justo después
+    // de título/precio. Si podemos localizar el título,
+    // reducimos la búsqueda a esa zona para evitar edades
+    // correspondientes a otros productos o al vendedor.
+    let relevantText=bodyText;
+
+    const title=String(item?.title||'')
+      .replace(/\s+/g,' ')
+      .trim();
+
+    if(title){
+      const titleIndex=bodyText.indexOf(title);
+
+      if(titleIndex>=0){
+        relevantText=bodyText.slice(
+          titleIndex,
+          titleIndex+2500
+        );
+      }
+    }
+
+    let ageText=bunjangVisibleAgeFromText(relevantText);
+
+    if(!ageText && relevantText!==bodyText){
+      ageText=bunjangVisibleAgeFromText(
+        bodyText.slice(0,5000)
+      );
+    }
+
+    if(!ageText){
+      let rendered=
+        await fetchBunjangPublicationRendered(item);
+
+      if(
+        rendered?.status==='UNKNOWN' &&
+        String(rendered?.source||'').includes('timeout')
+      ){
+        await sleep(500);
+
+        rendered=
+          await fetchBunjangPublicationRendered(item);
+      }
+
+      if(
+        rendered?.publishedAt ||
+        rendered?.ageText ||
+        rendered?.status==='FRESH' ||
+        rendered?.status==='STALE'
+      ){
+        return rendered;
+      }
+
+      return {
+        publishedAt:null,
+        ageText:null,
+        source:
+          rendered?.source ||
+          'visible_age_not_found',
+        status:'UNKNOWN'
+      };
+    }
+
+    const publishedMs=bunjangRelativeAgeToMs(ageText);
+
+    if(publishedMs===null){
+      return {
+        publishedAt:null,
+        ageText,
+        source:'visible_age_unparseable',
+        status:'UNKNOWN'
+      };
+    }
+
+    const ageMs=Date.now()-publishedMs;
+
+    return {
+      publishedAt:new Date(publishedMs).toISOString(),
+      ageText,
+      source:'visible_listing_age',
+      status:
+        ageMs>=-10*60*1000 &&
+        ageMs<24*60*60*1000
+          ? 'FRESH'
+          : 'STALE'
+    };
+
+  }catch(e){
+    return {
+      publishedAt:null,
+      ageText:null,
+      source:
+        e?.name==='AbortError'
+          ? 'timeout'
+          : String(e?.message||e),
+      status:'UNKNOWN'
+    };
+  }finally{
+    clearTimeout(timeout);
+  }
+}
+
+
 async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, maxEur=null, sessionId }) {
   const maxQueries = clampInt(process.env.BUNJANG_MAX_QUERIES || 2, 2, 1, 5);
   const selectedQueries = (queries || []).slice(0, maxQueries);
@@ -661,7 +1209,7 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
   const perQuery = [];
   for (const q0 of selectedQueries) {
     const q = String(q0).trim(); if (!q) continue;
-    const s = runBunjangCli(['--json','--preferred-transport','browser','search',q,'--pages',String(pages),'--max-items',String(maxItems)]);
+    const s = runBunjangCli(['--json','--preferred-transport','browser','search',q,'--sort','date','--pages',String(pages),'--max-items',String(maxItems)]);
     const ids = (s.items || []).map(x => x.id).filter(Boolean);
     ids.forEach(id => { if (!unique.has(String(id))) unique.set(String(id), q); });
     perQuery.push({ query:q, count:ids.length });
@@ -681,13 +1229,32 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
     if (Number.isFinite(Number(minEur)) && pe != null && pe < Number(minEur)) continue;
     if (Number.isFinite(Number(maxEur)) && pe != null && pe > Number(maxEur)) continue;
     const sourceQuery = unique.get(String(item.id)) || '';
+
+    const publication=await fetchBunjangPublication(item);
+
+    const rawWithPublication={
+      ...item,
+      publishedAt:publication.publishedAt,
+      luxuryHunterPublication:{
+        marketplace:'bunjang',
+        ageText:publication.ageText,
+        source:publication.source,
+        sourceValue:publication.sourceValue||null,
+        status:publication.status,
+        checkedAt:new Date().toISOString()
+      }
+    };
+
     upsertListing({
       source:'bunjang', source_id:item.id, url:item.url, title:item.title, description:item.description,
       original_price:p, currency:'KRW', price_eur:pe, seller_name:item.sellerName,
       seller_items:item.sellerItemCount, seller_sales:item.sellerSalesCount, seller_reviews:item.sellerReviewCount,
-      image_url:item.imageUrl, status:item.status, purchase_via:'Korea proxy', raw:item
+      image_url:item.imageUrl, status:item.status, purchase_via:'Korea proxy', raw:rawWithPublication
     }, sessionId, sourceQuery);
+
     kept++;
+
+    await sleep(120);
   }
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('bunjang','live-search',`Queries ${perQuery.length}; IDs ${unique.size}; kept ${kept}`,new Date().toISOString());
   return { ok:true, perQuery, uniqueIds:unique.size, detailed:details.length, kept };
@@ -2901,6 +3468,86 @@ function listingPublishedAtMs(item){
   return null;
 }
 
+// TASK PUBLICATION WINDOW V1
+// Convierte la configuración temporal de cada tarea
+// en una ventana estricta de horas.
+//
+// Ejemplos actuales:
+// 1天内发布 -> 24h
+// 7天内发布 -> 168h
+//
+// También admite variantes futuras en español/inglés.
+
+function publicationWindowHoursFromOption(value){
+  const raw=String(value||'').trim();
+
+  if(!raw)return null;
+
+  const normalized=raw
+    .toLowerCase()
+    .replace(/\s+/g,' ')
+    .trim();
+
+  let m=null;
+
+  m=normalized.match(/^(\d+)\s*天内发布$/);
+  if(m){
+    const days=Number(m[1]);
+    return Number.isFinite(days)&&days>0
+      ? days*24
+      : null;
+  }
+
+  m=normalized.match(/^(\d+)\s*天$/);
+  if(m){
+    const days=Number(m[1]);
+    return Number.isFinite(days)&&days>0
+      ? days*24
+      : null;
+  }
+
+  m=normalized.match(
+    /^(\d+)\s*(?:d|day|days|día|días|dia|dias)$/
+  );
+  if(m){
+    const days=Number(m[1]);
+    return Number.isFinite(days)&&days>0
+      ? days*24
+      : null;
+  }
+
+  m=normalized.match(
+    /(?:últimos?|ultimos?|last)\s+(\d+)\s*(?:días|dias|days)/
+  );
+  if(m){
+    const days=Number(m[1]);
+    return Number.isFinite(days)&&days>0
+      ? days*24
+      : null;
+  }
+
+  if(
+    normalized==='último día' ||
+    normalized==='ultimo dia' ||
+    normalized==='last day' ||
+    normalized==='last 24 hours' ||
+    normalized==='24h' ||
+    normalized==='24 h'
+  ){
+    return 24;
+  }
+
+  m=normalized.match(/^(\d+)\s*h(?:ours?|oras?)?$/);
+  if(m){
+    const hours=Number(m[1]);
+    return Number.isFinite(hours)&&hours>0
+      ? hours
+      : null;
+  }
+
+  return null;
+}
+
 function enforceFreshPublicationWindow(sessionId,hours=24){
   const rows=db.prepare(`
     SELECT
@@ -3169,26 +3816,49 @@ async function executeTask(taskId, runId=null) {
       'Preparando anuncios para análisis'
     );
 
-    const freshness24h=enforceFreshPublicationWindow(
-      result.sessionId,
-      24
-    );
+    const publicationWindowHours=
+      publicationWindowHoursFromOption(
+        task.new_publish_option
+      );
 
     result.status=result.status||{};
 
-    result.status.freshness={
-      ok:true,
-      state:'finished',
-      ...freshness24h
-    };
+    if(publicationWindowHours!==null){
+      const freshnessWindow=
+        enforceFreshPublicationWindow(
+          result.sessionId,
+          publicationWindowHours
+        );
 
-    console.log(
-      `Task ${taskId}: publicación 24h -> `+
-      `kept=${freshness24h.kept}, `+
-      `stale=${freshness24h.stale}, `+
-      `unknown=${freshness24h.unknown}, `+
-      `future=${freshness24h.future}`
-    );
+      result.status.freshness={
+        ok:true,
+        state:'finished',
+        configuredOption:
+          task.new_publish_option||null,
+        ...freshnessWindow
+      };
+
+      console.log(
+        `Task ${taskId}: publicación ${publicationWindowHours}h -> `+
+        `kept=${freshnessWindow.kept}, `+
+        `stale=${freshnessWindow.stale}, `+
+        `unknown=${freshnessWindow.unknown}, `+
+        `future=${freshnessWindow.future}`
+      );
+    }else{
+      result.status.freshness={
+        ok:true,
+        state:'skipped',
+        configuredOption:
+          task.new_publish_option||null,
+        hours:null,
+        reason:'no_publication_window'
+      };
+
+      console.log(
+        `Task ${taskId}: sin filtro temporal de publicación`
+      );
+    }
 
     const previousAnalyzedAnywhere=db.prepare(`
       DELETE FROM search_session_items
@@ -4763,6 +5433,88 @@ function statusPayload() {
   };
 }
 
+// AUTO CLOUD CONFIG SYNC V1
+let cloudConfigSyncTimer=null;
+let cloudConfigSyncRunning=false;
+let cloudConfigSyncPending=false;
+
+function cloudConfigAutoSyncEnabled(){
+  const githubActions=
+    String(process.env.GITHUB_ACTIONS||'')
+      .toLowerCase()==='true';
+
+  const disabled=
+    ['1','true','yes','on'].includes(
+      String(
+        process.env.DISABLE_CLOUD_CONFIG_SYNC||''
+      ).toLowerCase()
+    );
+
+  return !githubActions&&!disabled;
+}
+
+function scheduleCloudConfigSync(reason='platform-change'){
+  if(!cloudConfigAutoSyncEnabled())return;
+
+  cloudConfigSyncPending=true;
+
+  if(cloudConfigSyncTimer){
+    clearTimeout(cloudConfigSyncTimer);
+  }
+
+  cloudConfigSyncTimer=setTimeout(
+    ()=>runCloudConfigSync(reason),
+    1200
+  );
+}
+
+function runCloudConfigSync(reason){
+  cloudConfigSyncTimer=null;
+
+  if(cloudConfigSyncRunning){
+    cloudConfigSyncPending=true;
+    return;
+  }
+
+  cloudConfigSyncRunning=true;
+  cloudConfigSyncPending=false;
+
+  try{
+    const output=execFileSync(
+      process.execPath,
+      ['scripts/sync-cloud-config.mjs'],
+      {
+        cwd:process.cwd(),
+        encoding:'utf8',
+        timeout:90000,
+        maxBuffer:10*1024*1024,
+        env:{...process.env}
+      }
+    );
+
+    console.log(
+      `[Cloud config sync] ${reason}\n`+
+      String(output||'').trim()
+    );
+  }catch(e){
+    const stdout=String(e?.stdout||'').trim();
+    const stderr=String(e?.stderr||'').trim();
+
+    console.error(
+      `[Cloud config sync ERROR] ${reason}`,
+      stderr||stdout||e?.message||e
+    );
+  }finally{
+    cloudConfigSyncRunning=false;
+
+    if(cloudConfigSyncPending){
+      scheduleCloudConfigSync(
+        'pending-platform-change'
+      );
+    }
+  }
+}
+
 const server=http.createServer(async(req,res)=>{
   try{
     const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
@@ -4782,7 +5534,12 @@ const server=http.createServer(async(req,res)=>{
       return json(res,200,{ok:true,to});
     }
     if(req.method==='GET'&&u.pathname==='/api/economics') return json(res,200,{economics:getEconomics()});
-    if(req.method==='PUT'&&u.pathname==='/api/economics'){const b=await readBody(req);return json(res,200,{economics:saveEconomics(b)});}
+    if(req.method==='PUT'&&u.pathname==='/api/economics'){
+      const b=await readBody(req);
+      const economics=saveEconomics(b);
+      scheduleCloudConfigSync('economics-update');
+      return json(res,200,{economics});
+    }
     if(req.method==='GET'&&u.pathname==='/api/xianyu/accounts'){
       try{return json(res,200,{accounts:await xianyuFetch('/api/accounts',{timeoutMs:7000})});}catch(e){return json(res,200,{accounts:[],error:e.message});}
     }
@@ -4799,13 +5556,27 @@ const server=http.createServer(async(req,res)=>{
       const tasks=db.prepare('SELECT * FROM tasks ORDER BY updated_at DESC,id DESC').all().map(taskPublic);
       return json(res,200,{tasks});
     }
-    if(req.method==='POST'&&u.pathname==='/api/tasks'){const b=await readBody(req);return json(res,201,{task:createTaskRecord(b)});}
+    if(req.method==='POST'&&u.pathname==='/api/tasks'){
+      const b=await readBody(req);
+      const task=createTaskRecord(b);
+      scheduleCloudConfigSync(`task-create:${task.id}`);
+      return json(res,201,{task});
+    }
     const tm=u.pathname.match(/^\/api\/tasks\/(\d+)$/);
     if(tm&&req.method==='GET'){const t=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(tm[1])));if(!t)return json(res,404,{error:'Tarea no encontrada'});return json(res,200,{task:t});}
-    if(tm&&req.method==='PATCH'){const b=await readBody(req);return json(res,200,{task:updateTaskRecord(Number(tm[1]),b)});}
+    if(tm&&req.method==='PATCH'){
+      const b=await readBody(req);
+      const task=updateTaskRecord(Number(tm[1]),b);
+      scheduleCloudConfigSync(`task-update:${task.id}`);
+      return json(res,200,{task});
+    }
     if(tm&&req.method==='DELETE'){
       const id=Number(tm[1]); if(runningTaskIds.has(id))return json(res,409,{error:'No puedes borrar una tarea mientras se está ejecutando.'});
-      db.prepare('DELETE FROM task_analyses WHERE task_id=?').run(id);db.prepare('DELETE FROM task_runs WHERE task_id=?').run(id);db.prepare('DELETE FROM tasks WHERE id=?').run(id);return json(res,200,{ok:true});
+      db.prepare('DELETE FROM task_analyses WHERE task_id=?').run(id);
+      db.prepare('DELETE FROM task_runs WHERE task_id=?').run(id);
+      db.prepare('DELETE FROM tasks WHERE id=?').run(id);
+      scheduleCloudConfigSync(`task-delete:${id}`);
+      return json(res,200,{ok:true});
     }
     const tr=u.pathname.match(/^\/api\/tasks\/(\d+)\/run$/);
     if(tr&&req.method==='POST'){
