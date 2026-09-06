@@ -107,7 +107,25 @@ try{
 }catch(e){
   code=1; console.error(e?.stack||e);
 }finally{
-  child.kill('SIGTERM');
-  await sleep(1000);
-  process.exitCode=code;
+  if(child.exitCode===null && child.signalCode===null){
+    child.kill('SIGTERM');
+
+    await Promise.race([
+      new Promise(resolve=>child.once('exit',resolve)),
+      sleep(5000)
+    ]);
+  }
+
+  if(child.exitCode===null && child.signalCode===null){
+    console.log('Luxury Hunter server did not stop after SIGTERM; forcing shutdown.');
+    child.kill('SIGKILL');
+
+    await Promise.race([
+      new Promise(resolve=>child.once('exit',resolve)),
+      sleep(1000)
+    ]);
+  }
+
+  console.log('Luxury Hunter cloud worker finished. Continuing GitHub workflow.');
+  process.exit(code);
 }
