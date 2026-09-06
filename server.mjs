@@ -2180,7 +2180,7 @@ async function searchJapanSource(
 
         if(item.status==='sold')continue;
 
-        const pe=Number(item.price_eur);
+        const pe=item.price_eur==null?null:Number(item.price_eur);
         const hasMinEur=
           minEur!==null&&
           minEur!==undefined&&
