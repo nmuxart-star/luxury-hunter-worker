@@ -2796,6 +2796,179 @@ function updateTaskRecord(id, body) {
   return taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(id)));
 }
 
+
+// STRICT AUTO FRESHNESS V2
+// La automatización solo acepta una fecha real de publicación.
+// updatedAt, first_seen, last_seen y crawl time NO sustituyen
+// a la fecha de publicación del marketplace.
+function parseMarketplacePublishedMs(value,defaultOffset='+00:00'){
+  if(value===null||value===undefined)return null;
+
+  const raw=String(value).trim();
+  if(!raw)return null;
+
+  const naive=raw.match(
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})(?::(\d{2}))?$/
+  );
+
+  let normalized=raw;
+
+  if(naive){
+    const hhmm=naive[2].replace(/^(\d):/,'0$1:');
+    const ss=naive[3]||'00';
+    normalized=`${naive[1]}T${hhmm}:${ss}${defaultOffset}`;
+  }
+
+  const ms=Date.parse(normalized);
+  return Number.isFinite(ms)?ms:null;
+}
+
+function listingPublishedAtMs(item){
+  let raw={};
+
+  try{
+    raw=JSON.parse(item?.raw_json||'{}');
+  }catch{}
+
+  const source=String(item?.source||'').toLowerCase();
+
+  if(source==='xianyu'){
+    const value=
+      raw?.['商品信息']?.['发布时间']
+      ??
+      raw?.['发布时间'];
+
+    return parseMarketplacePublishedMs(value,'+08:00');
+  }
+
+  if(source==='bunjang'){
+    const candidates=[
+      raw?.publishedAt,
+      raw?.published_at,
+      raw?.postedAt,
+      raw?.posted_at,
+      raw?.createdAt,
+      raw?.created_at,
+      raw?.registeredAt,
+      raw?.registered_at,
+      raw?.metadata?.publishedAt,
+      raw?.metadata?.published_at,
+      raw?.metadata?.postedAt,
+      raw?.metadata?.posted_at,
+      raw?.metadata?.createdAt,
+      raw?.metadata?.created_at,
+      raw?.metadata?.registeredAt,
+      raw?.metadata?.registered_at
+    ];
+
+    for(const value of candidates){
+      const ms=parseMarketplacePublishedMs(value,'+09:00');
+      if(ms!==null)return ms;
+    }
+
+    return null;
+  }
+
+  const japanSources=new Set([
+    'buyee',
+    'buyee-jp',
+    'mercari-jp',
+    'rakuma-jp',
+    'jdirectitems-auction',
+    'jdirectitems-fleamarket'
+  ]);
+
+  if(japanSources.has(source)){
+    const candidates=[
+      raw?.publishedAt,
+      raw?.published_at,
+      raw?.postedAt,
+      raw?.posted_at,
+      raw?.createdAt,
+      raw?.created_at,
+      raw?.registeredAt,
+      raw?.registered_at
+    ];
+
+    for(const value of candidates){
+      const ms=parseMarketplacePublishedMs(value,'+09:00');
+      if(ms!==null)return ms;
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+function enforceFreshPublicationWindow(sessionId,hours=24){
+  const rows=db.prepare(`
+    SELECT
+      l.id,
+      l.source,
+      l.raw_json
+    FROM search_session_items ssi
+    JOIN listings l
+      ON l.id=ssi.listing_id
+    WHERE ssi.session_id=?
+  `).all(sessionId);
+
+  const remove=db.prepare(
+    'DELETE FROM search_session_items '+
+    'WHERE session_id=? AND listing_id=?'
+  );
+
+  const now=Date.now();
+  const maxAge=Math.max(1,Number(hours)||24)*60*60*1000;
+  const futureSlack=10*60*1000;
+
+  const stats={
+    hours:Number(hours)||24,
+    kept:0,
+    stale:0,
+    unknown:0,
+    future:0,
+    removed:0,
+    bySource:{}
+  };
+
+  for(const row of rows){
+    const source=String(row.source||'unknown');
+
+    if(!stats.bySource[source]){
+      stats.bySource[source]={
+        kept:0,
+        stale:0,
+        unknown:0,
+        future:0
+      };
+    }
+
+    const publishedMs=listingPublishedAtMs(row);
+    let reason=null;
+
+    if(publishedMs===null){
+      reason='unknown';
+    }else if(publishedMs>now+futureSlack){
+      reason='future';
+    }else if(now-publishedMs>maxAge){
+      reason='stale';
+    }
+
+    if(reason){
+      remove.run(sessionId,row.id);
+      stats[reason]++;
+      stats.removed++;
+      stats.bySource[source][reason]++;
+    }else{
+      stats.kept++;
+      stats.bySource[source].kept++;
+    }
+  }
+
+  return stats;
+}
+
 function progressEtaSeconds(startedAt,pct){
   const p=Number(pct);
 
@@ -2995,6 +3168,54 @@ async function executeTask(taskId, runId=null) {
       'Búsqueda completada',
       'Preparando anuncios para análisis'
     );
+
+    const freshness24h=enforceFreshPublicationWindow(
+      result.sessionId,
+      24
+    );
+
+    result.status=result.status||{};
+
+    result.status.freshness={
+      ok:true,
+      state:'finished',
+      ...freshness24h
+    };
+
+    console.log(
+      `Task ${taskId}: publicación 24h -> `+
+      `kept=${freshness24h.kept}, `+
+      `stale=${freshness24h.stale}, `+
+      `unknown=${freshness24h.unknown}, `+
+      `future=${freshness24h.future}`
+    );
+
+    const previousAnalyzedAnywhere=db.prepare(`
+      DELETE FROM search_session_items
+      WHERE session_id=?
+        AND listing_id IN (
+          SELECT listing_id FROM task_analyses
+          UNION
+          SELECT listing_id FROM analyses
+        )
+    `).run(result.sessionId);
+
+    if(previousAnalyzedAnywhere.changes){
+      console.log(
+        `Task ${taskId}: `+
+        `${previousAnalyzedAnywhere.changes} anuncios con análisis previo `+
+        `apartados globalmente de esta ejecución.`
+      );
+    }
+
+    if(typeof setTaskRunProgress==='function'){
+      setTaskRunProgress(
+        runId,
+        34,
+        'Filtrando anuncios',
+        'Solo publicación real <=24h y listings nunca analizados'
+      );
+    }
 
     // Apartar de esta ejecución los anuncios que esta misma tarea ya analizó.
     // El listing y su análisis permanecen guardados en el histórico.
@@ -3928,16 +4149,24 @@ function globalEmailOpportunityRow(x,index){
   `;
 }
 
+// GLOBAL EMAIL DEDUPE V1
+function listingWasEverEmailed(listingId){
+  return !!db.prepare(`
+    SELECT 1
+    FROM notifications
+    WHERE listing_id=?
+      AND kind IN ('email','global-digest')
+    LIMIT 1
+  `).get(Number(listingId));
+}
+
 function qualifiesForEmail(task,item){
   if(task.decision_mode==='ai'){
     if(!item.decision || !(task.notify_decisions||[]).includes(item.decision)) return false;
     if(task.notify_min_score!=null && Number(item.opportunity_score||0)<Number(task.notify_min_score)) return false;
     if(task.notify_min_profit_eur!=null && Number(item.net_profit_low_eur??-Infinity)<Number(task.notify_min_profit_eur)) return false;
   }
-  if(task.notify_only_new){
-    const sent=db.prepare("SELECT 1 FROM notifications WHERE task_id=? AND listing_id=? AND kind='email'").get(task.id,item.id);
-    if(sent) return false;
-  }
+  if(listingWasEverEmailed(item.id)) return false;
   return true;
 }
 async function sendTaskDigest(task,runId,sessionId,items,sourceStatus){
@@ -4325,6 +4554,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
   const summariesByTask=new Map();
   const opportunityMap=new Map();
   let totalAnalyzed=0;
+  let previouslyEmailedSkipped=0;
 
   for(const run of runs){
     const taskName=run.task_name||`Task ${run.task_id}`;
@@ -4352,7 +4582,13 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     for(const x of items){
       const decision=String(x.decision||'').toUpperCase();
       if(!['STRONG BUY','BUY','WATCH'].includes(decision))continue;
-      const key=`${run.task_id}:${x.id}`;
+
+      if(listingWasEverEmailed(x.id)){
+        previouslyEmailedSkipped++;
+        continue;
+      }
+
+      const key=String(x.id);
       opportunityMap.set(key,{
         ...x,
         _task_name:taskName,
@@ -4461,6 +4697,34 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
   });
 
   const sentAt=now.toISOString();
+
+  const markGlobalDigestSent=db.prepare(`
+    INSERT OR IGNORE INTO notifications(
+      task_id,
+      listing_id,
+      run_id,
+      kind,
+      sent_to,
+      sent_at
+    )
+    VALUES(0,?,?,'global-digest',?,?)
+  `);
+
+  const markGlobalDigestTransaction=db.transaction(items=>{
+    for(const x of items){
+      markGlobalDigestSent.run(
+        Number(x.id),
+        Number.isFinite(Number(x._run_id))
+          ? Number(x._run_id)
+          : null,
+        recipient,
+        sentAt
+      );
+    }
+  });
+
+  markGlobalDigestTransaction(opportunities);
+
   saveGlobalDigestState({
     last_sent_at:sentAt,
     previous_window_start:anchor.toISOString(),
@@ -4481,7 +4745,8 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     tasks:summaries.length,
     analyzed:totalAnalyzed,
     counts,
-    opportunities:opportunities.length
+    opportunities:opportunities.length,
+    previously_emailed_skipped:previouslyEmailedSkipped
   };
 }
 

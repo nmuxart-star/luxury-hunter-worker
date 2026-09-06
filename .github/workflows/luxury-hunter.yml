@@ -62,13 +62,27 @@ jobs:
         shell: bash
         run: |
           mkdir -p .state data
-          PREV_RUN="$(gh run list --workflow luxury-hunter.yml --status success --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)"
-          if [ -n "$PREV_RUN" ]; then
-            echo "Restoring state from run $PREV_RUN"
-            gh run download "$PREV_RUN" -n luxury-hunter-state -D .state || true
-          fi
-          if [ -f .state/luxury-hunter.sqlite3 ]; then
-            cp .state/luxury-hunter.sqlite3 data/luxury-hunter.sqlite3
+          RESTORED_RUN=""
+
+          for PREV_RUN in $(gh run list --workflow luxury-hunter.yml --limit 20 --json databaseId -q '.[].databaseId' 2>/dev/null || true); do
+            if [ "$PREV_RUN" = "${GITHUB_RUN_ID:-}" ]; then
+              continue
+            fi
+
+            rm -rf .state/*
+
+            if gh run download "$PREV_RUN" -n luxury-hunter-state -D .state >/dev/null 2>&1; then
+              if [ -f .state/luxury-hunter.sqlite3 ]; then
+                cp .state/luxury-hunter.sqlite3 data/luxury-hunter.sqlite3
+                RESTORED_RUN="$PREV_RUN"
+                echo "Restored persistent state from run $PREV_RUN"
+                break
+              fi
+            fi
+          done
+
+          if [ -z "$RESTORED_RUN" ]; then
+            echo "No previous persistent state artifact was available."
           fi
 
       - name: Install Luxury Hunter dependencies
@@ -123,7 +137,7 @@ jobs:
           name: luxury-hunter-state
           path: data/luxury-hunter.sqlite3
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 90
           compression-level: 9
 
       - name: Xianyu logs on failure
