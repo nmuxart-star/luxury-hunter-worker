@@ -211,7 +211,7 @@
         <div class="grid grid3" style="margin-top:14px">
           <div class="econ-source"><h4>Xianyu / China</h4><div id="econXFields" class="econ-grid"></div></div>
           <div class="econ-source"><h4>Bunjang / Corea</h4><div id="econBFields" class="econ-grid"></div></div>
-          <div class="econ-source"><h4>Japón / Buyee</h4><div id="econJFields" class="econ-grid"></div></div>
+          <div class="econ-source"><h4>Japón</h4><div id="econJFields" class="econ-grid"></div></div>
         </div>
         <div class="notice" style="margin-top:14px">Fórmula: precio convertido + envío local + agente/proxy + envío internacional + arancel + IVA de importación + gestión aduanera + autenticación + otros. El arancel porcentual es una estimación editable; para una compra real conviene comprobar el TARIC según material y origen.</div>
         <div class="settings-actions"><button class="btn primary" onclick="saveEconomics()">Guardar costes de importación</button></div><div id="econSaveStatus" class="subtext" style="text-align:right;margin-top:7px"></div>
@@ -1553,8 +1553,18 @@ function renderInspector(m){
   const conn=[];
   if(c.xianyu?.enabled){conn.push(`<div class="inspect-call"><div class="inspect-call-title"><b>Xianyu</b> · llamadas HTTP reales</div>${(c.xianyu.calls||[]).map((x,i)=>`<div class="inspect-call"><div class="subtext">Query ${i+1}: ${esc(x.query)}</div>${codeHtml(`${x.createTask.method} ${x.createTask.url}\n\nBODY:\n${pretty(x.createTask.body)}\n\nDESPUÉS:\n${(x.then||[]).join('\n')}`)}</div>`).join('')}</div>`)}
   if(c.bunjang?.enabled){conn.push(`<div class="inspect-call"><div class="inspect-call-title"><b>Bunjang</b> · comandos CLI reales</div>${(c.bunjang.calls||[]).map((x,i)=>`<div class="inspect-call"><div class="subtext">Query ${i+1}: ${esc(x.query)}</div>${codeHtml(`${x.searchCommand}\n${x.detailCommand}`)}</div>`).join('')}</div>`)}
-  if(c.japan?.enabled){conn.push(`<div class="inspect-call"><div class="inspect-call-title"><b>Japón / Buyee</b> · URLs consultadas</div>${(c.japan.calls||[]).map((x,i)=>`<div class="inspect-call"><div class="subtext">Query ${i+1}: ${esc(x.query)}</div>${codeHtml(`${x.method} ${x.url}`)}</div>`).join('')}</div>`)}
-  const liveHtml=Object.keys(live).length?Object.entries(live).map(([k,v])=>`<div class="source-box">${statusDot(v)}<b>${esc(k)}</b><div class="subtext" style="margin-top:7px">${esc(v?.state|| (v?.ok===true?'finished':v?.ok===false?'error':'pending'))}</div>${v?.kept!=null?`<div class="subtext">Guardados: ${esc(v.kept)}</div>`:''}${v?.error?`<div class="subtext" style="color:#fda4af">${esc(v.error)}</div>`:''}</div>`).join(''):'<div class="subtext">La ejecución todavía no ha publicado estado de fuentes.</div>';
+  if(c.japan?.enabled){conn.push(`<div class="inspect-call"><div class="inspect-call-title"><b>Japón · radar multifuente</b> · URLs consultadas</div>${(c.japan.calls||[]).map((x,i)=>`<div class="inspect-call"><div class="subtext">${esc(x.label||x.source||'Japón')} · ${esc(x.mode||'')} · ${esc(x.purchaseVia||'')} · Query ${i+1}: ${esc(x.query)}</div>${codeHtml(`${x.method} ${x.url}`)}</div>`).join('')}</div>`)}
+  const liveEntries=[];
+  for(const [k,v] of Object.entries(live)){
+    if(k==='buyee'&&v?.perSource){
+      for(const [sourceId,sourceStatus] of Object.entries(v.perSource)){
+        liveEntries.push([sourceStatus?.label||sourceId,sourceStatus]);
+      }
+    }else{
+      liveEntries.push([k,v]);
+    }
+  }
+  const liveHtml=liveEntries.length?liveEntries.map(([k,v])=>`<div class="source-box">${statusDot(v)}<b>${esc(k)}</b><div class="subtext" style="margin-top:7px">${esc(v?.state|| (v?.ok===true?'finished':v?.ok===false?'error':'pending'))}</div>${v?.kept!=null?`<div class="subtext">Guardados: ${esc(v.kept)}</div>`:''}${v?.withPublicationDate!=null?`<div class="subtext">Con fecha publicación: ${esc(v.withPublicationDate)}</div>`:''}${v?.error?`<div class="subtext" style="color:#fda4af">${esc(v.error)}</div>`:''}</div>`).join(''):'<div class="subtext">La ejecución todavía no ha publicado estado de fuentes.</div>';
   $('inspectBody').innerHTML=`
     <div class="inspect-grid"><div class="inspect-stat"><span>Estado</span><b>${esc(run.status||'PREVIEW')}</b></div><div class="inspect-stat"><span>Producto</span><b>${esc(m.task.product_query)}</b></div><div class="inspect-stat"><span>Plan generado por</span><b>${esc(qp.generatedBy||'—')}</b></div><div class="inspect-stat"><span>Gemini</span><b>${ai.enabled?(ai.configured?'ON':'SIN API KEY'):'OFF'}</b></div></div>
     <details class="inspect-section" open><summary>1. Queries exactas generadas</summary><div class="inside">${codeHtml({xianyu:qp.xianyu||[],bunjang:qp.bunjang||[],japan:qp.japan||[],limits:m.effectiveLimits})}</div></details>

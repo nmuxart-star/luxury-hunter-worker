@@ -271,7 +271,7 @@ const DEFAULT_ECONOMICS = {
   sources: {
     xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
-    buyee: { label:'Japón / Buyee', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 }
+    buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 }
   }
 };
 function finiteOr(v, fallback=0){ const n=Number(v); return Number.isFinite(n)?n:fallback; }
@@ -304,7 +304,24 @@ function saveEconomics(value){
 function roundMoney(n){ return Math.round((Number(n)+Number.EPSILON)*100)/100; }
 function importEconomics(item, settings=getEconomics()){
   const product=finiteOr(item?.price_eur,0);
-  const sourceKey=['xianyu','bunjang','buyee'].includes(item?.source)?item.source:'xianyu';
+  const rawSource=String(item?.source||'').toLowerCase();
+  const japanEconomicSources=new Set([
+    'buyee',
+    'buyee-jp',
+    'mercari-jp',
+    'rakuma-jp',
+    'jdirectitems-auction',
+    'jdirectitems-fleamarket',
+    'yahoo-auctions-jp',
+    'yahoo-fleamarket-jp',
+    '2ndstreet-jp',
+    'komehyo-jp'
+  ]);
+  const sourceKey=['xianyu','bunjang'].includes(rawSource)
+    ? rawSource
+    : japanEconomicSources.has(rawSource)
+      ? 'buyee'
+      : 'xianyu';
   const cfg=settings.sources[sourceKey]||settings.sources.xianyu;
   const domestic=finiteOr(cfg.domesticShippingEur,0);
   const agent=product*(finiteOr(cfg.agentFeePercent,0)/100)+finiteOr(cfg.agentFeeFixedEur,0);
@@ -1392,74 +1409,945 @@ async function searchXianyuLive({ queries, pages=1, maxItems=30, minEur=null, ma
   return { ok:true, perQuery, kept };
 }
 
-function buyeeSourceFromHref(href) {
-  const s = href.toLowerCase();
-  if (s.includes('mercari')) return 'mercari-jp';
-  if (s.includes('rakuma')) return 'rakuma-jp';
-  if (s.includes('auction')) return 'jdirectitems-auction';
-  if (s.includes('fleamarket')) return 'jdirectitems-fleamarket';
-  return 'buyee-jp';
-}
-function parseYen(text) {
-  const s = String(text || '').replace(/\s+/g,' ');
-  const patterns = [/[¥￥]\s*([0-9][0-9,]*)/, /([0-9][0-9,]*)\s*(?:JPY|円|yen)/i];
-  for (const p of patterns) { const m=s.match(p); if (m) return Number(m[1].replaceAll(',','')); }
+// JAPAN MULTI-SOURCE RADAR V2
+
+const JAPAN_HTTP_HEADERS={
+  'user-agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+  'accept-language':'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7'
+};
+
+const JAPAN_RADAR_SPECS=[
+  {
+    id:'yahoo-auctions-jp',
+    label:'Yahoo! Auctions Japan',
+    purchaseVia:'Buyee',
+    mode:'browser',
+    base:'https://buyee.jp',
+    cap:10,
+    searchWaitMs:5000,
+    detailWaitMs:1200,
+    searchUrl:q=>`https://buyee.jp/item/search/query/${encodeURIComponent(q)}?lang=en`,
+    accepts:u=>/^\/item\/jdirectitems\/auction\/[^/]+/i.test(u.pathname)
+  },
+  {
+    id:'mercari-jp',
+    label:'Mercari Japan',
+    purchaseVia:'Direct',
+    mode:'browser',
+    base:'https://jp.mercari.com',
+    cap:12,
+    searchWaitMs:3500,
+    detailWaitMs:4000,
+    searchUrl:q=>`https://jp.mercari.com/search?keyword=${encodeURIComponent(q)}&sort=created_time&order=desc`,
+    accepts:u=>/^\/item\/m\d+/i.test(u.pathname)||/^\/shops\/product\/[^/]+/i.test(u.pathname)
+  },
+  {
+    id:'rakuma-jp',
+    label:'Rakuma',
+    purchaseVia:'Direct',
+    mode:'http',
+    base:'https://fril.jp',
+    cap:12,
+    searchUrl:q=>`https://fril.jp/s?query=${encodeURIComponent(q)}`,
+    accepts:u=>u.hostname==='item.fril.jp'&&/^\/[a-f0-9]+\/?$/i.test(u.pathname)
+  },
+  {
+    id:'yahoo-fleamarket-jp',
+    label:'Yahoo! Flea Market',
+    purchaseVia:'Direct',
+    mode:'browser',
+    base:'https://paypayfleamarket.yahoo.co.jp',
+    cap:8,
+    searchWaitMs:3000,
+    detailWaitMs:1000,
+    searchUrl:q=>`https://paypayfleamarket.yahoo.co.jp/search/${encodeURIComponent(q)}?withSpeller=0`,
+    accepts:u=>/^\/item\/[^/]+/i.test(u.pathname)
+  },
+  {
+    id:'2ndstreet-jp',
+    label:'2nd STREET Japan',
+    purchaseVia:'Direct',
+    mode:'browser',
+    base:'https://www.2ndstreet.jp',
+    cap:6,
+    searchWaitMs:3000,
+    detailWaitMs:1000,
+    searchUrl:q=>`https://www.2ndstreet.jp/search?keyword=${encodeURIComponent(q)}`,
+    accepts:u=>/\/goods\//i.test(u.pathname)
+  },
+  {
+    id:'komehyo-jp',
+    label:'KOMEHYO',
+    purchaseVia:'Direct',
+    mode:'http',
+    base:'https://komehyo.jp',
+    cap:8,
+    searchUrl:q=>`https://komehyo.jp/search/?q=${encodeURIComponent(q)}`,
+    accepts:u=>/^\/product\/[^/]+\/?/i.test(u.pathname)
+  }
+];
+
+function parseYen(text){
+  const s=String(text||'').replace(/\s+/g,' ');
+  const patterns=[
+    /[¥￥]\s*([0-9][0-9,]*)/,
+    /([0-9][0-9,]*)\s*(?:JPY|円|yen)/i
+  ];
+  for(const p of patterns){
+    const m=s.match(p);
+    if(m)return Number(m[1].replaceAll(',',''));
+  }
   return null;
 }
-async function searchBuyeeLive({ queries, maxItems=30, minEur=null, maxEur=null, sessionId }) {
-  const maxQueries = clampInt(process.env.BUYEE_MAX_QUERIES || 2, 2, 1, 4);
-  const selected = (queries || []).slice(0,maxQueries);
-  const seen = new Set();
-  const perQuery=[];
-  let kept=0;
-  for (const q0 of selected) {
-    const q=String(q0).trim(); if(!q) continue;
-    const url=`https://buyee.jp/item/search/query/${encodeURIComponent(q)}?lang=en`;
-    const r=await fetch(url,{headers:{'user-agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150 Safari/537.36','accept-language':'en-US,en;q=0.9,ja;q=0.8'}});
-    if(!r.ok) throw new Error(`Buyee HTTP ${r.status}`);
-    const html=await r.text();
-    const $=loadHtml(html);
-    const candidates=[];
-    $('a[href]').each((_,el)=>{
-      const hrefRaw=$(el).attr('href')||'';
-      if(!hrefRaw.includes('/item/') || hrefRaw.includes('/item/search/')) return;
-      const href=normalizeUrl(hrefRaw,'https://buyee.jp');
-      if(!href.startsWith('https://buyee.jp/')) return;
-      let root=$(el).closest('li,article');
-      if(!root.length) root=$(el).parent().parent();
-      const img=$(el).find('img').first().attr('src') || root.find('img').first().attr('src') || '';
-      const title=$(el).attr('title') || $(el).find('img').first().attr('alt') || root.find('[class*=title],[class*=name]').first().text().trim() || $(el).text().trim();
-      const blob=root.text().replace(/\s+/g,' ').trim();
-      const price=parseYen(blob);
-      if(!title || title.length<2) return;
-      candidates.push({href,title,blob,price,img:normalizeUrl(img,'https://buyee.jp')});
-    });
-    let local=0;
-    for(const c of candidates){
-      if(local>=Number(maxItems)) break;
-      const key=c.href; if(seen.has(key)) continue; seen.add(key);
-      const pe=toEur(c.price,'JPY');
-      if(Number.isFinite(Number(minEur)) && pe!=null && pe<Number(minEur)) continue;
-      if(Number.isFinite(Number(maxEur)) && pe!=null && pe>Number(maxEur)) continue;
-      const source=buyeeSourceFromHref(c.href);
-      const sourceId=new URL(c.href).pathname.replace(/^\/+|\/+$/g,'') || c.href;
-      upsertListing({
-        source, source_id:sourceId, url:c.href, title:c.title, description:c.blob,
-        original_price:c.price, currency:'JPY', price_eur:pe, image_url:c.img, purchase_via:'Buyee', raw:{query:q,searchUrl:url,text:c.blob}
-      },sessionId,q);
-      local++; kept++;
-    }
-    perQuery.push({
-      query:q,
-      count:local,
-      candidateAnchors:candidates.length,
-      searchUrl:url,
-      warning: candidates.length === 0 ? 'Buyee devolvió HTML pero el conector no encontró tarjetas de producto. Esto NO confirma que no haya inventario; puede ser renderizado dinámico o protección del sitio.' : null
-    });
-    await sleep(700);
+
+function japanNormalizeHref(raw,base){
+  try{
+    return new URL(String(raw||''),base).href;
+  }catch{
+    return '';
   }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('buyee','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
-  return {ok:true,perQuery,kept};
+}
+
+function japanCandidateRoot($,el){
+  let root=$(el).closest('li,article');
+  if(root.length)return root;
+
+  let current=$(el);
+  for(let i=0;i<4;i++){
+    current=current.parent();
+    if(!current.length)break;
+    const text=current.text().replace(/\s+/g,' ').trim();
+    if(text.length>=25)return current;
+  }
+
+  return $(el);
+}
+
+function japanCardImage($,el,root,base){
+  const candidates=[
+    $(el).find('img').first().attr('src'),
+    $(el).find('img').first().attr('data-src'),
+    root.find('img').first().attr('src'),
+    root.find('img').first().attr('data-src')
+  ];
+
+  for(const value of candidates){
+    if(value){
+      const url=japanNormalizeHref(value,base);
+      if(url)return url;
+    }
+  }
+
+  return '';
+}
+
+function japanSourceId(source,href){
+  try{
+    const u=new URL(href);
+    let m=null;
+
+    if(source==='yahoo-auctions-jp'){
+      m=u.pathname.match(/\/auction\/([^/?#]+)/i);
+      if(m)return m[1];
+    }
+
+    if(source==='mercari-jp'){
+      m=u.pathname.match(/\/item\/(m\d+)/i);
+      if(m)return m[1];
+
+      m=u.pathname.match(/\/shops\/product\/([^/?#]+)/i);
+      if(m)return `shops-${m[1]}`;
+    }
+
+    if(source==='rakuma-jp'){
+      m=u.pathname.match(/^\/([a-f0-9]+)\/?$/i);
+      if(m)return m[1];
+    }
+
+    if(source==='yahoo-fleamarket-jp'){
+      m=u.pathname.match(/\/item\/([^/?#]+)/i);
+      if(m)return m[1];
+    }
+
+    if(source==='2ndstreet-jp'){
+      m=u.pathname.match(/\/goods\/([^/?#]+)/i);
+      if(m)return m[1];
+    }
+
+    if(source==='komehyo-jp'){
+      m=u.pathname.match(/\/product\/([^/?#]+)/i);
+      if(m)return m[1];
+    }
+
+    return u.pathname.replace(/^\/+|\/+$/g,'')||href;
+  }catch{
+    return href;
+  }
+}
+
+function japanFindJsonLdProduct($){
+  let found=null;
+
+  const walk=value=>{
+    if(found||value==null)return;
+
+    if(Array.isArray(value)){
+      for(const x of value)walk(x);
+      return;
+    }
+
+    if(typeof value!=='object')return;
+
+    const type=value['@type'];
+
+    if(
+      type==='Product'||
+      (Array.isArray(type)&&type.includes('Product'))
+    ){
+      found=value;
+      return;
+    }
+
+    if(value['@graph'])walk(value['@graph']);
+  };
+
+  $('script[type="application/ld+json"]').each((_,el)=>{
+    if(found)return;
+
+    try{
+      const raw=$(el).html();
+      if(!raw)return;
+      walk(JSON.parse(raw));
+    }catch{}
+  });
+
+  return found;
+}
+
+function japanOffer(product){
+  const offers=product?.offers;
+  if(Array.isArray(offers))return offers[0]||null;
+  return offers&&typeof offers==='object'?offers:null;
+}
+
+function japanProductImage(product){
+  const image=product?.image;
+
+  if(Array.isArray(image)){
+    for(const x of image){
+      if(typeof x==='string'&&/^https?:\/\//i.test(x))return x;
+      if(x&&typeof x==='object'&&/^https?:\/\//i.test(String(x.url||'')))return x.url;
+    }
+  }
+
+  if(typeof image==='string'&&/^https?:\/\//i.test(image))return image;
+  if(image&&typeof image==='object'&&/^https?:\/\//i.test(String(image.url||'')))return image.url;
+
+  return '';
+}
+
+function japanRelativePublication(text){
+  const s=String(text||'').replace(/\s+/g,' ');
+  const now=Date.now();
+
+  let m=s.match(/(?:たった今|数秒前)/);
+  if(m){
+    return {
+      raw:m[0],
+      publishedAt:new Date(now).toISOString(),
+      provenance:'marketplace-relative-age'
+    };
+  }
+
+  m=s.match(/(?:約\s*)?(\d+)\s*秒前/);
+  if(m){
+    const seconds=Number(m[1]);
+    return {
+      raw:m[0],
+      publishedAt:new Date(now-seconds*1000).toISOString(),
+      provenance:'marketplace-relative-age'
+    };
+  }
+
+  m=s.match(/(?:約\s*)?(\d+)\s*分前/);
+  if(m){
+    const minutes=Number(m[1]);
+    return {
+      raw:m[0],
+      publishedAt:new Date(now-minutes*60*1000).toISOString(),
+      provenance:'marketplace-relative-age'
+    };
+  }
+
+  m=s.match(/(?:約\s*)?(\d+)\s*時間前/);
+  if(m){
+    const hours=Number(m[1]);
+
+    if(hours>=24)return null;
+
+    return {
+      raw:m[0],
+      publishedAt:new Date(now-hours*60*60*1000).toISOString(),
+      provenance:'marketplace-relative-age'
+    };
+  }
+
+  return null;
+}
+
+function japanExactPublishedAt(year,month,day,hour,minute,second=0){
+  const pad=n=>String(n).padStart(2,'0');
+  const iso=`${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}+09:00`;
+  const ms=Date.parse(iso);
+  return Number.isFinite(ms)?new Date(ms).toISOString():null;
+}
+
+function japanYahooFleaPublication(text){
+  const s=String(text||'').replace(/\s+/g,' ');
+  const m=s.match(
+    /出品日時\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[:時](\d{2})(?:[:分](\d{2}))?/
+  );
+
+  if(!m)return null;
+
+  const publishedAt=japanExactPublishedAt(
+    Number(m[1]),
+    Number(m[2]),
+    Number(m[3]),
+    Number(m[4]),
+    Number(m[5]),
+    Number(m[6]||0)
+  );
+
+  return publishedAt?{
+    raw:m[0],
+    publishedAt,
+    provenance:'marketplace-exact-published-time'
+  }:null;
+}
+
+function japanAuctionPublication(text){
+  const s=String(text||'').replace(/\s+/g,' ');
+
+  let m=s.match(
+    /開始日時\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[:時](\d{2})(?:[:分](\d{2}))?/
+  );
+
+  if(m){
+    const publishedAt=japanExactPublishedAt(
+      Number(m[1]),
+      Number(m[2]),
+      Number(m[3]),
+      Number(m[4]),
+      Number(m[5]),
+      Number(m[6]||0)
+    );
+
+    if(publishedAt){
+      return {
+        raw:m[0],
+        publishedAt,
+        provenance:'auction-start-time'
+      };
+    }
+  }
+
+  m=s.match(
+    /(?:Start Time|Start Date)\s*[:：]?\s*([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?)/i
+  );
+
+  if(m){
+    const ms=Date.parse(`${m[1]} GMT+0900`);
+
+    if(Number.isFinite(ms)){
+      return {
+        raw:m[0],
+        publishedAt:new Date(ms).toISOString(),
+        provenance:'auction-start-time'
+      };
+    }
+  }
+
+  return null;
+}
+
+function japanInventoryArrival(text){
+  const s=String(text||'').replace(/\s+/g,' ');
+  const m=s.match(/(\d{1,2})月(\d{1,2})日入荷/);
+
+  if(!m)return null;
+
+  return {
+    raw:m[0],
+    month:Number(m[1]),
+    day:Number(m[2]),
+    provenance:'inventory-arrival-not-publication'
+  };
+}
+
+function japanPublicationFor(source,text){
+  if(source==='mercari-jp'||source==='rakuma-jp'){
+    return japanRelativePublication(text);
+  }
+
+  if(source==='yahoo-fleamarket-jp'){
+    return japanYahooFleaPublication(text);
+  }
+
+  if(source==='yahoo-auctions-jp'){
+    return japanAuctionPublication(text);
+  }
+
+  return null;
+}
+
+function japanYenPrice(source,product,body,candidate){
+  const offer=japanOffer(product);
+  const offerCurrency=String(offer?.priceCurrency||'').toUpperCase();
+  const offerPrice=Number(offer?.price??offer?.lowPrice);
+
+  if(
+    Number.isFinite(offerPrice)&&
+    offerPrice>0&&
+    (!offerCurrency||offerCurrency==='JPY')
+  ){
+    return offerPrice;
+  }
+
+  const text=String(body||'').replace(/\s+/g,' ');
+  let m=null;
+
+  if(source==='komehyo-jp'){
+    m=text.match(/販売価格(?:\(税込\))?\s*[¥￥]\s*([0-9][0-9,]*)/);
+    if(m)return Number(m[1].replaceAll(',',''));
+  }
+
+  if(source==='yahoo-auctions-jp'){
+    m=text.match(
+      /(?:Current Price|Current Bid|現在価格|現在の価格)[^0-9¥￥]{0,50}[¥￥]?\s*([0-9][0-9,]*)/i
+    );
+
+    if(m)return Number(m[1].replaceAll(',',''));
+
+    return null;
+  }
+
+  const direct=parseYen(text);
+  if(Number.isFinite(direct)&&direct>0)return direct;
+
+  if(Number.isFinite(Number(candidate?.price))&&Number(candidate.price)>0){
+    return Number(candidate.price);
+  }
+
+  return null;
+}
+
+async function japanHttpSnapshot(url){
+  const r=await fetch(url,{
+    headers:JAPAN_HTTP_HEADERS,
+    redirect:'follow',
+    signal:AbortSignal.timeout(20000)
+  });
+
+  const html=await r.text();
+  const $=loadHtml(html);
+  const body=$('body').text().replace(/\s+/g,' ').trim();
+
+  return {
+    status:r.status,
+    finalUrl:r.url||url,
+    html,
+    body,
+    title:$('title').first().text().replace(/\s+/g,' ').trim()
+  };
+}
+
+async function japanBrowserSnapshot(context,url,waitMs=1000){
+  const page=await context.newPage();
+
+  try{
+    const response=await page.goto(url,{
+      waitUntil:'domcontentloaded',
+      timeout:45000
+    });
+
+    await page.waitForTimeout(waitMs);
+
+    const html=await page.content();
+
+    const body=await page.locator('body')
+      .innerText()
+      .catch(()=>'');
+
+    return {
+      status:response?.status()??0,
+      finalUrl:page.url(),
+      html,
+      body:String(body||'').replace(/\s+/g,' ').trim(),
+      title:await page.title().catch(()=>'')
+    };
+  }finally{
+    await page.close();
+  }
+}
+
+function japanCollectCandidates(spec,html){
+  const $=loadHtml(html);
+  const out=[];
+  const seen=new Set();
+
+  $('a[href]').each((_,el)=>{
+    const raw=$(el).attr('href')||'';
+    const href=japanNormalizeHref(raw,spec.base);
+
+    if(!href)return;
+
+    let u=null;
+    try{
+      u=new URL(href);
+    }catch{
+      return;
+    }
+
+    if(!spec.accepts(u))return;
+    if(seen.has(href))return;
+    seen.add(href);
+
+    const root=japanCandidateRoot($,el);
+
+    const alt=$(el).find('img').first().attr('alt')||'';
+
+    const text=$(el)
+      .text()
+      .replace(/\s+/g,' ')
+      .trim();
+
+    const blob=root
+      .text()
+      .replace(/\s+/g,' ')
+      .trim();
+
+    const title=(
+      alt||
+      $(el).attr('title')||
+      text||
+      blob
+    ).replace(/\s+/g,' ').trim();
+
+    if(!title||title.length<2)return;
+
+    out.push({
+      href,
+      title,
+      blob,
+      price:parseYen(blob),
+      img:japanCardImage($,el,root,spec.base)
+    });
+  });
+
+  return out;
+}
+
+async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
+  const snap=spec.mode==='browser'
+    ? await japanBrowserSnapshot(
+        browserContext,
+        candidate.href,
+        spec.detailWaitMs||900
+      )
+    : await japanHttpSnapshot(candidate.href);
+
+  if(snap.status>=400){
+    throw new Error(`HTTP ${snap.status}`);
+  }
+
+  const $=loadHtml(snap.html);
+  const product=japanFindJsonLdProduct($);
+  const offer=japanOffer(product);
+
+  const ogTitle=$('meta[property="og:title"]').attr('content')||'';
+  const h1=$('h1').first().text().replace(/\s+/g,' ').trim();
+
+  let title=String(
+    product?.name||
+    ogTitle||
+    h1||
+    candidate.title||
+    snap.title||
+    ''
+  ).replace(/\s+/g,' ').trim();
+
+  title=title
+    .replace(/\s+\|\s+フリマアプリ\s+ラクマ.*$/i,'')
+    .replace(/\s+-\s+メルカリ.*$/i,'')
+    .trim();
+
+  const description=String(
+    product?.description||
+    $('meta[property="og:description"]').attr('content')||
+    candidate.blob||
+    snap.body||
+    ''
+  ).trim();
+
+  const price=japanYenPrice(
+    spec.id,
+    product,
+    snap.body,
+    candidate
+  );
+
+  const image=
+    japanProductImage(product)||
+    $('meta[property="og:image"]').attr('content')||
+    candidate.img||
+    '';
+
+  const publication=japanPublicationFor(
+    spec.id,
+    snap.body
+  );
+
+  const arrival=spec.id==='komehyo-jp'
+    ? japanInventoryArrival(
+        `${candidate.blob||''} ${snap.body||''}`
+      )
+    : null;
+
+  const seller=
+    String(
+      offer?.seller?.name||
+      ''
+    ).trim();
+
+  const sourceId=japanSourceId(
+    spec.id,
+    candidate.href
+  );
+
+  const status=/SOLD OUT|売り切れ|売切れ/i.test(snap.body)
+    ? 'sold'
+    : '';
+
+  return {
+    source:spec.id,
+    source_id:sourceId,
+    url:candidate.href,
+    title,
+    description,
+    original_price:price,
+    currency:'JPY',
+    price_eur:price==null?null:toEur(price,'JPY'),
+    seller_name:seller,
+    image_url:image,
+    status,
+    purchase_via:spec.purchaseVia,
+    publishedAt:publication?.publishedAt||null,
+    raw:{
+      query:searchMeta.query,
+      searchUrl:searchMeta.searchUrl,
+      searchMode:spec.mode,
+      sourceLabel:spec.label,
+      purchaseVia:spec.purchaseVia,
+      detailHttpStatus:snap.status,
+      finalUrl:snap.finalUrl,
+      cardText:candidate.blob,
+      publishedAt:publication?.publishedAt||null,
+      publicationRaw:publication?.raw||null,
+      publicationProvenance:publication?.provenance||null,
+      inventoryArrival:arrival,
+      inventoryArrivalIsPublication:false,
+      newlyPosted:Boolean(
+        publication?.publishedAt&&
+        Date.now()-Date.parse(publication.publishedAt)<24*60*60*1000
+      )
+    }
+  };
+}
+
+async function searchJapanSource(
+  spec,
+  {
+    queries,
+    maxItems=30,
+    minEur=null,
+    maxEur=null,
+    sessionId,
+    personalOnly=false
+  },
+  browserContext
+){
+  const maxQueries=clampInt(
+    process.env.BUYEE_MAX_QUERIES||2,
+    2,
+    1,
+    4
+  );
+
+  const selected=(queries||[])
+    .map(x=>String(x||'').trim())
+    .filter(Boolean)
+    .slice(0,maxQueries);
+
+  const sourceLimit=Math.min(
+    Number(maxItems)||30,
+    spec.cap
+  );
+
+  const seen=new Set();
+  const perQuery=[];
+
+  let kept=0;
+  let withPublicationDate=0;
+  let detailErrors=0;
+  let successfulQueries=0;
+
+  if(spec.mode==='browser'&&!browserContext){
+    return {
+      ok:false,
+      source:spec.id,
+      label:spec.label,
+      purchaseVia:spec.purchaseVia,
+      mode:spec.mode,
+      kept:0,
+      withPublicationDate:0,
+      detailErrors:0,
+      perQuery:[],
+      error:'Playwright browser unavailable'
+    };
+  }
+
+  for(const q of selected){
+    const searchUrl=spec.searchUrl(q);
+
+    let snap=null;
+    let candidates=[];
+
+    try{
+      snap=spec.mode==='browser'
+        ? await japanBrowserSnapshot(
+            browserContext,
+            searchUrl,
+            spec.searchWaitMs||2500
+          )
+        : await japanHttpSnapshot(searchUrl);
+
+      if(snap.status>=400){
+        throw new Error(`HTTP ${snap.status}`);
+      }
+
+      successfulQueries++;
+
+      candidates=japanCollectCandidates(
+        spec,
+        snap.html
+      );
+
+      if(spec.id==='mercari-jp'&&personalOnly){
+        candidates=candidates.filter(
+          x=>/^https:\/\/jp\.mercari\.com\/item\/m/i.test(x.href)
+        );
+      }
+
+      let local=0;
+
+      for(const candidate of candidates){
+        if(kept>=sourceLimit)break;
+
+        const sourceId=japanSourceId(
+          spec.id,
+          candidate.href
+        );
+
+        const dedupeKey=`${spec.id}:${sourceId}`;
+
+        if(seen.has(dedupeKey))continue;
+        seen.add(dedupeKey);
+
+        let item=null;
+
+        try{
+          item=await japanEnrichCandidate(
+            spec,
+            candidate,
+            {query:q,searchUrl},
+            browserContext
+          );
+        }catch{
+          detailErrors++;
+          continue;
+        }
+
+        if(item.status==='sold')continue;
+
+        const pe=Number(item.price_eur);
+        const hasMinEur=
+          minEur!==null&&
+          minEur!==undefined&&
+          minEur!==''&&
+          Number.isFinite(Number(minEur));
+        const hasMaxEur=
+          maxEur!==null&&
+          maxEur!==undefined&&
+          maxEur!==''&&
+          Number.isFinite(Number(maxEur));
+
+        if(
+          hasMinEur&&
+          Number.isFinite(pe)&&
+          pe<Number(minEur)
+        ){
+          continue;
+        }
+
+        if(
+          hasMaxEur&&
+          Number.isFinite(pe)&&
+          pe>Number(maxEur)
+        ){
+          continue;
+        }
+
+        upsertListing(item,sessionId,q);
+
+        local++;
+        kept++;
+
+        if(item.publishedAt){
+          withPublicationDate++;
+        }
+      }
+
+      perQuery.push({
+        query:q,
+        count:local,
+        candidateAnchors:candidates.length,
+        searchUrl,
+        httpStatus:snap.status,
+        finalUrl:snap.finalUrl
+      });
+    }catch(e){
+      perQuery.push({
+        query:q,
+        count:0,
+        candidateAnchors:0,
+        searchUrl,
+        httpStatus:snap?.status??null,
+        finalUrl:snap?.finalUrl??searchUrl,
+        error:e.message
+      });
+    }
+  }
+
+  const ok=successfulQueries>0;
+
+  return {
+    ok,
+    source:spec.id,
+    label:spec.label,
+    purchaseVia:spec.purchaseVia,
+    mode:spec.mode,
+    kept,
+    withPublicationDate,
+    detailErrors,
+    perQuery,
+    error:ok?null:'No accessible search query succeeded'
+  };
+}
+
+async function searchJapanRadarLive(opts){
+  const perSource={};
+  let kept=0;
+  let withPublicationDate=0;
+
+  let browser=null;
+  let browserContext=null;
+  let browserError=null;
+
+  const needsBrowser=JAPAN_RADAR_SPECS.some(
+    x=>x.mode==='browser'
+  );
+
+  if(needsBrowser){
+    try{
+      const {chromium}=await import('playwright');
+
+      browser=await chromium.launch({
+        headless:true
+      });
+
+      browserContext=await browser.newContext({
+        locale:'ja-JP',
+        userAgent:JAPAN_HTTP_HEADERS['user-agent']
+      });
+    }catch(e){
+      browserError=e.message;
+    }
+  }
+
+  try{
+    for(const spec of JAPAN_RADAR_SPECS){
+      try{
+        const result=await searchJapanSource(
+          spec,
+          opts,
+          browserContext
+        );
+
+        if(
+          spec.mode==='browser'&&
+          !browserContext&&
+          browserError
+        ){
+          result.error=browserError;
+        }
+
+        perSource[spec.id]=result;
+        kept+=Number(result.kept||0);
+        withPublicationDate+=Number(
+          result.withPublicationDate||0
+        );
+      }catch(e){
+        perSource[spec.id]={
+          ok:false,
+          source:spec.id,
+          label:spec.label,
+          purchaseVia:spec.purchaseVia,
+          mode:spec.mode,
+          kept:0,
+          withPublicationDate:0,
+          detailErrors:0,
+          perQuery:[],
+          error:e.message
+        };
+      }
+    }
+  }finally{
+    if(browserContext){
+      await browserContext.close().catch(()=>{});
+    }
+
+    if(browser){
+      await browser.close().catch(()=>{});
+    }
+  }
+
+  db.prepare(
+    'INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)'
+  ).run(
+    'buyee',
+    'japan-multisource-search',
+    `Sources ${Object.keys(perSource).length}; kept ${kept}; dated ${withPublicationDate}`,
+    new Date().toISOString()
+  );
+
+  return {
+    ok:Object.values(perSource).some(x=>x.ok),
+    radar:'japan-multisource-v2',
+    kept,
+    withPublicationDate,
+    perSource
+  };
 }
 
 // POSITIVE MARKET VERIFICATION V1.6
@@ -3871,7 +4759,17 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
     searchCommand:`bunjang-cli --json --preferred-transport browser search ${JSON.stringify(q)} --pages ${pages} --max-items ${maxItems}`,
     detailCommand:'bunjang-cli --json item list --ids <IDs encontrados, lotes de 40>'
   }));
-  const japanCalls=jQueries.map(q=>({query:q,method:'GET',url:`https://buyee.jp/item/search/query/${encodeURIComponent(q)}?lang=en`}));
+  const japanCalls=JAPAN_RADAR_SPECS.flatMap(spec=>
+    jQueries.map(q=>({
+      source:spec.id,
+      label:spec.label,
+      purchaseVia:spec.purchaseVia,
+      mode:spec.mode,
+      query:q,
+      method:spec.mode==='browser'?'BROWSER GET':'GET',
+      url:spec.searchUrl(q)
+    }))
+  );
   let liveStatus={};
   try { liveStatus=JSON.parse(session?.source_status_json||run?.source_status_json||'{}'); } catch {}
   return {
@@ -3885,7 +4783,7 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
     connectors:{
       xianyu:{enabled:sources.includes('xianyu'),baseUrl:XIANYU_BASE_URL,queriesExecuted:xQueries,calls:xianyuCalls},
       bunjang:{enabled:sources.includes('bunjang'),binary:bunjangCli,queriesExecuted:bQueries,calls:bunjangCalls},
-      japan:{enabled:sources.includes('buyee'),provider:'Buyee search pages',queriesExecuted:jQueries,calls:japanCalls}
+      japan:{enabled:sources.includes('buyee'),provider:'Japan multi-source radar v2',queriesExecuted:jQueries,calls:japanCalls}
     },
     ai:{enabled:task.decision_mode==='ai',configured:!!process.env.GEMINI_API_KEY,model:process.env.GEMINI_MODEL||'gemini-3.8-flash',analyzeImages:!!task.analyze_images,centralInstruction:CENTRAL_AI_INSTRUCTION,userCriteria:task.description||'',keywordRules:task.keyword_rules||[],positiveVerification:{mandatory:true,stages:['preliminary-screen','exact-visual-model-check','live-google-market-comparables','deterministic-final-decision'],prioritySources:['Vestiaire Collective','Collector Square','EU specialist resellers','The RealReal','Fashionphile','Rebag'],strongBuyMinimum:{modelConfidence:0.85,relevantComparables:3,independentSources:2,marketConfidence:'HIGH'},marketplaceAuthenticitySignal:{enabled:true,xianyu:'Xianyu Verification / 验货宝',bunjang:'Bunjang Care / 번개케어',scores:{AVAILABLE:4,PASSED:8,UNKNOWN:0,UNAVAILABLE:0},failed:'REJECT',sellerAuthenticityClaimIsNotPassed:true}}},
     economics:getEconomics(),
@@ -3916,7 +4814,7 @@ async function globalSearch(body) {
   };
   const jobs=[];
   if(sources.includes('bunjang')) { status.bunjang={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.bunjang=await searchBunjangLive({...opts,queries:plan.bunjang});}catch(e){status.bunjang={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
-  if(sources.includes('buyee')) { status.buyee={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.buyee=await searchBuyeeLive({...opts,queries:plan.japan});}catch(e){status.buyee={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
+  if(sources.includes('buyee')) { status.buyee={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.buyee=await searchJapanRadarLive({...opts,queries:plan.japan});}catch(e){status.buyee={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
   await Promise.all(jobs);
   if(sources.includes('xianyu')) { status.xianyu={ok:null,state:'running'}; persistStatus(); try{status.xianyu=await searchXianyuLive({...opts,queries:plan.xianyu});}catch(e){status.xianyu={ok:false,state:'error',error:e.message};} finally{persistStatus();} }
   const finishedAt=new Date().toISOString();
@@ -4038,7 +4936,11 @@ function listingPublishedAtMs(item){
     'mercari-jp',
     'rakuma-jp',
     'jdirectitems-auction',
-    'jdirectitems-fleamarket'
+    'jdirectitems-fleamarket',
+    'yahoo-auctions-jp',
+    'yahoo-fleamarket-jp',
+    '2ndstreet-jp',
+    'komehyo-jp'
   ]);
 
   if(japanSources.has(source)){
