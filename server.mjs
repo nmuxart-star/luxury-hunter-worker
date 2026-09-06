@@ -1830,6 +1830,89 @@ function visionSourceName(url){
   }
 }
 
+// TRUSTED LUXURY MARKET SOURCES V1
+// Google / Vision se utiliza para DESCUBRIR.
+// Solo estas fuentes pueden convertirse en evidencia de mercado.
+
+const TRUSTED_LUXURY_MARKET_DOMAINS=Object.freeze([
+  'vestiairecollective.com',
+  'collectorsquare.com',
+  'therealreal.com',
+  'fashionphile.com',
+  'rebag.com',
+  '1stdibs.com',
+  'yoogiscloset.com',
+  'whatgoesaroundnyc.com',
+  'annsfabulousfinds.com',
+  'hardlyeverwornit.com',
+  'sothebys.com',
+  'christies.com'
+]);
+
+function luxuryMarketHostname(value){
+  try{
+    return new URL(String(value||'').trim())
+      .hostname
+      .toLowerCase()
+      .replace(/^www\./,'');
+  }catch{
+    return '';
+  }
+}
+
+function trustedLuxuryMarketUrl(value){
+  const host=luxuryMarketHostname(value);
+
+  if(!host)return false;
+
+  return TRUSTED_LUXURY_MARKET_DOMAINS.some(
+    domain=>
+      host===domain ||
+      host.endsWith(`.${domain}`)
+  );
+}
+
+function trustedLuxuryMarketEntry(entry){
+  const url=String(
+    entry?.url ||
+    entry?.link ||
+    entry?.uri ||
+    ''
+  ).trim();
+
+  return trustedLuxuryMarketUrl(url);
+}
+
+function trustedLuxuryMarketSourceName(value){
+  const host=luxuryMarketHostname(value);
+
+  const labels={
+    'vestiairecollective.com':'Vestiaire Collective',
+    'collectorsquare.com':'Collector Square',
+    'therealreal.com':'The RealReal',
+    'fashionphile.com':'Fashionphile',
+    'rebag.com':'Rebag',
+    '1stdibs.com':'1stDibs',
+    'yoogiscloset.com':"Yoogi's Closet",
+    'whatgoesaroundnyc.com':'What Goes Around Comes Around',
+    'annsfabulousfinds.com':"Ann's Fabulous Finds",
+    'hardlyeverwornit.com':'HEWI',
+    'sothebys.com':"Sotheby's",
+    'christies.com':"Christie's"
+  };
+
+  for(const [domain,label] of Object.entries(labels)){
+    if(
+      host===domain ||
+      host.endsWith(`.${domain}`)
+    ){
+      return label;
+    }
+  }
+
+  return '';
+}
+
 async function googleVisionWebDetection(item){
   const apiKey=String(
     process.env.GOOGLE_CLOUD_VISION_API_KEY||''
@@ -2004,7 +2087,11 @@ async function googleVisionWebDetection(item){
         Array.isArray(p?.partialMatchingImages)
           ? p.partialMatchingImages.map(imageRef)
           : []
-    })).filter(p=>p.url);
+    })).filter(
+      p=>
+        p.url &&
+        trustedLuxuryMarketUrl(p.url)
+    );
 
     return {
       enabled:true,
@@ -2137,13 +2224,32 @@ VISUAL-CANDIDATE RULES:
 - If the candidate is visually relevant but pricing/date evidence cannot be validated, preserve it as research evidence rather than inventing information.
 - Do not return zero research results without considering the visual candidates above when they exist.
 
-SOURCE PRIORITY:
-1. Vestiaire Collective, European listings/prices where available.
-2. Collector Square and specialist European second-hand luxury resellers found through Google.
-3. The RealReal.
-4. Fashionphile.
-5. Rebag.
-6. Other reputable second-hand luxury resellers if useful.
+SOURCE POLICY — HARD WHITELIST:
+Google Search and Google Cloud Vision are DISCOVERY mechanisms only.
+A result becomes market evidence ONLY when its final/direct URL belongs to one of these approved domains:
+
+1. vestiairecollective.com — Vestiaire Collective
+2. collectorsquare.com — Collector Square
+3. therealreal.com — The RealReal
+4. fashionphile.com — Fashionphile
+5. rebag.com — Rebag
+6. 1stdibs.com — 1stDibs
+7. yoogiscloset.com — Yoogi's Closet
+8. whatgoesaroundnyc.com — What Goes Around Comes Around
+9. annsfabulousfinds.com — Ann's Fabulous Finds
+10. hardlyeverwornit.com — HEWI
+11. sothebys.com — Sotheby's
+12. christies.com — Christie's
+
+HARD SOURCE RULES:
+- Do NOT use or return YouTube.
+- Do NOT use or return Reddit, Pinterest, Instagram, TikTok or Facebook.
+- Do NOT use ShopMy.
+- Do NOT use blogs, SEO pages, generic shops, affiliate pages or unknown domains.
+- Do NOT use a Google search-result page itself as a comparable.
+- Do NOT treat an image-match host as a market source unless the landing page belongs to the whitelist above.
+- Brand-new retail MSRP pages are not resale comparables.
+- If the whitelist does not provide enough evidence, report insufficient market evidence. Never relax the whitelist.
 
 COMPARABLE RULES:
 - Same exact variant/size/material/pattern/edition = EXACT.
@@ -2227,8 +2333,28 @@ Return ONLY JSON:
     'Evaluando relevancia de las referencias encontradas'
   );
 
-  let comps=Array.isArray(result.data?.comparables)?result.data.comparables:[];
-  let marketGroundingSources=Array.isArray(result.groundingSources)?result.groundingSources:[];
+  const rawFirstPassComps=
+    Array.isArray(result.data?.comparables)
+      ? result.data.comparables
+      : [];
+
+  let comps=
+    rawFirstPassComps.filter(
+      trustedLuxuryMarketEntry
+    );
+
+  let rejectedUntrustedReferenceCount=
+    rawFirstPassComps.length-comps.length;
+
+  const rawFirstPassGrounding=
+    Array.isArray(result.groundingSources)
+      ? result.groundingSources
+      : [];
+
+  let marketGroundingSources=
+    rawFirstPassGrounding.filter(
+      trustedLuxuryMarketEntry
+    );
   let marketWebSearchQueries=Array.isArray(result.webSearchQueries)
     ? result.webSearchQueries
     : [];
@@ -2322,7 +2448,7 @@ Requirements:
 10. Prioritize finding comparables whose physical condition is SIMILAR to the target condition.
 11. Do not infer a condition from price alone.
 12. Do not convert better/worse condition listings into the target value using a fixed discount or premium.
-9. Search specifically for additional results on Vestiaire Collective, The RealReal, Fashionphile, Rebag, Collector Square, specialist EU resellers and credible sold/archived listings.
+9. Search specifically for additional results ONLY on the HARD WHITELIST defined above. Do not use specialist resellers outside that whitelist, even when Google surfaces them.
 10. Continue broadening until you either obtain at least 3 useful EXACT/NEAR comparables from at least 2 independent sources, or the available grounded evidence is genuinely exhausted.
 11. Return real URLs and evidence-backed prices whenever available.
 12. Do not invent comparables if a page cannot be grounded.
@@ -2390,6 +2516,23 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
       return true;
     });
   }
+  // BACKEND HARD GATE:
+  // Ninguna fuente fuera de la whitelist puede llegar a
+  // valoración, confidence, referencias o UI.
+  const preFinalTrustFilterCount=comps.length;
+
+  comps=comps.filter(
+    trustedLuxuryMarketEntry
+  );
+
+  rejectedUntrustedReferenceCount+=
+    preFinalTrustFilterCount-comps.length;
+
+  marketGroundingSources=
+    marketGroundingSources.filter(
+      trustedLuxuryMarketEntry
+    );
+
   const structuredResearchReferences=
     comps.slice(0,40).map(c=>({
       source:String(c?.source||'').trim()||sourceKey(c),
@@ -2740,6 +2883,16 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     vision_web_detection:visionWeb,
     visual_candidate_count:visionCandidates.length,
     research_candidate_count:researchReferences.length,
+
+    trusted_market_source_policy:'strict_allowlist',
+
+    trusted_market_domains:[
+      ...TRUSTED_LUXURY_MARKET_DOMAINS
+    ],
+
+    rejected_untrusted_reference_count:
+      rejectedUntrustedReferenceCount,
+
     checked_at:new Date().toISOString(),
 
     search_passes:recallFallbackUsed?2:1,

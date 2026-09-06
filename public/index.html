@@ -571,11 +571,49 @@ function marketAuditHtml(i){
   const auditId=
     `market-audit-${String(i.result_task_id||'task')}-${String(i.id)}`;
 
-  const references=Array.isArray(market.research_references)
-    ? market.research_references
-    : Array.isArray(market.comparables)
-      ? market.comparables
-      : [];
+  const rawReferences=
+    Array.isArray(market.research_references)
+      ? market.research_references
+      : Array.isArray(market.comparables)
+        ? market.comparables
+        : [];
+
+  const trustedMarketHosts=
+    Array.isArray(market.trusted_market_domains) &&
+    market.trusted_market_domains.length
+      ? market.trusted_market_domains
+      : [
+          'vestiairecollective.com',
+          'collectorsquare.com',
+          'therealreal.com',
+          'fashionphile.com',
+          'rebag.com',
+          '1stdibs.com',
+          'yoogiscloset.com',
+          'whatgoesaroundnyc.com',
+          'annsfabulousfinds.com',
+          'hardlyeverwornit.com',
+          'sothebys.com',
+          'christies.com'
+        ];
+
+  const references=rawReferences.filter(r=>{
+    try{
+      const host=new URL(
+        String(r?.url||'')
+      ).hostname
+        .toLowerCase()
+        .replace(/^www\./,'');
+
+      return trustedMarketHosts.some(
+        domain=>
+          host===domain ||
+          host.endsWith('.'+domain)
+      );
+    }catch{
+      return false;
+    }
+  });
 
   const queries=Array.isArray(market.web_search_queries)
     ? market.web_search_queries
