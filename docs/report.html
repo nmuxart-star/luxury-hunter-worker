@@ -436,6 +436,23 @@ function render(p){
   const c=p.condition||{};
   const m=p.market||{};
 
+  const resaleSource=String(
+    m.resale_estimate_source||''
+  ).toUpperCase();
+
+  const resaleConfidence=String(
+    m.resale_estimate_confidence ||
+    m?.ai_resale_estimate?.confidence ||
+    'LOW'
+  ).toUpperCase();
+
+  const resaleSourceLabel=
+    resaleSource==='MARKET_ANALYSIS'
+      ? 'ANÁLISIS DE MERCADO'
+      : resaleSource==='AI_ESTIMATE'
+        ? `ESTIMACIÓN IA · confianza ${resaleConfidence}`
+        : 'ORIGEN NO DISPONIBLE';
+
   const resale=
     n(a.resale_low_eur)!==null ||
     n(a.resale_high_eur)!==null
@@ -540,7 +557,7 @@ function render(p){
           ${eur(a.landed_cost_eur)}
         </div>
 
-        <div class="muted">Reventa</div>
+        <div class="muted">Reventa · ${esc(resaleSourceLabel)}</div>
         <div class="big">${resale}</div>
 
         <div class="muted">
@@ -726,7 +743,7 @@ function render(p){
 
       <div style="margin-top:18px">
         <div class="kv">
-          <span>Reventa estimada</span>
+          <span>Reventa estimada · ${esc(resaleSourceLabel)}</span>
           <b>${resale}</b>
         </div>
 

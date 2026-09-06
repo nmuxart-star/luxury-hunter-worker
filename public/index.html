@@ -998,6 +998,37 @@ function hasFinalOpportunityScore(i){
   if(v?.status==='error'||v?.status==='legacy_pending')return false;
   return i.opportunity_score!==null&&i.opportunity_score!==undefined&&i.opportunity_score!=='';
 }
+function resaleEstimateSourceLabel(i){
+  const v=parseVerification(i)||{};
+  const final=v.final||{};
+  const market=v.market||{};
+
+  const source=String(
+    final.resale_estimate_source ||
+    market.resale_estimate_source ||
+    i?.resale_estimate_source ||
+    ''
+  ).toUpperCase();
+
+  const confidence=String(
+    final.resale_estimate_confidence ||
+    market.resale_estimate_confidence ||
+    market?.ai_resale_estimate?.confidence ||
+    i?.resale_estimate_confidence ||
+    'LOW'
+  ).toUpperCase();
+
+  if(source==='MARKET_ANALYSIS'){
+    return 'ANÁLISIS DE MERCADO';
+  }
+
+  if(source==='AI_ESTIMATE'){
+    return `ESTIMACIÓN IA · confianza ${confidence}`;
+  }
+
+  return 'ORIGEN DE REVENTA NO DISPONIBLE';
+}
+
 function resultListingHtml(i){
   return `<div class="listing">
     <img src="${esc(i.image_url||'')}" onerror="this.style.visibility='hidden'">
@@ -1045,6 +1076,7 @@ function resultListingHtml(i){
         <div class="economics">
           Score <b>${num(i.opportunity_score)}</b>/100<br>
           Reventa ${euro(i.resale_low_eur)}–${euro(i.resale_high_eur)}<br>
+          <span class="subtext">${esc(resaleEstimateSourceLabel(i))}</span><br>
           Profit ${euro(i.net_profit_low_eur)}–${euro(i.net_profit_high_eur)}<br>
           Auth ${esc(i.authenticity_risk||'—')} · Liquidez ${esc(i.liquidity||'—')}
         </div>

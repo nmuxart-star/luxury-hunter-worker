@@ -3103,6 +3103,230 @@ function detectMarketplaceVerification(item){
   return result('UNKNOWN',service,['No se ha podido confirmar si este anuncio admite Bunjang Care.'],'LOW','no_signal');
 }
 
+// AI WESTERN RESALE FALLBACK V2
+async function aiWesternResaleEstimate({
+  key,
+  model,
+  task,
+  exact,
+  market
+}){
+  const exactConfidence=clampNum(
+    exact?.confidence,
+    0,
+    1
+  );
+
+  const context={
+    target_product:
+      task?.product_query||'',
+
+    identified_product:{
+      brand:
+        exact?.brand||'',
+
+      family:
+        exact?.family||'',
+
+      exact_variant:
+        exact?.exact_variant_label||'',
+
+      size:
+        exact?.size||'unknown',
+
+      material:
+        exact?.material||'unknown',
+
+      color:
+        exact?.main_color||'unknown',
+
+      pattern:
+        exact?.pattern||'unknown',
+
+      special_edition:
+        exact?.special_edition===true,
+
+      likely_era:
+        exact?.likely_era||'unknown',
+
+      identification_confidence:
+        exactConfidence
+    },
+
+    visible_condition:
+      exact?.condition||null,
+
+    live_market_result:{
+      relevant_comparables:
+        Number(
+          market?.relevant_comparable_count||0
+        ),
+
+      independent_sources:
+        Number(
+          market?.independent_source_count||0
+        ),
+
+      market_confidence:
+        String(
+          market?.market_confidence||'LOW'
+        )
+    }
+  };
+
+  const prompt=`You are the FALLBACK WESTERN RESALE VALUATION specialist for Luxury Hunter.
+
+The normal live-market research did not produce enough reliable evidence to publish a market-backed resale valuation.
+
+Estimate the CURRENT plausible Western second-hand resale range of the identified luxury item.
+
+THIS IS AN AI APPROXIMATION, NOT A LIVE MARKET OBSERVATION.
+
+STRICT RULES:
+- Do NOT use Google Search.
+- Do NOT claim that you found listings, sales or comparables.
+- Do NOT invent URLs, sources, listings or sold prices.
+- The purchase price is intentionally not supplied. Do NOT try to infer or anchor to it.
+- Base the estimate on brand, exact model/variant, size, material, colour, pattern/edition, likely era and visible physical condition.
+- Think primarily about the European and US luxury resale markets.
+- Estimate what a genuine example in THIS observed condition could plausibly resell for.
+- Use your learned understanding of luxury resale pricing only.
+- Do not apply a fixed percentage formula for condition.
+- If identification, rarity, era or condition is uncertain, widen the range.
+- Avoid false precision.
+- Round prices to sensible EUR increments.
+- confidence may ONLY be LOW or MEDIUM. Never HIGH.
+- This estimate must NEVER be described as market verified.
+- If a meaningful approximation is genuinely impossible, return estimate_available false.
+
+INPUT:
+${JSON.stringify(context)}
+
+Return ONLY JSON:
+{
+  "estimate_available": true,
+  "low_eur": 800,
+  "high_eur": 1100,
+  "confidence": "LOW|MEDIUM",
+  "rationale_es": "Explicación breve en español.",
+  "assumptions_es": [
+    "Supuesto relevante"
+  ]
+}`;
+
+  const result=await geminiJsonRequest({
+    key,
+    model,
+    parts:[{text:prompt}],
+    googleSearch:false
+  });
+
+  const data=result?.data||{};
+
+  if(data?.estimate_available===false){
+    return {
+      available:false,
+      source:'AI_ESTIMATE',
+      confidence:'LOW',
+      low_eur:null,
+      high_eur:null,
+      midpoint_eur:null,
+      rationale_es:
+        String(
+          data?.rationale_es||''
+        ).trim(),
+      assumptions_es:
+        Array.isArray(data?.assumptions_es)
+          ? data.assumptions_es
+              .map(x=>String(x||'').trim())
+              .filter(Boolean)
+              .slice(0,6)
+          : [],
+      generated_at:
+        new Date().toISOString()
+    };
+  }
+
+  let low=Number(data?.low_eur);
+  let high=Number(data?.high_eur);
+
+  if(
+    !Number.isFinite(low) ||
+    !Number.isFinite(high) ||
+    low<=0 ||
+    high<=0
+  ){
+    return {
+      available:false,
+      source:'AI_ESTIMATE',
+      confidence:'LOW',
+      low_eur:null,
+      high_eur:null,
+      midpoint_eur:null,
+      rationale_es:
+        'La IA no produjo un rango de precio utilizable.',
+      assumptions_es:[],
+      generated_at:
+        new Date().toISOString()
+    };
+  }
+
+  if(low>high){
+    const temp=low;
+    low=high;
+    high=temp;
+  }
+
+  low=Math.max(
+    25,
+    Math.round(low/25)*25
+  );
+
+  high=Math.max(
+    low,
+    Math.round(high/25)*25
+  );
+
+  let confidence=
+    String(
+      data?.confidence||'LOW'
+    ).toUpperCase();
+
+  if(
+    confidence!=='MEDIUM' ||
+    exactConfidence<0.80
+  ){
+    confidence='LOW';
+  }
+
+  return {
+    available:true,
+    source:'AI_ESTIMATE',
+    confidence,
+    low_eur:low,
+    high_eur:high,
+    midpoint_eur:
+      Math.round(
+        ((low+high)/2)/25
+      )*25,
+    rationale_es:
+      String(
+        data?.rationale_es||''
+      ).trim(),
+    assumptions_es:
+      Array.isArray(data?.assumptions_es)
+        ? data.assumptions_es
+            .map(x=>String(x||'').trim())
+            .filter(Boolean)
+            .slice(0,6)
+        : [],
+    generated_at:
+      new Date().toISOString(),
+    method:
+      'Gemini learned market knowledge; no Google Search; no live comparables'
+  };
+}
+
 function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketplaceVerification={}){
   const landed=Number(economics.importedTotalEur)||0;
   const marketNumber=v=>{
@@ -3111,11 +3335,107 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
     return Number.isFinite(n)?n:null;
   };
 
-  const conservative=marketNumber(market.conservative_resale_eur);
-  const high=marketNumber(market.market_high_eur);
-  const low=marketNumber(market.market_low_eur);
-  const profit=Number.isFinite(conservative)?roundMoney(conservative-landed):null;
-  const highProfit=Number.isFinite(high)?roundMoney(high-landed):profit;
+  const marketConservative=
+    marketNumber(
+      market.conservative_resale_eur
+    );
+
+  const marketHigh=
+    marketNumber(
+      market.market_high_eur
+    );
+
+  const marketLow=
+    marketNumber(
+      market.market_low_eur
+    );
+
+  const aiEstimate=
+    market?.ai_resale_estimate &&
+    typeof market.ai_resale_estimate==='object'
+      ? market.ai_resale_estimate
+      : {};
+
+  const aiLow=
+    marketNumber(
+      aiEstimate?.low_eur
+    );
+
+  const aiHigh=
+    marketNumber(
+      aiEstimate?.high_eur
+    );
+
+  const marketEstimateAvailable=
+    Number.isFinite(
+      marketConservative
+    );
+
+  const aiEstimateAvailable=
+    aiEstimate?.available===true &&
+    Number.isFinite(aiLow) &&
+    Number.isFinite(aiHigh);
+
+  const resaleEstimateSource=
+    marketEstimateAvailable
+      ? 'MARKET_ANALYSIS'
+      : aiEstimateAvailable
+        ? 'AI_ESTIMATE'
+        : 'UNAVAILABLE';
+
+  const resaleEstimateConfidence=
+    resaleEstimateSource==='MARKET_ANALYSIS'
+      ? String(
+          market?.market_confidence||'LOW'
+        ).toUpperCase()
+      : resaleEstimateSource==='AI_ESTIMATE'
+        ? String(
+            aiEstimate?.confidence||'LOW'
+          ).toUpperCase()
+        : 'LOW';
+
+  const conservative=
+    resaleEstimateSource==='MARKET_ANALYSIS'
+      ? marketConservative
+      : resaleEstimateSource==='AI_ESTIMATE'
+        ? aiLow
+        : null;
+
+  const low=
+    resaleEstimateSource==='MARKET_ANALYSIS'
+      ? (
+          Number.isFinite(marketLow)
+            ? marketLow
+            : marketConservative
+        )
+      : resaleEstimateSource==='AI_ESTIMATE'
+        ? aiLow
+        : null;
+
+  const high=
+    resaleEstimateSource==='MARKET_ANALYSIS'
+      ? (
+          Number.isFinite(marketHigh)
+            ? marketHigh
+            : marketConservative
+        )
+      : resaleEstimateSource==='AI_ESTIMATE'
+        ? aiHigh
+        : null;
+
+  const profit=
+    Number.isFinite(conservative)
+      ? roundMoney(
+          conservative-landed
+        )
+      : null;
+
+  const highProfit=
+    Number.isFinite(high)
+      ? roundMoney(
+          high-landed
+        )
+      : profit;
   const auth=String(preliminary.authenticity_risk||'').toUpperCase();
   const liquidity=String(preliminary.liquidity||'').toUpperCase();
   const conf=clampNum(exact.confidence,0,1);
@@ -3135,9 +3455,16 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
   }else if(auth==='HIGH'){
     decision='REJECT';
     reasons.push('El riesgo de autenticidad preliminar es alto y bloquea la oportunidad.');
+  }else if(resaleEstimateSource==='AI_ESTIMATE'){
+    decision='WATCH';
+
+    reasons.push(
+      `No hay evidencia de mercado suficiente para verificar la reventa. Se muestra una estimación IA occidental de ${Math.round(low)}-${Math.round(high)} EUR con confianza ${resaleEstimateConfidence}.`
+    );
+
   }else if(!Number.isFinite(conservative)||compN===0){
     decision='WATCH';
-    reasons.push('La variante se reviso, pero no hay comparables exactos o suficientemente cercanos para fijar una reventa fiable.');
+    reasons.push('La variante se reviso, pero no hay comparables exactos o suficientemente cercanos ni una estimación IA utilizable para fijar una reventa.');
   }else if(Number.isFinite(profit)&&profit<200){
     decision='REJECT';
     reasons.push(`Tras contrastar comparables, el margen conservador estimado es de ${Math.round(profit)} EUR, por debajo del minimo operativo.`);
@@ -3155,7 +3482,23 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
   if(marketplaceStatus==='PASSED')reasons.push(`${marketplaceVerification.service}: verificacion superada segun evidencia estructurada del marketplace; es una senal positiva adicional, no una garantia absoluta de autenticidad.`);
   else if(marketplaceStatus==='AVAILABLE')reasons.push(`${marketplaceVerification.service}: disponible para este anuncio; reduce el riesgo operativo de compra, pero no demuestra por si sola la autenticidad.`);
   if(compN)reasons.push(`${compN} comparables exactos/cercanos en ${sourceN} fuentes independientes; confianza de mercado ${mconf}.`);
-  if(Number.isFinite(conservative))reasons.push(`Reventa conservadora contrastada: ${Math.round(conservative)} EUR; margen conservador: ${Math.round(profit)} EUR.`);
+  if(
+    Number.isFinite(conservative) &&
+    resaleEstimateSource==='MARKET_ANALYSIS'
+  ){
+    reasons.push(
+      `Reventa conservadora contrastada: ${Math.round(conservative)} EUR; margen conservador: ${Math.round(profit)} EUR.`
+    );
+  }
+
+  if(
+    Number.isFinite(conservative) &&
+    resaleEstimateSource==='AI_ESTIMATE'
+  ){
+    reasons.push(
+      `Reventa orientativa por IA: ${Math.round(low)}-${Math.round(high)} EUR; margen orientativo desde ${Math.round(profit)} EUR. No es una valoración de mercado verificada.`
+    );
+  }
   const profitScore=Number.isFinite(profit)?clampNum((profit-150)/4,0,100):20;
   const marketScore=mconf==='HIGH'?95:mconf==='MEDIUM'?68:35;
   const authScore=auth==='LOW'?92:auth==='MEDIUM'?62:10;
@@ -3166,11 +3509,26 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
   if(marketplaceStatus==='FAILED')score=0;
   else if(decision==='REJECT')score=Math.min(score,55);
   if(decision==='WATCH')score=Math.min(score,79);
+
+  if(resaleEstimateSource==='AI_ESTIMATE'){
+    score=Math.min(score,69);
+  }
+
   return {
     decision,
     opportunity_score:score,
     resale_low_eur:Number.isFinite(low)?low:null,
     resale_high_eur:Number.isFinite(high)?high:null,
+
+    resale_estimate_source:
+      resaleEstimateSource,
+
+    resale_estimate_confidence:
+      resaleEstimateConfidence,
+
+    resale_estimate_market_verified:
+      resaleEstimateSource==='MARKET_ANALYSIS',
+
     landed_cost_eur:landed,
     net_profit_low_eur:Number.isFinite(profit)?profit:null,
     net_profit_high_eur:Number.isFinite(highProfit)?highProfit:null,
@@ -3301,6 +3659,88 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
           onProgress:reportProgress
         });
 
+        const marketResaleAvailable=
+          market?.conservative_resale_eur!==null &&
+          market?.conservative_resale_eur!==undefined &&
+          market?.conservative_resale_eur!=='' &&
+          Number.isFinite(
+            Number(
+              market.conservative_resale_eur
+            )
+          );
+
+        market.ai_resale_estimate=null;
+
+        market.resale_estimate_source=
+          marketResaleAvailable
+            ? 'MARKET_ANALYSIS'
+            : 'UNAVAILABLE';
+
+        market.resale_estimate_confidence=
+          marketResaleAvailable
+            ? String(
+                market?.market_confidence||'LOW'
+              ).toUpperCase()
+            : 'LOW';
+
+        if(
+          !marketResaleAvailable &&
+          exact?.target_match
+        ){
+          reportProgress(
+            91,
+            'Estimando reventa con IA',
+            'Sin evidencia de mercado suficiente · calculando aproximación occidental'
+          );
+
+          try{
+            const aiEstimate=
+              await aiWesternResaleEstimate({
+                key,
+                model,
+                task,
+                exact,
+                market
+              });
+
+            market.ai_resale_estimate=
+              aiEstimate;
+
+            if(aiEstimate?.available===true){
+              market.resale_estimate_source=
+                'AI_ESTIMATE';
+
+              market.resale_estimate_confidence=
+                String(
+                  aiEstimate?.confidence||
+                  'LOW'
+                ).toUpperCase();
+            }
+
+          }catch(aiEstimateError){
+            console.error(
+              `AI resale fallback failed for listing ${item.id}:`,
+              aiEstimateError?.message||
+              aiEstimateError
+            );
+
+            market.ai_resale_estimate={
+              available:false,
+              source:'AI_ESTIMATE',
+              confidence:'LOW',
+              low_eur:null,
+              high_eur:null,
+              midpoint_eur:null,
+              rationale_es:
+                aiEstimateError?.message||
+                String(aiEstimateError),
+              assumptions_es:[],
+              generated_at:
+                new Date().toISOString()
+            };
+          }
+        }
+
         reportProgress(
           94,
           'Calculando oportunidad',
@@ -3324,6 +3764,9 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
         a.landed_cost_eur=final.landed_cost_eur;
         a.net_profit_low_eur=final.net_profit_low_eur;
         a.net_profit_high_eur=final.net_profit_high_eur;
+        a.resale_estimate_source=final.resale_estimate_source;
+        a.resale_estimate_confidence=final.resale_estimate_confidence;
+        a.resale_estimate_market_verified=final.resale_estimate_market_verified;
         a.decision_reasons_es=final.decision_reasons_es;
         a.notes=[a.notes,`Exact-model + live-market verification completed. Market confidence: ${market.market_confidence}.`].filter(Boolean).join(' ');
       }
@@ -4610,6 +5053,20 @@ function globalEmailOpportunityData(x){
       vision_error:
         market?.vision_web_detection?.error||'',
 
+      resale_estimate_source:
+        verification?.final?.resale_estimate_source ||
+        market?.resale_estimate_source ||
+        'UNAVAILABLE',
+
+      resale_estimate_confidence:
+        verification?.final?.resale_estimate_confidence ||
+        market?.resale_estimate_confidence ||
+        market?.ai_resale_estimate?.confidence ||
+        'LOW',
+
+      ai_resale_estimate:
+        market?.ai_resale_estimate||null,
+
       checked_at:
         market?.checked_at ||
         verification?.verified_at ||
@@ -4693,27 +5150,97 @@ function globalEmailConditionText(d){
 }
 
 function globalEmailResaleText(d){
-  if(!d.resaleVerified){
-    return 'Sin estimación verificada';
+  const low=d?.analysis?.resale_low_eur;
+  const high=d?.analysis?.resale_high_eur;
+
+  const lowOk=
+    low!==null &&
+    low!==undefined &&
+    low!=='' &&
+    Number.isFinite(Number(low));
+
+  const highOk=
+    high!==null &&
+    high!==undefined &&
+    high!=='' &&
+    Number.isFinite(Number(high));
+
+  if(!lowOk&&!highOk){
+    return 'Sin estimación disponible';
   }
 
-  return `${
-    emailMoney(d.analysis.resale_low_eur)
-  } – ${
-    emailMoney(d.analysis.resale_high_eur)
-  }`;
+  const price=
+    lowOk&&highOk
+      ? `${emailMoney(low)} – ${emailMoney(high)}`
+      : lowOk
+        ? emailMoney(low)
+        : emailMoney(high);
+
+  const source=
+    String(
+      d?.market?.resale_estimate_source||
+      'UNAVAILABLE'
+    ).toUpperCase();
+
+  const confidence=
+    String(
+      d?.market?.resale_estimate_confidence||
+      'LOW'
+    ).toUpperCase();
+
+  if(source==='MARKET_ANALYSIS'){
+    return `${price} · ANÁLISIS DE MERCADO`;
+  }
+
+  if(source==='AI_ESTIMATE'){
+    return `${price} · ESTIMACIÓN IA · confianza ${confidence}`;
+  }
+
+  return `${price} · origen no disponible`;
 }
 
 function globalEmailProfitText(d){
-  if(!d.resaleVerified){
-    return 'Sin estimación verificada';
+  const low=d?.analysis?.profit_low_eur;
+  const high=d?.analysis?.profit_high_eur;
+
+  const lowOk=
+    low!==null &&
+    low!==undefined &&
+    low!=='' &&
+    Number.isFinite(Number(low));
+
+  const highOk=
+    high!==null &&
+    high!==undefined &&
+    high!=='' &&
+    Number.isFinite(Number(high));
+
+  if(!lowOk&&!highOk){
+    return 'Sin estimación disponible';
   }
 
-  return `${
-    emailMoney(d.analysis.profit_low_eur)
-  } – ${
-    emailMoney(d.analysis.profit_high_eur)
-  }`;
+  const price=
+    lowOk&&highOk
+      ? `${emailMoney(low)} – ${emailMoney(high)}`
+      : lowOk
+        ? emailMoney(low)
+        : emailMoney(high);
+
+  const source=
+    String(
+      d?.market?.resale_estimate_source||
+      ''
+    ).toUpperCase();
+
+  if(source==='AI_ESTIMATE'){
+    return `${price} · orientativo (estimación IA)`;
+  }
+
+  if(source==='MARKET_ANALYSIS'){
+    return `${price} · basado en análisis de mercado`;
+  }
+
+  return price;
 }
 
 function globalEmailOpportunityRow(x,index){
