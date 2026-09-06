@@ -201,6 +201,13 @@ ensureColumn('analyses', 'preliminary_decision', 'TEXT');
 ensureColumn('analyses', 'verification_json', "TEXT NOT NULL DEFAULT '{}'");
 ensureColumn('task_analyses', 'preliminary_decision', 'TEXT');
 ensureColumn('task_analyses', 'verification_json', "TEXT NOT NULL DEFAULT '{}'");
+ensureColumn('task_runs', 'progress_pct', 'REAL NOT NULL DEFAULT 0');
+ensureColumn('task_runs', 'progress_stage', 'TEXT');
+ensureColumn('task_runs', 'progress_detail', 'TEXT');
+ensureColumn('task_runs', 'progress_updated_at', 'TEXT');
+ensureColumn('task_runs', 'progress_eta_seconds', 'INTEGER');
+ensureColumn('task_runs', 'progress_current', 'INTEGER');
+ensureColumn('task_runs', 'progress_total', 'INTEGER');
 
 db.prepare(`
   UPDATE task_analyses
@@ -1130,6 +1137,16 @@ IMPORTANT:
 - If images are insufficient, explicitly lower confidence.
 - This is model/variant identification, NOT an authenticity certificate.
 
+CONDITION ASSESSMENT:
+- In the SAME visual pass, assess the actual physical condition of THIS specific unit.
+- Inspect only what is genuinely visible in the supplied listing images.
+- Check, when visible: corners, edges, handles, straps, leather/canvas/textile surface, stains, scratches, cracking, discoloration, hardware wear, oxidation, shape loss, structure, base, interior, lining, closures, repairs, missing pieces and included accessories.
+- Never assume a hidden area is in good condition.
+- If important views are missing, lower condition confidence and list them in missing_views_es.
+- condition.score MUST use a 0-100 scale, where 100 means the best visible condition and 0 the worst. Do not return a 0-1 or 0-10 score.
+- condition.score is only a visual condition indicator. It MUST NEVER map to a fixed resale percentage or price adjustment.
+- Do not estimate resale value in this visual stage.
+
 TARGET TASK: ${task?.product_query||''}
 TASK CRITERIA:
 ${task?.description||''}
@@ -1155,7 +1172,17 @@ Return ONLY JSON:
   "special_edition": null,
   "confidence": 0.0,
   "visual_evidence_es": ["1-4 short Spanish points"],
-  "uncertainties_es": []
+  "uncertainties_es": [],
+  "condition": {
+    "grade": "EXCELLENT|VERY_GOOD|GOOD|FAIR|POOR|UNKNOWN",
+    "score": null,
+    "confidence": 0.0,
+    "visible_areas_es": [],
+    "defects_es": [],
+    "positive_signals_es": [],
+    "missing_views_es": [],
+    "notes_es": []
+  }
 }`;
   const {data}=await geminiJsonRequest({key,model,parts:[{text:visualPrompt},...imageParts],googleSearch:false});
   return {
@@ -1173,10 +1200,347 @@ Return ONLY JSON:
     special_edition:typeof data.special_edition==='boolean'?data.special_edition:null,
     confidence:clampNum(data.confidence,0,1),
     visual_evidence_es:Array.isArray(data.visual_evidence_es)?data.visual_evidence_es.slice(0,4):[],
-    uncertainties_es:Array.isArray(data.uncertainties_es)?data.uncertainties_es.slice(0,4):[]
+    uncertainties_es:Array.isArray(data.uncertainties_es)?data.uncertainties_es.slice(0,4):[],
+    condition:(()=>{
+      const c=data?.condition&&typeof data.condition==='object'?data.condition:{};
+
+      let grade=String(c.grade||'UNKNOWN')
+        .trim()
+        .toUpperCase()
+        .replace(/[ -]+/g,'_');
+
+      if(!['EXCELLENT','VERY_GOOD','GOOD','FAIR','POOR','UNKNOWN'].includes(grade)){
+        grade='UNKNOWN';
+      }
+
+      const scoreRaw=Number(c.score);
+
+      let conditionScore=null;
+
+      if(Number.isFinite(scoreRaw)){
+        if(scoreRaw>=0 && scoreRaw<=1){
+          conditionScore=clampNum(
+            scoreRaw*100,
+            0,
+            100
+          );
+        }else if(scoreRaw>1 && scoreRaw<=10){
+          conditionScore=clampNum(
+            scoreRaw*10,
+            0,
+            100
+          );
+        }else{
+          conditionScore=clampNum(
+            scoreRaw,
+            0,
+            100
+          );
+        }
+      }
+
+      return {
+        grade,
+        score:conditionScore,
+        confidence:clampNum(c.confidence,0,1),
+        visible_areas_es:Array.isArray(c.visible_areas_es)?c.visible_areas_es.slice(0,12):[],
+        defects_es:Array.isArray(c.defects_es)?c.defects_es.slice(0,12):[],
+        positive_signals_es:Array.isArray(c.positive_signals_es)?c.positive_signals_es.slice(0,12):[],
+        missing_views_es:Array.isArray(c.missing_views_es)?c.missing_views_es.slice(0,12):[],
+        notes_es:Array.isArray(c.notes_es)?c.notes_es.slice(0,6):[]
+      };
+    })()
   };
 }
-async function liveMarketResearch({key,model,item,task,exact}){
+
+function visionSourceName(url){
+  try{
+    return new URL(String(url||'')).hostname
+      .replace(/^www\./,'')
+      .trim() || 'Google Vision';
+  }catch{
+    return 'Google Vision';
+  }
+}
+
+async function googleVisionWebDetection(item){
+  const apiKey=String(
+    process.env.GOOGLE_CLOUD_VISION_API_KEY||''
+  ).trim();
+
+  const imageUrl=String(item?.image_url||'').trim();
+
+  const base={
+    enabled:!!apiKey,
+    ok:false,
+    checked_at:new Date().toISOString(),
+    image_url:imageUrl||null,
+    best_guess_labels:[],
+    pages_with_matching_images:[],
+    full_matching_images:[],
+    partial_matching_images:[],
+    visually_similar_images:[],
+    error:null
+  };
+
+  if(!apiKey){
+    return {
+      ...base,
+      error:'GOOGLE_CLOUD_VISION_API_KEY no configurada'
+    };
+  }
+
+  if(!imageUrl){
+    return {
+      ...base,
+      error:'El anuncio no tiene image_url'
+    };
+  }
+
+  // Intentamos enviar a Vision los bytes reales de la imagen.
+  // Si el marketplace bloquea la descarga, usamos imageUri.
+  let visionImage=null;
+
+  try{
+    const controller=new AbortController();
+
+    const timer=setTimeout(
+      ()=>controller.abort(),
+      15000
+    );
+
+    try{
+      const imageResponse=await fetch(
+        imageUrl,
+        {
+          headers:{
+            'user-agent':
+              'Mozilla/5.0 LuxuryHunter/1.7',
+            'accept':
+              'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+          },
+          signal:controller.signal
+        }
+      );
+
+      if(imageResponse.ok){
+        const ab=await imageResponse.arrayBuffer();
+        const buffer=Buffer.from(ab);
+
+        if(
+          buffer.length>0 &&
+          buffer.length<=15*1024*1024
+        ){
+          visionImage={
+            content:buffer.toString('base64')
+          };
+        }
+      }
+    }finally{
+      clearTimeout(timer);
+    }
+
+  }catch{
+    // Fallback a URL pública.
+  }
+
+  if(!visionImage){
+    visionImage={
+      source:{
+        imageUri:imageUrl
+      }
+    };
+  }
+
+  const endpoint=
+    `https://vision.googleapis.com/v1/images:annotate?key=${
+      encodeURIComponent(apiKey)
+    }`;
+
+  const payload={
+    requests:[
+      {
+        image:visionImage,
+        features:[
+          {
+            type:'WEB_DETECTION',
+            maxResults:50
+          }
+        ]
+      }
+    ]
+  };
+
+  try{
+    const response=await fetch(
+      endpoint,
+      {
+        method:'POST',
+        headers:{
+          'content-type':'application/json'
+        },
+        body:JSON.stringify(payload)
+      }
+    );
+
+    let body={};
+
+    try{
+      body=await response.json();
+    }catch{}
+
+    if(!response.ok){
+      return {
+        ...base,
+        error:
+          body?.error?.message ||
+          `Vision HTTP ${response.status}`
+      };
+    }
+
+    const annotation=body?.responses?.[0]||{};
+
+    if(annotation?.error?.message){
+      return {
+        ...base,
+        error:annotation.error.message
+      };
+    }
+
+    const web=annotation.webDetection||{};
+
+    const imageRef=x=>({
+      url:String(x?.url||'').trim(),
+      score:Number.isFinite(Number(x?.score))
+        ? Number(x.score)
+        : null
+    });
+
+    const pages=(
+      Array.isArray(web.pagesWithMatchingImages)
+        ? web.pagesWithMatchingImages
+        : []
+    ).map(p=>({
+      url:String(p?.url||'').trim(),
+      page_title:String(p?.pageTitle||'').trim(),
+
+      score:Number.isFinite(Number(p?.score))
+        ? Number(p.score)
+        : null,
+
+      full_matching_images:
+        Array.isArray(p?.fullMatchingImages)
+          ? p.fullMatchingImages.map(imageRef)
+          : [],
+
+      partial_matching_images:
+        Array.isArray(p?.partialMatchingImages)
+          ? p.partialMatchingImages.map(imageRef)
+          : []
+    })).filter(p=>p.url);
+
+    return {
+      enabled:true,
+      ok:true,
+      checked_at:new Date().toISOString(),
+      image_url:imageUrl,
+
+      best_guess_labels:(
+        Array.isArray(web.bestGuessLabels)
+          ? web.bestGuessLabels
+          : []
+      ).map(x=>({
+        label:String(x?.label||'').trim(),
+        language_code:String(
+          x?.languageCode||''
+        ).trim()
+      })).filter(x=>x.label),
+
+      pages_with_matching_images:pages,
+
+      full_matching_images:(
+        Array.isArray(web.fullMatchingImages)
+          ? web.fullMatchingImages
+          : []
+      ).map(imageRef).filter(x=>x.url),
+
+      partial_matching_images:(
+        Array.isArray(web.partialMatchingImages)
+          ? web.partialMatchingImages
+          : []
+      ).map(imageRef).filter(x=>x.url),
+
+      visually_similar_images:(
+        Array.isArray(web.visuallySimilarImages)
+          ? web.visuallySimilarImages
+          : []
+      ).map(imageRef).filter(x=>x.url),
+
+      error:null
+    };
+
+  }catch(e){
+    return {
+      ...base,
+      error:e?.message||String(e)
+    };
+  }
+}
+
+async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
+  const reportMarket=(pct,stage,detail='')=>{
+    try{
+      if(typeof onProgress==='function'){
+        onProgress(pct,stage,detail);
+      }
+    }catch{}
+  };
+
+  reportMarket(
+    68,
+    'Buscando comparables de mercado',
+    'Ronda 1 de búsqueda con Google'
+  );
+
+  if(typeof onProgress==='function'){
+    onProgress(
+      65,
+      'Búsqueda visual',
+      'Buscando coincidencias de la imagen en Google Vision'
+    );
+  }
+
+  const visionWeb=
+    await googleVisionWebDetection(item);
+
+  const visionCandidates=(
+    Array.isArray(
+      visionWeb?.pages_with_matching_images
+    )
+      ? visionWeb.pages_with_matching_images
+      : []
+  ).slice(0,25);
+
+  const visionContext=visionCandidates.length
+    ? visionCandidates.map((p,idx)=>({
+        candidate:idx+1,
+        source:visionSourceName(p.url),
+        page_title:p.page_title||'',
+        url:p.url,
+        vision_score:p.score,
+
+        full_match_count:
+          Array.isArray(p.full_matching_images)
+            ? p.full_matching_images.length
+            : 0,
+
+        partial_match_count:
+          Array.isArray(p.partial_matching_images)
+            ? p.partial_matching_images.length
+            : 0
+      }))
+    : [];
+
   const prompt=`You are the LIVE MARKET COMPARABLES researcher for Luxury Hunter.
 Current date: ${new Date().toISOString().slice(0,10)}.
 
@@ -1190,6 +1554,21 @@ ${task?.product_query||''}
 
 CURRENT LISTING TO EXCLUDE:
 ${item.url||''}
+
+GOOGLE CLOUD VISION WEB-DETECTION CANDIDATES:
+${JSON.stringify(visionContext)}
+
+VISUAL-CANDIDATE RULES:
+- The URLs above were discovered from the LISTING IMAGE itself using Google Cloud Vision Web Detection.
+- They are research leads, NOT automatically valid comparables.
+- You MUST investigate these visual candidates before concluding that no market references exist.
+- A visual candidate may be old, archived or sold. Do not discard it merely because of age.
+- Historical exact-model references remain useful evidence of model identity and historic market activity.
+- For each grounded candidate classify it as EXACT, NEAR or ORIENTATIVE.
+- Extract the real source, title, URL, observed price, currency, SOLD/CURRENT status, publication/sale date when genuinely available and condition evidence.
+- Different reseller terminology is NOT a reason to reject an otherwise matching product.
+- If the candidate is visually relevant but pricing/date evidence cannot be validated, preserve it as research evidence rather than inventing information.
+- Do not return zero research results without considering the visual candidates above when they exist.
 
 SOURCE PRIORITY:
 1. Vestiaire Collective, European listings/prices where available.
@@ -1207,8 +1586,45 @@ COMPARABLE RULES:
 - Prefer sold prices when genuinely visible. Otherwise label CURRENT.
 - Do not use new-retail MSRP.
 - Do not fabricate a listing, price, URL, sold status or source.
+- Historical sold/archive listings are valid research references when they genuinely correspond to the identified model.
+- Do NOT discard a genuine exact/near reference only because it is old.
+- Historical references may provide product/model evidence, but do not pretend an old price is automatically today's market price.
+- For every comparable, extract listing/sale date ONLY when grounded evidence supports it.
+- Never invent a date.
+- If an exact YYYY-MM-DD date is unavailable, return null and optionally preserve the visible date wording in date_text.
+- SOLD means sold only when the source/search evidence genuinely indicates sold.
+- CURRENT means currently offered only when that is genuinely supported.
 - Return 5-12 evidence-backed comparables when possible.
+- Do NOT depend on one exact commercial name. Luxury handbags are frequently listed under incomplete, translated, reseller-created or alternative model names.
+- Search multiple naming variants automatically.
+- Build search queries from BRAND + MODEL FAMILY + SIZE + MATERIAL/CONSTRUCTION + COLOUR.
+- Also try common synonyms and reseller terminology. Examples: woven / intrecciato / intreccio / braided / nappa woven; multicolor / multicolore; shoulder bag / baguette bag.
+- Progressively remove over-specific wording if an exact query has weak recall.
+- A different listing title does NOT make a result irrelevant if the photographed object and defining visual attributes correspond to the same variant.
+- Use image-derived attributes from the exact visual identification as the primary matching criteria.
+- Search across Vestiaire Collective, The RealReal, Fashionphile, Rebag, Collector Square, specialist European luxury resellers and other credible second-hand sources surfaced by Google.
+- Use ONLY these match_level values: EXACT, NEAR, ORIENTATIVE.
+- EXACT = same model variant with matching size, material/construction, pattern/edition and materially equivalent characteristics.
+- NEAR = same genuine model/variant and broadly equivalent size/material, with only ordinary colour, season or minor specification differences that still make it useful for resale valuation.
+- ORIENTATIVE = same family but meaningfully different size, material, construction, edition or other characteristics that make it unsuitable for direct valuation.
+- Never output CLOSE, CLOSE COMP, IRRELEVANT or any other match_level label.
+- A listing title does not need to contain every attribute. If the page clearly corresponds to the same product despite abbreviated reseller naming, classify it from the available evidence rather than rejecting it merely because words are missing.
+- Do not count a broad family match as an exact comparable.
+- If the first wording produces few results, actively reformulate the search instead of concluding that no market exists.
 - Price must be numeric in its listing currency.
+
+CONDITION-BASED VALUATION RULES:
+- The target unit condition is included inside EXACT VISUAL IDENTIFICATION.
+- For every EXACT or NEAR comparable, research its condition using only grounded evidence available from the reseller page, listing description, platform condition label or other directly supported information.
+- Never invent the condition of a comparable.
+- If its condition cannot be established, use condition_grade UNKNOWN, condition_relation_to_target UNKNOWN and low/zero confidence.
+- condition_relation_to_target MUST be one of SIMILAR, BETTER, WORSE, UNKNOWN.
+- SIMILAR means sufficiently comparable physical condition to value THIS target unit.
+- Different condition levels may remain useful as general model-market evidence, but MUST NOT be mathematically converted into the target resale price using a fixed percentage.
+- Do NOT apply fixed discounts or premiums for EXCELLENT, VERY_GOOD, GOOD, FAIR or POOR.
+- Do NOT apply an automatic discount to CURRENT asking prices.
+- The final condition-adjusted resale must come from observed prices of condition-SIMILAR comparables.
+- If there is insufficient condition-matched evidence, report insufficient evidence instead of inventing a resale adjustment.
 
 Return ONLY JSON:
 {
@@ -1222,16 +1638,361 @@ Return ONLY JSON:
       "listing_status": "SOLD|CURRENT|UNKNOWN",
       "country_or_market": "EU/France/US/etc",
       "match_level": "EXACT|NEAR|ORIENTATIVE",
-      "match_reason_es": "short Spanish reason"
+      "match_reason_es": "short Spanish reason",
+      "condition_grade": "EXCELLENT|VERY_GOOD|GOOD|FAIR|POOR|UNKNOWN",
+      "condition_confidence": 0.0,
+      "condition_relation_to_target": "SIMILAR|BETTER|WORSE|UNKNOWN",
+      "condition_evidence_es": ["grounded evidence only"],
+      "listing_date": null,
+      "sold_date": null,
+      "date_text": null,
+      "date_type": "LISTED|SOLD|UPDATED|UNKNOWN",
+      "date_evidence_es": "grounded date evidence or empty string"
     }
   ],
   "research_notes_es": []
 }`;
   const result=await geminiJsonRequest({key,model,parts:[{text:prompt}],googleSearch:true});
-  const comps=Array.isArray(result.data?.comparables)?result.data.comparables:[];
+
+  reportMarket(
+    76,
+    'Primera búsqueda completada',
+    'Evaluando relevancia de las referencias encontradas'
+  );
+
+  let comps=Array.isArray(result.data?.comparables)?result.data.comparables:[];
+  let marketGroundingSources=Array.isArray(result.groundingSources)?result.groundingSources:[];
+  let marketWebSearchQueries=Array.isArray(result.webSearchQueries)
+    ? result.webSearchQueries
+    : [];
+
+  // Recall fallback:
+  // La calidad de la primera ronda se mide por comparables realmente
+  // utilizables, no por el numero bruto de resultados devueltos.
+  const firstPassRelevant=comps.filter(c=>
+    ['EXACT','NEAR'].includes(
+      String(c?.match_level||'').toUpperCase()
+    )
+  );
+
+  const firstPassSources=new Set(
+    firstPassRelevant
+      .map(c=>String(c?.source||'').trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  const targetConditionGrade=String(
+    exact?.condition?.grade||'UNKNOWN'
+  ).toUpperCase();
+
+  const targetConditionConfidence=clampNum(
+    exact?.condition?.confidence,
+    0,
+    1
+  );
+
+  const targetConditionUsable=
+    targetConditionGrade!=='UNKNOWN' &&
+    targetConditionConfidence>=0.50;
+
+  const firstPassConditionMatched=firstPassRelevant.filter(c=>
+    String(c?.condition_relation_to_target||'').toUpperCase()==='SIMILAR'
+  );
+
+  const firstPassConditionSources=new Set(
+    firstPassConditionMatched
+      .map(c=>String(c?.source||'').trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  const needsConditionRecall=
+    targetConditionUsable &&
+    (
+      firstPassConditionMatched.length<3 ||
+      firstPassConditionSources.size<2
+    );
+
+  const needsRecallFallback=
+    firstPassRelevant.length<3 ||
+    firstPassSources.size<2 ||
+    marketGroundingSources.length<2 ||
+    needsConditionRecall;
+
+  let recallFallbackUsed=false;
+
+  if(needsRecallFallback){
+    recallFallbackUsed=true;
+
+    reportMarket(
+      80,
+      'Ampliando búsqueda de mercado',
+      'Ronda 2 de 2 · nombres alternativos y referencias históricas'
+    );
+    const fallbackPrompt=`${prompt}
+
+SECOND-PASS MARKET RECALL SEARCH
+
+The first search returned too little usable evidence.
+
+Do a fresh Google-grounded search using BROADER ALTERNATIVE NOMENCLATURE.
+
+Requirements:
+1. Keep the visually identified handbag as the target.
+2. Generate AND EXECUTE multiple alternative Google search formulations. Do not stop after one wording.
+3. Use at least these search strategies when applicable:
+   - brand + exact variant/model label
+   - brand + model family + material/construction
+   - brand + model family + pattern/monogram
+   - brand + model family + colour
+   - brand + model family + size
+   - reference code when a reliable reference is available
+4. Progressively remove attributes that resellers commonly omit from titles.
+5. Try reseller vocabulary, translations, abbreviations and naming synonyms.
+6. Do not require the seller title to equal exact_variant_label.
+7. Missing words in the title are not enough to reject a comparable if the remaining evidence identifies the same product.
+8. Use ONLY match_level EXACT, NEAR or ORIENTATIVE.
+9. For each EXACT/NEAR result, actively look for grounded condition information.
+10. Prioritize finding comparables whose physical condition is SIMILAR to the target condition.
+11. Do not infer a condition from price alone.
+12. Do not convert better/worse condition listings into the target value using a fixed discount or premium.
+9. Search specifically for additional results on Vestiaire Collective, The RealReal, Fashionphile, Rebag, Collector Square, specialist EU resellers and credible sold/archived listings.
+10. Continue broadening until you either obtain at least 3 useful EXACT/NEAR comparables from at least 2 independent sources, or the available grounded evidence is genuinely exhausted.
+11. Return real URLs and evidence-backed prices whenever available.
+12. Do not invent comparables if a page cannot be grounded.
+
+This is a RECALL fallback. The goal is to find genuine listings that a visual Google search would reasonably surface even when their titles use different terminology.`;
+
+    const fallback=await geminiJsonRequest({
+      key,
+      model,
+      parts:[{text:fallbackPrompt}],
+      googleSearch:true
+    });
+
+    marketWebSearchQueries=[
+      ...new Set([
+        ...marketWebSearchQueries,
+        ...(Array.isArray(fallback.webSearchQueries)?fallback.webSearchQueries:[])
+      ].filter(Boolean))
+    ];
+
+    reportMarket(
+      88,
+      'Segunda búsqueda completada',
+      'Uniendo y deduplicando referencias'
+    );
+
+    const extra=Array.isArray(fallback.data?.comparables)
+      ? fallback.data.comparables
+      : [];
+
+    // Deduplicar por URL; si no hay URL, usar source/title/price.
+    const seen=new Set();
+
+    comps=[...comps,...extra].filter(c=>{
+      const keyPart=String(
+        c?.url ||
+        c?.link ||
+        `${c?.source||''}|${c?.title||''}|${c?.price_eur||c?.price||''}`
+      ).trim().toLowerCase();
+
+      if(!keyPart) return true;
+      if(seen.has(keyPart)) return false;
+
+      seen.add(keyPart);
+      return true;
+    });
+
+    const sourceSeen=new Set();
+
+    marketGroundingSources=[
+      ...marketGroundingSources,
+      ...(Array.isArray(fallback.groundingSources)?fallback.groundingSources:[])
+    ].filter(s=>{
+      const keyPart=String(
+        s?.uri ||
+        s?.url ||
+        s?.title ||
+        ''
+      ).trim().toLowerCase();
+
+      if(!keyPart) return true;
+      if(sourceSeen.has(keyPart)) return false;
+
+      sourceSeen.add(keyPart);
+      return true;
+    });
+  }
+  const structuredResearchReferences=
+    comps.slice(0,40).map(c=>({
+      source:String(c?.source||'').trim()||sourceKey(c),
+      title:String(c?.title||'').trim(),
+      url:String(c?.url||c?.link||'').trim(),
+
+      price:Number.isFinite(Number(c?.price))
+        ? Number(c.price)
+        : null,
+
+      currency:normalizeCurrency(c?.currency),
+      price_eur:comparableToEur(c),
+
+      listing_status:String(
+        c?.listing_status||'UNKNOWN'
+      ).toUpperCase(),
+
+      country_or_market:String(
+        c?.country_or_market||''
+      ).trim(),
+
+      match_level:String(
+        c?.match_level||'ORIENTATIVE'
+      ).toUpperCase(),
+
+      match_reason_es:String(
+        c?.match_reason_es||''
+      ).trim(),
+
+      condition_grade:String(
+        c?.condition_grade||'UNKNOWN'
+      ).toUpperCase(),
+
+      condition_confidence:
+        Number.isFinite(
+          Number(c?.condition_confidence)
+        )
+          ? clampNum(
+              Number(c.condition_confidence),
+              0,
+              1
+            )
+          : 0,
+
+      condition_relation_to_target:String(
+        c?.condition_relation_to_target||
+        'UNKNOWN'
+      ).toUpperCase(),
+
+      condition_evidence_es:
+        Array.isArray(c?.condition_evidence_es)
+          ? c.condition_evidence_es.slice(0,6)
+          : [],
+
+      listing_date:
+        c?.listing_date
+          ? String(c.listing_date)
+          : null,
+
+      sold_date:
+        c?.sold_date
+          ? String(c.sold_date)
+          : null,
+
+      date_text:
+        c?.date_text
+          ? String(c.date_text)
+          : null,
+
+      date_type:String(
+        c?.date_type||'UNKNOWN'
+      ).toUpperCase(),
+
+      date_evidence_es:String(
+        c?.date_evidence_es||''
+      ).trim()
+    })).filter(r=>
+      r.source||
+      r.title||
+      r.url
+    );
+
+  const visionResearchReferences=
+    visionCandidates.map(p=>({
+      source:visionSourceName(p.url),
+
+      title:
+        p.page_title ||
+        `Coincidencia visual en ${
+          visionSourceName(p.url)
+        }`,
+
+      url:p.url,
+
+      price:null,
+      currency:'',
+      price_eur:null,
+
+      listing_status:'UNKNOWN',
+      country_or_market:'',
+
+      match_level:'VISUAL_CANDIDATE',
+
+      match_reason_es:
+        'Página localizada directamente a partir de la imagen mediante Google Cloud Vision Web Detection. Pendiente de validación como EXACT, NEAR u ORIENTATIVE.',
+
+      condition_grade:'UNKNOWN',
+      condition_confidence:0,
+      condition_relation_to_target:'UNKNOWN',
+      condition_evidence_es:[],
+
+      listing_date:null,
+      sold_date:null,
+      date_text:null,
+      date_type:'UNKNOWN',
+      date_evidence_es:'',
+
+      vision_score:
+        Number.isFinite(Number(p.score))
+          ? Number(p.score)
+          : null,
+
+      full_match_count:
+        Array.isArray(p.full_matching_images)
+          ? p.full_matching_images.length
+          : 0,
+
+      partial_match_count:
+        Array.isArray(p.partial_matching_images)
+          ? p.partial_matching_images.length
+          : 0
+    }));
+
+  const researchSeen=new Set();
+
+  const researchReferences=[
+    ...structuredResearchReferences,
+    ...visionResearchReferences
+  ].filter(r=>{
+    const key=String(
+      r.url ||
+      `${r.source}|${r.title}`
+    ).trim().toLowerCase();
+
+    if(!key)return false;
+
+    if(researchSeen.has(key)){
+      return false;
+    }
+
+    researchSeen.add(key);
+    return true;
+  });
+
   const normalized=[];
   const seen=new Set();
-  for(const c of comps.slice(0,15)){
+
+  const compRank={
+    EXACT:0,
+    NEAR:1,
+    ORIENTATIVE:2
+  };
+
+  const rankedComps=[...comps].sort((a,b)=>{
+    const al=String(a?.match_level||'').toUpperCase();
+    const bl=String(b?.match_level||'').toUpperCase();
+    return (compRank[al]??3)-(compRank[bl]??3);
+  });
+
+  for(const c of rankedComps.slice(0,24)){
     const eur=comparableToEur(c);
     const url=String(c?.url||'').trim();
     const source=String(c?.source||'').trim()||sourceKey(c);
@@ -1241,6 +2002,28 @@ Return ONLY JSON:
     const keyId=`${source.toLowerCase()}|${url}|${Math.round(eur)}`;
     if(seen.has(keyId))continue;
     seen.add(keyId);
+    let conditionGrade=String(c?.condition_grade||'UNKNOWN')
+      .trim()
+      .toUpperCase()
+      .replace(/[ -]+/g,'_');
+
+    if(!['EXCELLENT','VERY_GOOD','GOOD','FAIR','POOR','UNKNOWN'].includes(conditionGrade)){
+      conditionGrade='UNKNOWN';
+    }
+
+    let conditionRelation=String(c?.condition_relation_to_target||'UNKNOWN')
+      .trim()
+      .toUpperCase();
+
+    if(!['SIMILAR','BETTER','WORSE','UNKNOWN'].includes(conditionRelation)){
+      conditionRelation='UNKNOWN';
+    }
+
+    const conditionConfidenceRaw=Number(c?.condition_confidence);
+    const conditionConfidence=Number.isFinite(conditionConfidenceRaw)
+      ? clampNum(conditionConfidenceRaw,0,1)
+      : 0;
+
     normalized.push({
       source,
       title:String(c?.title||'').trim(),
@@ -1251,31 +2034,218 @@ Return ONLY JSON:
       listing_status:status,
       country_or_market:String(c?.country_or_market||'').trim(),
       match_level:level,
-      match_reason_es:String(c?.match_reason_es||'').trim()
+      match_reason_es:String(c?.match_reason_es||'').trim(),
+      condition_grade:conditionGrade,
+      condition_confidence:conditionConfidence,
+      condition_relation_to_target:conditionRelation,
+      condition_evidence_es:Array.isArray(c?.condition_evidence_es)
+        ? c.condition_evidence_es.slice(0,6)
+        : []
     });
   }
-  const relevant=normalized.filter(c=>c.match_level==='EXACT'||c.match_level==='NEAR');
-  const exactOnly=normalized.filter(c=>c.match_level==='EXACT');
-  const realized=relevant.map(c=>roundMoney(c.price_eur*(c.listing_status==='SOLD'?1:0.90))).filter(Number.isFinite);
-  const sources=[...new Set(relevant.map(sourceKey).filter(Boolean))];
-  let confidence='LOW';
-  if(relevant.length>=3&&sources.length>=2&&exact.confidence>=0.85)confidence='HIGH';
-  else if(relevant.length>=2&&sources.length>=1&&exact.confidence>=0.70)confidence='MEDIUM';
+  const relevant=normalized.filter(
+    c=>c.match_level==='EXACT'||c.match_level==='NEAR'
+  );
+
+  const exactOnly=relevant.filter(
+    c=>c.match_level==='EXACT'
+  );
+
+  // ---------------------------------------------------------
+  // MODEL MARKET:
+  // precios observados reales, SIN aplicar 0.90 a CURRENT.
+  // ---------------------------------------------------------
+
+  const modelPrices=relevant
+    .map(c=>roundMoney(c.price_eur))
+    .filter(v=>Number.isFinite(v)&&v>0);
+
+  const modelSources=[
+    ...new Set(relevant.map(sourceKey).filter(Boolean))
+  ];
+
+  let modelMarketConfidence='LOW';
+
+  if(
+    relevant.length>=3 &&
+    modelSources.length>=2 &&
+    exact.confidence>=0.85
+  ){
+    modelMarketConfidence='HIGH';
+  }else if(
+    relevant.length>=2 &&
+    modelSources.length>=1 &&
+    exact.confidence>=0.70
+  ){
+    modelMarketConfidence='MEDIUM';
+  }
+
+  // ---------------------------------------------------------
+  // CONDITION MARKET:
+  // SOLO comparables cuyo estado se haya podido contrastar
+  // como SIMILAR al bolso que estamos comprando.
+  // ---------------------------------------------------------
+
+  const targetCondition=exact?.condition||{
+    grade:'UNKNOWN',
+    score:null,
+    confidence:0
+  };
+
+  const targetConditionConfidenceFinal=clampNum(
+    targetCondition.confidence,
+    0,
+    1
+  );
+
+  const targetConditionKnown=
+    String(targetCondition.grade||'UNKNOWN').toUpperCase()!=='UNKNOWN' &&
+    targetConditionConfidenceFinal>=0.50;
+
+  const conditionMatched=relevant.filter(c=>
+    c.condition_relation_to_target==='SIMILAR' &&
+    c.condition_confidence>=0.50
+  );
+
+  const conditionExact=conditionMatched.filter(
+    c=>c.match_level==='EXACT'
+  );
+
+  const conditionSources=[
+    ...new Set(conditionMatched.map(sourceKey).filter(Boolean))
+  ];
+
+  const conditionPrices=conditionMatched
+    .map(c=>roundMoney(c.price_eur))
+    .filter(v=>Number.isFinite(v)&&v>0);
+
+  let conditionMarketConfidence='LOW';
+
+  if(
+    targetConditionKnown &&
+    targetConditionConfidenceFinal>=0.70 &&
+    conditionMatched.length>=3 &&
+    conditionSources.length>=2
+  ){
+    conditionMarketConfidence='HIGH';
+  }else if(
+    targetConditionKnown &&
+    targetConditionConfidenceFinal>=0.50 &&
+    conditionMatched.length>=2 &&
+    conditionSources.length>=1
+  ){
+    conditionMarketConfidence='MEDIUM';
+  }
+
+  // Con un solo comparable o condition incierta NO publicamos
+  // un precio de reventa "ajustado". Eso sería inventarlo.
+  const conditionValuationUsable=
+    conditionMarketConfidence==='HIGH' ||
+    conditionMarketConfidence==='MEDIUM';
+
+  const valuationPrices=conditionValuationUsable
+    ? conditionPrices
+    : [];
+
+  const conditionLow=valuationPrices.length
+    ? roundMoney(percentile(valuationPrices,0.10)??0)||null
+    : null;
+
+  const conditionMedian=valuationPrices.length
+    ? roundMoney(percentile(valuationPrices,0.50)??0)||null
+    : null;
+
+  const conditionHigh=valuationPrices.length
+    ? roundMoney(percentile(valuationPrices,0.90)??0)||null
+    : null;
+
+  const conditionConservative=valuationPrices.length
+    ? roundMoney(percentile(valuationPrices,0.25)??0)||null
+    : null;
+
+  const conditionQuick=valuationPrices.length
+    ? roundMoney(percentile(valuationPrices,0.15)??0)||null
+    : null;
+
   return {
     comparables:normalized,
-    grounding_sources:result.groundingSources,
-    web_search_queries:result.webSearchQueries,
-    research_notes_es:Array.isArray(result.data?.research_notes_es)?result.data.research_notes_es.slice(0,4):[],
-    relevant_comparable_count:relevant.length,
-    exact_comparable_count:exactOnly.length,
-    independent_source_count:sources.length,
-    market_confidence:confidence,
-    market_low_eur:roundMoney(percentile(realized,0.10)??0)||null,
-    market_median_eur:roundMoney(percentile(realized,0.50)??0)||null,
-    market_high_eur:roundMoney(percentile(realized,0.90)??0)||null,
-    conservative_resale_eur:roundMoney(percentile(realized,0.25)??0)||null,
-    quick_sale_eur:roundMoney(percentile(realized,0.15)??0)||null,
-    asking_realization_factor:0.90
+    research_references:researchReferences,
+    vision_web_detection:visionWeb,
+    visual_candidate_count:visionCandidates.length,
+    research_candidate_count:researchReferences.length,
+    checked_at:new Date().toISOString(),
+
+    search_passes:recallFallbackUsed?2:1,
+    raw_comparable_count:comps.length,
+
+    first_pass_relevant_count:firstPassRelevant.length,
+    first_pass_independent_source_count:firstPassSources.size,
+    first_pass_condition_matched_count:firstPassConditionMatched.length,
+    first_pass_condition_source_count:firstPassConditionSources.size,
+
+    grounding_sources:marketGroundingSources,
+    web_search_queries:marketWebSearchQueries,
+
+    research_notes_es:Array.isArray(result.data?.research_notes_es)
+      ? result.data.research_notes_es.slice(0,4)
+      : [],
+
+    // Mercado general del modelo.
+    model_relevant_comparable_count:relevant.length,
+    model_exact_comparable_count:exactOnly.length,
+    model_independent_source_count:modelSources.length,
+    model_market_confidence:modelMarketConfidence,
+
+    model_market_low_eur:modelPrices.length
+      ? roundMoney(percentile(modelPrices,0.10)??0)||null
+      : null,
+
+    model_market_median_eur:modelPrices.length
+      ? roundMoney(percentile(modelPrices,0.50)??0)||null
+      : null,
+
+    model_market_high_eur:modelPrices.length
+      ? roundMoney(percentile(modelPrices,0.90)??0)||null
+      : null,
+
+    // Estado de la unidad que estamos comprando.
+    target_condition:targetCondition,
+
+    // Mercado realmente comparable por ESTADO.
+    condition_matched_comparable_count:conditionMatched.length,
+    condition_exact_comparable_count:conditionExact.length,
+    condition_independent_source_count:conditionSources.length,
+    condition_market_confidence:conditionMarketConfidence,
+
+    condition_market_low_eur:conditionLow,
+    condition_market_median_eur:conditionMedian,
+    condition_market_high_eur:conditionHigh,
+    condition_conservative_resale_eur:conditionConservative,
+    condition_quick_sale_eur:conditionQuick,
+
+    pricing_method:
+      'Observed prices from condition-SIMILAR EXACT/NEAR comparables; no fixed condition or asking-price discount.',
+
+    // -------------------------------------------------------
+    // COMPATIBILIDAD:
+    // finalizeVerifiedOpportunity ya consume estos nombres.
+    // Desde ahora representan CONDITION-ADJUSTED MARKET.
+    // -------------------------------------------------------
+
+    relevant_comparable_count:conditionMatched.length,
+    exact_comparable_count:conditionExact.length,
+    independent_source_count:conditionSources.length,
+    market_confidence:conditionMarketConfidence,
+
+    market_low_eur:conditionLow,
+    market_median_eur:conditionMedian,
+    market_high_eur:conditionHigh,
+    conservative_resale_eur:conditionConservative,
+    quick_sale_eur:conditionQuick,
+
+    // Se mantiene la propiedad solo por compatibilidad histórica,
+    // pero ya NO se aplica ningún factor automático.
+    asking_realization_factor:null
   };
 }
 
@@ -1415,9 +2385,15 @@ function detectMarketplaceVerification(item){
 
 function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketplaceVerification={}){
   const landed=Number(economics.importedTotalEur)||0;
-  const conservative=Number(market.conservative_resale_eur);
-  const high=Number(market.market_high_eur);
-  const low=Number(market.market_low_eur);
+  const marketNumber=v=>{
+    if(v===null||v===undefined||v==='')return null;
+    const n=Number(v);
+    return Number.isFinite(n)?n:null;
+  };
+
+  const conservative=marketNumber(market.conservative_resale_eur);
+  const high=marketNumber(market.market_high_eur);
+  const low=marketNumber(market.market_low_eur);
   const profit=Number.isFinite(conservative)?roundMoney(conservative-landed):null;
   const highProfit=Number.isFinite(high)?roundMoney(high-landed):profit;
   const auth=String(preliminary.authenticity_risk||'').toUpperCase();
@@ -1497,7 +2473,21 @@ function storeStandaloneAnalysis(item,a,now){
     ON CONFLICT(listing_id) DO UPDATE SET brand=excluded.brand,model=excluded.model,authenticity_risk=excluded.authenticity_risk,liquidity=excluded.liquidity,decision=excluded.decision,opportunity_score=excluded.opportunity_score,resale_low_eur=excluded.resale_low_eur,resale_high_eur=excluded.resale_high_eur,landed_cost_eur=excluded.landed_cost_eur,net_profit_low_eur=excluded.net_profit_low_eur,net_profit_high_eur=excluded.net_profit_high_eur,notes=excluded.notes,decision_reasons_es_json=excluded.decision_reasons_es_json,raw_json=excluded.raw_json,updated_at=excluded.updated_at,preliminary_decision=excluded.preliminary_decision,verification_json=excluded.verification_json`)
     .run(item.id,a.brand||'',a.model||'',a.authenticity_risk||'',a.liquidity||'',a.decision||'',numberOrNull(a.opportunity_score),numberOrNull(a.resale_low_eur),numberOrNull(a.resale_high_eur),numberOrNull(a.landed_cost_eur),numberOrNull(a.net_profit_low_eur),numberOrNull(a.net_profit_high_eur),a.notes||'',JSON.stringify(reasons),JSON.stringify(a),now,a.decision||'',JSON.stringify({status:'not_applicable',reason:'no_task_context'}));
 }
-async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true){
+async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProgress=null){
+  const reportProgress=(pct,stage,detail='')=>{
+    try{
+      if(typeof onProgress==='function'){
+        onProgress(pct,stage,detail);
+      }
+    }catch{}
+  };
+
+  reportProgress(
+    3,
+    'Preparando análisis',
+    'Cargando datos del anuncio'
+  );
+
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new Error('GEMINI_API_KEY is empty in .env');
   const model=process.env.GEMINI_MODEL||'gemini-3.8-flash';
@@ -1508,9 +2498,27 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true){
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
   const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}\nURL: ${item.url}`;
+  reportProgress(
+    8,
+    'Cargando imágenes',
+    'Preparando primera evaluación visual'
+  );
+
   const initialImageParts=analyzeImages?await fetchGeminiImageParts(item,1):[];
+  reportProgress(
+    18,
+    'Screening inicial',
+    'Gemini está evaluando modelo, riesgo y oportunidad'
+  );
+
   const first=await geminiJsonRequest({key,model,parts:[{text:prompt},...initialImageParts],googleSearch:false});
   const a=first.data||{};
+
+  reportProgress(
+    30,
+    'Screening completado',
+    `Decisión preliminar: ${String(a.decision||'pendiente')}`
+  );
   a.landed_cost_eur=economics.importedTotalEur;
   a.import_costs=economics;
   a.marketplace_verification=marketplaceVerification;
@@ -1535,6 +2543,12 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true){
   };
   if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)){
     try{
+      reportProgress(
+        38,
+        'Preparando verificación visual',
+        'Cargando imágenes adicionales'
+      );
+
       const imageParts=analyzeImages?await fetchGeminiImageParts(item,4):[];
       if(!imageParts.length){
         verification={status:'error',preliminary_decision:preliminaryDecision,ai_preliminary_decision:aiPreliminaryDecision,marketplace_verification:marketplaceVerification,error:'No listing image could be loaded for exact variant verification.'};
@@ -1542,9 +2556,44 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true){
         a.opportunity_score=null;
         a.decision_reasons_es=[`La primera pasada detecto ${preliminaryDecision}, pero no se pudo completar el chequeo visual exacto.`,'No se publica como WATCH/BUY/STRONG BUY hasta completar la verificacion.'];
       }else{
-        const exact=await exactModelVerification({key,model,item,task,imageParts,preliminary:a});
-        const market=await liveMarketResearch({key,model,item,task,exact});
-        const final=finalizeVerifiedOpportunity(a,exact,market,economics,marketplaceVerification);
+        reportProgress(
+          48,
+          'Identificando modelo exacto',
+          'Chequeando variante, tamaño, material y condición'
+        );
+
+        const exact=await exactModelVerification({
+          key,model,item,task,imageParts,preliminary:a
+        });
+
+        reportProgress(
+          62,
+          'Modelo y condición identificados',
+          `${exact.exact_variant_label||exact.family||'Modelo'} · condition ${exact?.condition?.grade||'UNKNOWN'}`
+        );
+
+        const market=await liveMarketResearch({
+          key,
+          model,
+          item,
+          task,
+          exact,
+          onProgress:reportProgress
+        });
+
+        reportProgress(
+          94,
+          'Calculando oportunidad',
+          'Aplicando mercado, condición, costes y beneficio'
+        );
+
+        const final=finalizeVerifiedOpportunity(
+          a,
+          exact,
+          market,
+          economics,
+          marketplaceVerification
+        );
         verification={status:'verified',verified_at:new Date().toISOString(),preliminary_decision:preliminaryDecision,ai_preliminary_decision:aiPreliminaryDecision,marketplace_verification:marketplaceVerification,exact,market,final};
         a.brand=exact.brand||a.brand;
         a.model=exact.exact_variant_label||exact.family||a.model;
@@ -1568,8 +2617,21 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true){
   }
   a.market_verification=verification;
   const now=new Date().toISOString();
+  reportProgress(
+    97,
+    'Guardando resultado',
+    'Actualizando Luxury Hunter'
+  );
+
   if(taskId)storeTaskAnalysis(taskId,item,a,preliminaryDecision,verification,now);
   else storeStandaloneAnalysis(item,a,now);
+
+  reportProgress(
+    100,
+    'Análisis finalizado',
+    'Resultado guardado'
+  );
+
   return a;
 }
 
@@ -1733,8 +2795,165 @@ function updateTaskRecord(id, body) {
     t.task_name,boolInt(t.enabled),t.product_query,JSON.stringify(t.sources),t.description,boolInt(t.analyze_images),t.max_pages,t.max_items,Number.isFinite(t.min_eur)?t.min_eur:null,Number.isFinite(t.max_eur)?t.max_eur:null,boolInt(t.personal_only),boolInt(t.free_shipping),t.new_publish_option,t.region,t.cron,t.account_state_file,t.account_strategy,t.decision_mode,JSON.stringify(t.keyword_rules),JSON.stringify(t.xianyu_queries),JSON.stringify(t.bunjang_queries),JSON.stringify(t.japan_queries),t.interval_minutes,boolInt(t.run_if_missed),boolInt(t.email_enabled),t.email_to,JSON.stringify(t.notify_decisions),t.notify_min_score,t.notify_min_profit_eur,t.notify_max_items,boolInt(t.notify_only_new),now,Number(id));
   return taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(id)));
 }
+
+function progressEtaSeconds(startedAt,pct){
+  const p=Number(pct);
+
+  if(!startedAt || !Number.isFinite(p) || p<10 || p>=100){
+    return p>=100?0:null;
+  }
+
+  const startedMs=new Date(startedAt).getTime();
+
+  if(!Number.isFinite(startedMs))return null;
+
+  const elapsed=Math.max(0,(Date.now()-startedMs)/1000);
+
+  if(elapsed<8)return null;
+
+  return Math.max(
+    0,
+    Math.round(elapsed*((100-p)/p))
+  );
+}
+
+function setTaskRunProgress(
+  runId,
+  pct,
+  stage,
+  detail='',
+  current=null,
+  total=null
+){
+  if(!runId)return;
+
+  const p=Math.max(
+    0,
+    Math.min(100,Math.round(Number(pct)||0))
+  );
+
+  const row=db.prepare(
+    'SELECT started_at FROM task_runs WHERE id=?'
+  ).get(Number(runId));
+
+  const eta=progressEtaSeconds(row?.started_at,p);
+  const now=new Date().toISOString();
+
+  db.prepare(`
+    UPDATE task_runs
+    SET progress_pct=?,
+        progress_stage=?,
+        progress_detail=?,
+        progress_updated_at=?,
+        progress_eta_seconds=?,
+        progress_current=?,
+        progress_total=?
+    WHERE id=?
+  `).run(
+    p,
+    String(stage||''),
+    String(detail||''),
+    now,
+    eta,
+    current==null?null:Number(current),
+    total==null?null:Number(total),
+    Number(runId)
+  );
+}
+
+const analysisJobs=new Map();
+
+function createAnalysisJob(taskId,listingId){
+  const id=`analysis-${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
+  const startedAt=new Date().toISOString();
+
+  analysisJobs.set(id,{
+    id,
+    task_id:Number(taskId),
+    listing_id:Number(listingId),
+    status:'running',
+    progress_pct:1,
+    progress_stage:'Preparando análisis',
+    progress_detail:'',
+    progress_eta_seconds:null,
+    started_at:startedAt,
+    updated_at:startedAt,
+    finished_at:null,
+    error:null
+  });
+
+  return analysisJobs.get(id);
+}
+
+function updateAnalysisJob(
+  jobId,
+  pct,
+  stage,
+  detail=''
+){
+  const job=analysisJobs.get(jobId);
+  if(!job)return;
+
+  const p=Math.max(
+    0,
+    Math.min(100,Math.round(Number(pct)||0))
+  );
+
+  job.progress_pct=p;
+  job.progress_stage=String(stage||'');
+  job.progress_detail=String(detail||'');
+  job.progress_eta_seconds=progressEtaSeconds(
+    job.started_at,
+    p
+  );
+  job.updated_at=new Date().toISOString();
+}
+
+function finishAnalysisJob(jobId,status,error=null){
+  const job=analysisJobs.get(jobId);
+  if(!job)return;
+
+  job.status=status;
+  job.finished_at=new Date().toISOString();
+  job.updated_at=job.finished_at;
+  job.progress_eta_seconds=0;
+
+  if(status==='finished'){
+    job.progress_pct=100;
+    job.progress_stage='Análisis finalizado';
+    job.progress_detail='Resultado guardado';
+  }
+
+  if(status==='error'){
+    job.progress_stage='Error';
+    job.error=String(error||'Error desconocido');
+  }
+
+  setTimeout(()=>{
+    analysisJobs.delete(jobId);
+  },15*60*1000);
+}
+
 const runningTaskIds=new Set();
+
+function runIsAborted(runId){
+  return db.prepare('SELECT status FROM task_runs WHERE id=?')
+    .get(Number(runId))?.status==='aborted';
+}
+
+function abortedResult(runId,sessionId=null){
+  const finished=new Date().toISOString();
+  if(sessionId){
+    db.prepare(
+      "UPDATE search_sessions SET status='aborted',finished_at=? WHERE id=?"
+    ).run(finished,sessionId);
+  }
+  return {runId:Number(runId),sessionId,status:'aborted'};
+}
 async function executeTask(taskId, runId=null) {
+  if(runId && runIsAborted(runId)){
+    return abortedResult(runId);
+  }
   taskId=Number(taskId); if(runningTaskIds.has(taskId)) throw new Error('La tarea ya está ejecutándose.');
   const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId)); if(!task) throw new Error('Tarea no encontrada.');
   if(!task.enabled) throw new Error('La tarea está desactivada.');
@@ -1743,13 +2962,40 @@ async function executeTask(taskId, runId=null) {
   if(!runId){const rr=db.prepare('INSERT INTO task_runs(task_id,status,started_at) VALUES(?,?,?)').run(taskId,'running',started);runId=Number(rr.lastInsertRowid);}
   else db.prepare('UPDATE task_runs SET status=?,started_at=? WHERE id=?').run('running',started,Number(runId));
   db.prepare('UPDATE task_runs SET debug_json=? WHERE id=?').run(JSON.stringify({version:'1.7.1',taskSnapshot:safeTaskSnapshot(task),startedAt:started}),Number(runId));
+
+  setTaskRunProgress(
+    runId,
+    2,
+    'Iniciando tarea',
+    'Preparando fuentes y consultas'
+  );
+
   try{
+    setTaskRunProgress(
+      runId,
+      8,
+      'Buscando en marketplaces',
+      'Xianyu · Bunjang · Japón'
+    );
+
     const result=await globalSearch({
       taskId,runId:Number(runId),product:task.product_query,sources:task.sources,pages:task.max_pages,maxItems:task.max_items,minEur:task.min_eur,maxEur:task.max_eur,
       personal_only:task.personal_only,free_shipping:task.free_shipping,new_publish_option:task.new_publish_option,region:task.region,
       account_state_file:task.account_state_file,account_strategy:task.account_strategy,
       xianyuQueries:task.xianyu_queries,bunjangQueries:task.bunjang_queries,japanQueries:task.japan_queries
     });
+
+    if(runIsAborted(runId)){
+      return abortedResult(runId,result.sessionId);
+    }
+
+    setTaskRunProgress(
+      runId,
+      30,
+      'Búsqueda completada',
+      'Preparando anuncios para análisis'
+    );
+
     // Apartar de esta ejecución los anuncios que esta misma tarea ya analizó.
     // El listing y su análisis permanecen guardados en el histórico.
     const previousAnalyzed = db.prepare(`
@@ -1775,29 +3021,184 @@ async function executeTask(taskId, runId=null) {
 
     if(task.decision_mode==='keyword'){
       const items=sessionListings(result.sessionId);
-      for(const item of items){if(!matchesKeywordRules(item,task.keyword_rules)) db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);}
+      for(const item of items){
+        if(runIsAborted(runId)){
+          return abortedResult(runId,result.sessionId);
+        }if(!matchesKeywordRules(item,task.keyword_rules)) db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);}
     } else if(process.env.GEMINI_API_KEY){
       const items=sessionListings(result.sessionId);
+      const pendingItems=[];
+
       for(const item of items){
-        const existingAnalysis=db.prepare('SELECT decision,verification_json FROM task_analyses WHERE task_id=? AND listing_id=?').get(taskId,item.id);
+        const existingAnalysis=db.prepare(
+          'SELECT decision,verification_json FROM task_analyses WHERE task_id=? AND listing_id=?'
+        ).get(taskId,item.id);
+
         if(existingAnalysis){
           let verificationStatus='';
-          try{verificationStatus=JSON.parse(existingAnalysis.verification_json||'{}')?.status||''}catch{}
-          const needsVerification=existingAnalysis.decision==='REVIEW'||(POSITIVE_DECISIONS.has(String(existingAnalysis.decision||'').toUpperCase())&&verificationStatus!=='verified');
-          if(!needsVerification) continue;
+
+          try{
+            verificationStatus=
+              JSON.parse(existingAnalysis.verification_json||'{}')?.status||'';
+          }catch{}
+
+          const needsVerification=
+            existingAnalysis.decision==='REVIEW' ||
+            (
+              POSITIVE_DECISIONS.has(
+                String(existingAnalysis.decision||'').toUpperCase()
+              ) &&
+              verificationStatus!=='verified'
+            );
+
+          if(!needsVerification)continue;
         }
-        try{await analyzeWithGemini(item.id,taskId,task.analyze_images);await sleep(250);}catch(e){console.error(`AI task ${taskId} listing ${item.id}:`,e.message);}
+
+        pendingItems.push(item);
+      }
+
+      const total=pendingItems.length;
+
+      if(!total){
+        setTaskRunProgress(
+          runId,
+          90,
+          'Sin anuncios nuevos por analizar',
+          'Todos los resultados relevantes ya estaban procesados',
+          0,
+          0
+        );
+      }
+
+      for(let idx=0;idx<total;idx++){
+        if(runIsAborted(runId)){
+          return abortedResult(runId,result.sessionId);
+        }
+
+        const item=pendingItems[idx];
+
+        const itemProgress=(pct,stage,detail='')=>{
+          const local=Math.max(
+            0,
+            Math.min(100,Number(pct)||0)
+          );
+
+          const overall=
+            30 +
+            Math.round(
+              60*((idx+(local/100))/Math.max(total,1))
+            );
+
+          setTaskRunProgress(
+            runId,
+            Math.min(90,overall),
+            stage,
+            `Anuncio ${idx+1}/${total}${detail?' · '+detail:''}`,
+            idx,
+            total
+          );
+        };
+
+        try{
+          await analyzeWithGemini(
+            item.id,
+            taskId,
+            task.analyze_images,
+            itemProgress
+          );
+
+          await sleep(250);
+        }catch(e){
+          console.error(
+            `AI task ${taskId} listing ${item.id}:`,
+            e.message
+          );
+        }
+
+        const completed=idx+1;
+
+        setTaskRunProgress(
+          runId,
+          30+Math.round(60*(completed/Math.max(total,1))),
+          `Analizados ${completed}/${total}`,
+          completed<total
+            ? 'Preparando siguiente anuncio'
+            : 'Análisis de anuncios completado',
+          completed,
+          total
+        );
       }
     }
+    if(runIsAborted(runId)){
+      return abortedResult(runId,result.sessionId);
+    }
     const finalItems=sessionListings(result.sessionId);
+
+    setTaskRunProgress(
+      runId,
+      94,
+      'Preparando resultados',
+      `${finalItems.length} anuncios en la ejecución`
+    );
+
     let emailResult=null;
-    try{emailResult=await sendTaskDigest(task,Number(runId),result.sessionId,finalItems,result.status);}catch(e){emailResult={sent:false,error:e.message};console.error(`Email task ${taskId}:`,e.message);}
+
+    setTaskRunProgress(
+      runId,
+      96,
+      'Procesando notificaciones',
+      'Preparando email / digest si corresponde'
+    );
+
+    try{
+      emailResult=await sendTaskDigest(
+        task,
+        Number(runId),
+        result.sessionId,
+        finalItems,
+        result.status
+      );
+    }catch(e){
+      emailResult={sent:false,error:e.message};
+      console.error(`Email task ${taskId}:`,e.message);
+    }
+
+    setTaskRunProgress(
+      runId,
+      99,
+      'Finalizando',
+      'Guardando estado de la ejecución'
+    );
+
+    if(runIsAborted(runId)){
+      return abortedResult(runId,result.sessionId);
+    }
     const finished=new Date().toISOString();
+
+    setTaskRunProgress(
+      runId,
+      100,
+      'Finalizado',
+      'Ejecución completada'
+    );
+
     db.prepare('UPDATE task_runs SET session_id=?,status=?,source_status_json=?,finished_at=? WHERE id=?').run(result.sessionId,'finished',JSON.stringify({...result.status,email:emailResult}),finished,Number(runId));
     db.prepare('UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?').run(finished,finished,taskId);
     return {runId,sessionId:result.sessionId,count:finalItems.length,status:result.status,email:emailResult};
   }catch(e){
     const finished=new Date().toISOString();
+
+    const pr=db.prepare(
+      'SELECT progress_pct FROM task_runs WHERE id=?'
+    ).get(Number(runId));
+
+    setTaskRunProgress(
+      runId,
+      Number(pr?.progress_pct||0),
+      'Error',
+      e?.message||String(e)
+    );
+
     db.prepare('UPDATE task_runs SET status=?,error=?,finished_at=? WHERE id=?').run('error',e?.message||String(e),finished,Number(runId));
     throw e;
   }finally{runningTaskIds.delete(taskId);}
@@ -1821,6 +3222,712 @@ function getMailTransport(){
 }
 function htmlEsc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function moneyEmail(n){return n==null||!Number.isFinite(Number(n))?'—':new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(n));}
+
+
+function emailSafeJson(value){
+  if(value && typeof value==='object')return value;
+
+  try{
+    const v=JSON.parse(String(value||'{}'));
+    return v && typeof v==='object'?v:{};
+  }catch{
+    return {};
+  }
+}
+
+function emailNumber(value){
+  if(value===null||value===undefined||value===''){
+    return null;
+  }
+
+  const n=Number(value);
+  return Number.isFinite(n)?n:null;
+}
+
+function emailMoney(value){
+  const n=emailNumber(value);
+
+  if(n===null)return '—';
+
+  return new Intl.NumberFormat(
+    'es-ES',
+    {
+      style:'currency',
+      currency:'EUR',
+      maximumFractionDigits:2
+    }
+  ).format(n);
+}
+
+function emailPercent(value){
+  const n=emailNumber(value);
+
+  if(n===null)return '—';
+
+  return `${Math.round(n<=1?n*100:n)}%`;
+}
+
+function emailReportBaseUrl(){
+  return String(
+    process.env.REPORT_BASE_URL ||
+    'https://nmuxart-star.github.io/luxury-hunter-worker/report.html'
+  )
+    .trim()
+    .replace(/#.*$/,'');
+}
+
+function emailReportPayload(value){
+  return Buffer
+    .from(JSON.stringify(value),'utf8')
+    .toString('base64url');
+}
+
+function globalEmailOpportunityData(x){
+  const verification=emailSafeJson(
+    x?.verification_json
+  );
+
+  const exact=
+    verification?.exact &&
+    typeof verification.exact==='object'
+      ? verification.exact
+      : {};
+
+  const market=
+    verification?.market &&
+    typeof verification.market==='object'
+      ? verification.market
+      : {};
+
+  const marketplace=
+    verification?.marketplace_verification &&
+    typeof verification.marketplace_verification==='object'
+      ? verification.marketplace_verification
+      : {};
+
+  const condition=
+    (
+      market?.target_condition &&
+      typeof market.target_condition==='object'
+    )
+      ? market.target_condition
+      : (
+          exact?.condition &&
+          typeof exact.condition==='object'
+        )
+          ? exact.condition
+          : {};
+
+  const resaleLow=emailNumber(
+    x?.resale_low_eur
+  );
+
+  const resaleHigh=emailNumber(
+    x?.resale_high_eur
+  );
+
+  const resaleVerified=
+    (resaleLow!==null && resaleLow>0) ||
+    (resaleHigh!==null && resaleHigh>0);
+
+  const profitLow=resaleVerified
+    ? emailNumber(x?.net_profit_low_eur)
+    : null;
+
+  const profitHigh=resaleVerified
+    ? emailNumber(x?.net_profit_high_eur)
+    : null;
+
+  const imported=emailNumber(
+    x?.landed_cost_eur ??
+    x?.import_costs?.importedTotalEur
+  );
+
+  const marketConfidence=String(
+    market?.model_market_confidence ??
+    market?.market_confidence ??
+    'LOW'
+  ).toUpperCase();
+
+  const relevantComps=Number(
+    market?.model_relevant_comparable_count ??
+    market?.relevant_comparable_count ??
+    0
+  );
+
+  const marketSources=Number(
+    market?.model_independent_source_count ??
+    market?.independent_source_count ??
+    0
+  );
+
+  const conditionMarketConfidence=String(
+    market?.condition_market_confidence ??
+    'LOW'
+  ).toUpperCase();
+
+  const conditionComps=Number(
+    market?.condition_matched_comparable_count ??
+    0
+  );
+
+  const conditionSources=Number(
+    market?.condition_independent_source_count ??
+    0
+  );
+
+  const conditionGrade=String(
+    condition?.grade||'UNKNOWN'
+  ).toUpperCase();
+
+  const conditionScore=emailNumber(
+    condition?.score
+  );
+
+  const conditionConfidence=emailNumber(
+    condition?.confidence
+  );
+
+  const marketplaceStatus=String(
+    marketplace?.status||'UNKNOWN'
+  ).toUpperCase();
+
+  let marketplaceService=String(
+    marketplace?.service||''
+  ).trim();
+
+  if(!marketplaceService){
+    const src=String(x?.source||'').toLowerCase();
+
+    if(src==='bunjang'){
+      marketplaceService='Bunjang Care';
+    }else if(src==='xianyu'){
+      marketplaceService='Xianyu Verification';
+    }
+  }
+
+  const references=(
+    Array.isArray(market?.research_references)
+      ? market.research_references
+      : Array.isArray(market?.comparables)
+        ? market.comparables
+        : []
+  ).slice(0,8).map(r=>({
+    source:r?.source||'',
+    title:r?.title||'',
+    url:r?.url||'',
+    price:r?.price??null,
+    currency:r?.currency||'',
+    price_eur:r?.price_eur??null,
+    listing_status:r?.listing_status||'UNKNOWN',
+    match_level:r?.match_level||'UNKNOWN',
+    match_reason_es:r?.match_reason_es||'',
+    condition_grade:r?.condition_grade||'UNKNOWN',
+    condition_relation_to_target:
+      r?.condition_relation_to_target||'UNKNOWN',
+    listing_date:r?.listing_date||null,
+    sold_date:r?.sold_date||null,
+    date_text:r?.date_text||null
+  }));
+
+  const queries=(
+    Array.isArray(market?.web_search_queries)
+      ? market.web_search_queries
+      : []
+  ).slice(0,8);
+
+  const payload={
+    generated_at:new Date().toISOString(),
+
+    task:{
+      name:x?.task_name||''
+    },
+
+    listing:{
+      id:x?.id??null,
+      title:x?.title||'',
+      source:x?.source||'',
+      purchase_via:x?.purchase_via||'',
+      seller_name:x?.seller_name||'',
+      url:x?.url||'',
+      image_url:x?.image_url||'',
+      original_price:x?.original_price??null,
+      currency:x?.currency||'',
+      price_eur:x?.price_eur??null
+    },
+
+    analysis:{
+      decision:x?.decision||'',
+      score:x?.opportunity_score??null,
+      authenticity_risk:x?.authenticity_risk||'',
+      liquidity:x?.liquidity||'',
+      landed_cost_eur:imported,
+
+      resale_low_eur:
+        resaleVerified?resaleLow:null,
+
+      resale_high_eur:
+        resaleVerified?resaleHigh:null,
+
+      profit_low_eur:profitLow,
+      profit_high_eur:profitHigh
+    },
+
+    marketplace:{
+      service:marketplaceService,
+      status:marketplaceStatus,
+      confidence:marketplace?.confidence||'',
+      evidence_es:Array.isArray(
+        marketplace?.evidence_es
+      )
+        ? marketplace.evidence_es.slice(0,6)
+        : []
+    },
+
+    exact:{
+      label:
+        exact?.exact_variant_label ||
+        exact?.family ||
+        x?.model ||
+        '',
+
+      confidence:exact?.confidence??null,
+      size:exact?.size||'',
+      material:exact?.material||'',
+      color:exact?.main_color||'',
+      pattern:exact?.pattern||'',
+      hardware:exact?.hardware||'',
+
+      visual_evidence_es:
+        Array.isArray(exact?.visual_evidence_es)
+          ? exact.visual_evidence_es.slice(0,6)
+          : [],
+
+      uncertainties_es:
+        Array.isArray(exact?.uncertainties_es)
+          ? exact.uncertainties_es.slice(0,6)
+          : []
+    },
+
+    condition:{
+      grade:conditionGrade,
+      score:conditionScore,
+      confidence:conditionConfidence,
+
+      visible_areas_es:
+        Array.isArray(condition?.visible_areas_es)
+          ? condition.visible_areas_es.slice(0,8)
+          : [],
+
+      defects_es:
+        Array.isArray(condition?.defects_es)
+          ? condition.defects_es.slice(0,8)
+          : [],
+
+      positive_signals_es:
+        Array.isArray(condition?.positive_signals_es)
+          ? condition.positive_signals_es.slice(0,8)
+          : [],
+
+      missing_views_es:
+        Array.isArray(condition?.missing_views_es)
+          ? condition.missing_views_es.slice(0,8)
+          : []
+    },
+
+    market:{
+      confidence:marketConfidence,
+      relevant_comps:relevantComps,
+      sources:marketSources,
+
+      condition_confidence:
+        conditionMarketConfidence,
+
+      condition_comps:conditionComps,
+      condition_sources:conditionSources,
+
+      search_passes:Number(
+        market?.search_passes||0
+      ),
+
+      results_found:Number(
+        market?.research_candidate_count ??
+        market?.raw_comparable_count ??
+        references.length
+      ),
+
+      vision_ok:
+        market?.vision_web_detection?.ok===true,
+
+      vision_candidates:Number(
+        market?.visual_candidate_count||0
+      ),
+
+      vision_error:
+        market?.vision_web_detection?.error||'',
+
+      checked_at:
+        market?.checked_at ||
+        verification?.verified_at ||
+        '',
+
+      queries,
+      references
+    },
+
+    import_costs:
+      x?.import_costs &&
+      typeof x.import_costs==='object'
+        ? x.import_costs
+        : {}
+  };
+
+  const reportUrl=
+    `${emailReportBaseUrl()}#${
+      emailReportPayload(payload)
+    }`;
+
+  return {
+    ...payload,
+    reportUrl,
+    resaleVerified
+  };
+}
+
+function globalEmailMarketplaceText(d){
+  const service=d?.marketplace?.service;
+
+  if(!service){
+    return 'No aplica';
+  }
+
+  const status=String(
+    d?.marketplace?.status||'UNKNOWN'
+  ).toUpperCase();
+
+  if(status==='PASSED'){
+    return `${service}: SUPERADO`;
+  }
+
+  if(status==='AVAILABLE'){
+    return `${service}: DISPONIBLE`;
+  }
+
+  if(status==='FAILED'){
+    return `${service}: NO SUPERADO`;
+  }
+
+  if(status==='UNAVAILABLE'){
+    return `${service}: NO DISPONIBLE`;
+  }
+
+  return `${service}: NO DETECTADO`;
+}
+
+function globalEmailConditionText(d){
+  const c=d?.condition||{};
+
+  if(!c.grade || c.grade==='UNKNOWN'){
+    return 'Sin información suficiente';
+  }
+
+  const parts=[c.grade];
+
+  if(emailNumber(c.score)!==null){
+    parts.push(
+      `${Math.round(Number(c.score))}/100`
+    );
+  }
+
+  if(emailNumber(c.confidence)!==null){
+    parts.push(
+      `confianza ${emailPercent(c.confidence)}`
+    );
+  }
+
+  return parts.join(' · ');
+}
+
+function globalEmailResaleText(d){
+  if(!d.resaleVerified){
+    return 'Sin estimación verificada';
+  }
+
+  return `${
+    emailMoney(d.analysis.resale_low_eur)
+  } – ${
+    emailMoney(d.analysis.resale_high_eur)
+  }`;
+}
+
+function globalEmailProfitText(d){
+  if(!d.resaleVerified){
+    return 'Sin estimación verificada';
+  }
+
+  return `${
+    emailMoney(d.analysis.profit_low_eur)
+  } – ${
+    emailMoney(d.analysis.profit_high_eur)
+  }`;
+}
+
+function globalEmailOpportunityRow(x,index){
+  const d=globalEmailOpportunityData(x);
+
+  const exactLabel=
+    d.exact.label||x?.model||'—';
+
+  const exactConfidence=
+    emailNumber(d.exact.confidence)!==null
+      ? emailPercent(d.exact.confidence)
+      : '—';
+
+  const image=d.listing.image_url
+    ? `<img
+         src="${htmlEsc(d.listing.image_url)}"
+         alt=""
+         width="120"
+         height="120"
+         style="
+           display:block;
+           width:120px;
+           height:120px;
+           object-fit:cover;
+           border-radius:10px;
+           border:1px solid #e5e7eb;
+           margin-bottom:10px;
+         "
+       >`
+    : '';
+
+  return `
+    <tr>
+      <td
+        valign="top"
+        style="
+          padding:16px;
+          border-bottom:1px solid #e5e7eb;
+          width:40%;
+        "
+      >
+        ${image}
+
+        <b style="
+          font-size:16px;
+          color:#111827;
+        ">
+          ${index}. ${htmlEsc(x.task_name||'')}
+        </b>
+
+        <div style="
+          margin-top:5px;
+          font-weight:700;
+          color:#111827;
+        ">
+          ${htmlEsc(d.listing.title||'(sin título)')}
+        </div>
+
+        <div style="
+          margin-top:5px;
+          color:#6b7280;
+          font-size:13px;
+        ">
+          ${htmlEsc(d.listing.source||'')}
+          ${
+            d.listing.price_eur!=null
+              ? ` · producto ${
+                  emailMoney(d.listing.price_eur)
+                }`
+              : ''
+          }
+          ${
+            d.analysis.landed_cost_eur!=null
+              ? ` · importado ${
+                  emailMoney(
+                    d.analysis.landed_cost_eur
+                  )
+                }`
+              : ''
+          }
+        </div>
+
+        <div style="
+          margin-top:10px;
+          font-size:13px;
+          line-height:1.5;
+        ">
+          <b>Exact model:</b>
+          ${htmlEsc(exactLabel)}
+          · ${htmlEsc(exactConfidence)}
+          <br>
+
+          <b>Market:</b>
+          ${htmlEsc(d.market.confidence)}
+          · ${d.market.relevant_comps} comparables
+          · ${d.market.sources} fuentes
+        </div>
+      </td>
+
+      <td
+        valign="top"
+        style="
+          padding:16px;
+          border-bottom:1px solid #e5e7eb;
+          width:22%;
+        "
+      >
+        <b style="
+          font-size:16px;
+          color:#111827;
+        ">
+          ${htmlEsc(d.analysis.decision||'—')}
+        </b>
+
+        ${
+          d.analysis.score!==null &&
+          d.analysis.score!==undefined
+            ? `<div style="margin-top:4px">
+                Score ${htmlEsc(d.analysis.score)}
+               </div>`
+            : ''
+        }
+
+        <div style="
+          margin-top:7px;
+          color:#6b7280;
+          line-height:1.5;
+        ">
+          Auth:
+          ${htmlEsc(
+            d.analysis.authenticity_risk||'—'
+          )}
+          <br>
+
+          Liquidez:
+          ${htmlEsc(
+            d.analysis.liquidity||'—'
+          )}
+        </div>
+
+        <div style="
+          margin-top:10px;
+          font-size:13px;
+          line-height:1.55;
+        ">
+          <b>Control autenticidad:</b><br>
+          ${htmlEsc(
+            globalEmailMarketplaceText(d)
+          )}
+        </div>
+
+        <div style="
+          margin-top:10px;
+          font-size:13px;
+          line-height:1.55;
+        ">
+          <b>Informe de calidad:</b><br>
+          ${htmlEsc(
+            globalEmailConditionText(d)
+          )}
+        </div>
+      </td>
+
+      <td
+        valign="top"
+        style="
+          padding:16px;
+          border-bottom:1px solid #e5e7eb;
+          width:23%;
+          line-height:1.65;
+        "
+      >
+        <span style="color:#6b7280">
+          Final importado
+        </span>
+        <br>
+        <b>
+          ${emailMoney(
+            d.analysis.landed_cost_eur
+          )}
+        </b>
+
+        <div style="margin-top:10px">
+          <span style="color:#6b7280">
+            Reventa estimada
+          </span>
+          <br>
+          <b>
+            ${htmlEsc(
+              globalEmailResaleText(d)
+            )}
+          </b>
+        </div>
+
+        <div style="margin-top:10px">
+          <span style="color:#6b7280">
+            Beneficio tras reventa
+          </span>
+          <br>
+          <b>
+            ${htmlEsc(
+              globalEmailProfitText(d)
+            )}
+          </b>
+        </div>
+      </td>
+
+      <td
+        valign="top"
+        style="
+          padding:16px;
+          border-bottom:1px solid #e5e7eb;
+          width:15%;
+        "
+      >
+        ${
+          d.listing.url
+            ? `<a
+                 href="${htmlEsc(d.listing.url)}"
+                 target="_blank"
+                 style="
+                   display:block;
+                   padding:9px 11px;
+                   border-radius:8px;
+                   background:#111827;
+                   color:#ffffff;
+                   text-decoration:none;
+                   font-weight:700;
+                   text-align:center;
+                   margin-bottom:8px;
+                 "
+               >
+                 Abrir anuncio
+               </a>`
+            : ''
+        }
+
+        <a
+          href="${htmlEsc(d.reportUrl)}"
+          target="_blank"
+          style="
+            display:block;
+            padding:9px 11px;
+            border-radius:8px;
+            background:#6d4aff;
+            color:#ffffff;
+            text-decoration:none;
+            font-weight:700;
+            text-align:center;
+          "
+        >
+          Abrir informe
+        </a>
+      </td>
+    </tr>
+  `;
+}
+
 function qualifiesForEmail(task,item){
   if(task.decision_mode==='ai'){
     if(!item.decision || !(task.notify_decisions||[]).includes(item.decision)) return false;
@@ -2282,28 +4389,24 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
       <td style="padding:8px;border-bottom:1px solid #e5e7eb">${Number(s.status_error||0)?`${s.status_error} error(es)`:'OK'}</td>
     </tr>`).join(''):`<tr><td colspan="5" style="padding:12px;color:#6b7280">No hubo ejecuciones registradas en esta ventana.</td></tr>`;
 
-  const rows=opportunities.length?opportunities.map((x,index)=>{
-    const imported=x.import_costs?.importedTotalEur??x.landed_cost_eur??null;
-    return `
-      <tr>
-        <td style="padding:13px;border-bottom:1px solid #e5e7eb;vertical-align:top">
-          <b>${index+1}. ${htmlEsc(x._task_name)}</b><br>
-          ${htmlEsc(x.brand||'')} ${htmlEsc(x.model||x.title||'')}<br>
-          <span style="color:#6b7280">${htmlEsc(x.source||'-')} - producto ${moneyEmail(x.price_eur)} - importado ${moneyEmail(imported)}</span>
-          ${globalDigestVerificationHtml(x)}
+  const rows=opportunities.length
+    ? opportunities.map(
+        (x,i)=>globalEmailOpportunityRow(x,i+1)
+      ).join('')
+    : `<tr>
+        <td
+          colspan="4"
+          style="
+            padding:22px;
+            text-align:center;
+            color:#6b7280;
+          "
+        >
+          <b>No ha habido novedades.</b><br>
+          No se detectaron STRONG BUY, BUY ni WATCH
+          durante las ultimas 3 horas.
         </td>
-        <td style="padding:13px;border-bottom:1px solid #e5e7eb;vertical-align:top">
-          <b>${htmlEsc(x.decision||'')}</b><br>
-          Score ${x.opportunity_score==null?'-':htmlEsc(x.opportunity_score)}<br>
-          <span style="color:#6b7280">Auth: ${htmlEsc(x.authenticity_risk||'-')} - Liquidez: ${htmlEsc(x.liquidity||'-')}</span>
-        </td>
-        <td style="padding:13px;border-bottom:1px solid #e5e7eb;vertical-align:top">
-          Reventa: ${moneyEmail(x.resale_low_eur)} - ${moneyEmail(x.resale_high_eur)}<br>
-          <b>Beneficio: ${moneyEmail(x.net_profit_low_eur)} - ${moneyEmail(x.net_profit_high_eur)}</b>
-        </td>
-        <td style="padding:13px;border-bottom:1px solid #e5e7eb;vertical-align:top"><a href="${htmlEsc(x.url||'#')}">Abrir anuncio</a></td>
       </tr>`;
-  }).join(''):`<tr><td colspan="4" style="padding:22px;text-align:center;color:#6b7280"><b>No ha habido novedades.</b><br>No se detectaron STRONG BUY, BUY ni WATCH durante las ultimas 3 horas.</td></tr>`;
 
   const sendTime=globalDigestMadridLabel(now,setting.timezone||'Europe/Madrid');
   const sendFull=globalDigestMadridFullLabel(now,setting.timezone||'Europe/Madrid');
@@ -2454,6 +4557,38 @@ const server=http.createServer(async(req,res)=>{
       const latestRun=db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1').get(task.id)||null;
       return json(res,200,{manifest:buildExecutionManifest(task,plan,null,null)});
     }
+    const ra=u.pathname.match(/^\/api\/task-runs\/(\d+)\/abort$/);
+    if(ra&&req.method==='POST'){
+      const runId=Number(ra[1]);
+      const run=db.prepare('SELECT * FROM task_runs WHERE id=?').get(runId);
+
+      if(!run)return json(res,404,{error:'Run no encontrado'});
+
+      if(!['queued','running'].includes(String(run.status))){
+        return json(res,409,{
+          error:`La ejecución ya está en estado ${run.status}.`
+        });
+      }
+
+      const finished=new Date().toISOString();
+
+      db.prepare(
+        "UPDATE task_runs SET status='aborted',error=NULL,finished_at=? WHERE id=?"
+      ).run(finished,runId);
+
+      if(run.session_id){
+        db.prepare(
+          "UPDATE search_sessions SET status='aborted',finished_at=? WHERE id=?"
+        ).run(finished,run.session_id);
+      }
+
+      db.prepare(
+        'UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?'
+      ).run(finished,finished,run.task_id);
+
+      return json(res,200,{ok:true,runId,status:'aborted'});
+    }
+
     const ri=u.pathname.match(/^\/api\/task-runs\/(\d+)\/inspect$/);
     if(ri&&req.method==='GET'){
       const run=db.prepare(`SELECT r.*,t.task_name FROM task_runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=?`).get(Number(ri[1])); if(!run)return json(res,404,{error:'Run no encontrado'});
@@ -2467,6 +4602,80 @@ const server=http.createServer(async(req,res)=>{
 
     const tresults=u.pathname.match(/^\/api\/tasks\/(\d+)\/results$/);
     if(tresults&&req.method==='GET')return json(res,200,{items:taskResults(Number(tresults[1]))});
+    const taj=u.pathname.match(
+      /^\/api\/tasks\/(\d+)\/listings\/(\d+)\/analyze-job$/
+    );
+
+    if(taj&&req.method==='POST'){
+      const taskId=Number(taj[1]);
+      const listingId=Number(taj[2]);
+
+      const task=taskPublic(
+        db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId)
+      );
+
+      if(!task){
+        return json(res,404,{error:'Tarea no encontrada'});
+      }
+
+      const listing=db.prepare(
+        'SELECT id FROM listings WHERE id=?'
+      ).get(listingId);
+
+      if(!listing){
+        return json(res,404,{error:'Anuncio no encontrado'});
+      }
+
+      const job=createAnalysisJob(taskId,listingId);
+
+      setImmediate(async()=>{
+        try{
+          await analyzeWithGemini(
+            listingId,
+            taskId,
+            task.analyze_images,
+            (pct,stage,detail)=>{
+              updateAnalysisJob(
+                job.id,
+                pct,
+                stage,
+                detail
+              );
+            }
+          );
+
+          finishAnalysisJob(job.id,'finished');
+        }catch(e){
+          finishAnalysisJob(
+            job.id,
+            'error',
+            e?.message||String(e)
+          );
+        }
+      });
+
+      return json(res,202,{
+        jobId:job.id,
+        status:'running'
+      });
+    }
+
+    const aj=u.pathname.match(
+      /^\/api\/analysis-jobs\/([^/]+)$/
+    );
+
+    if(aj&&req.method==='GET'){
+      const job=analysisJobs.get(aj[1]);
+
+      if(!job){
+        return json(res,404,{
+          error:'Análisis no encontrado o ya expirado'
+        });
+      }
+
+      return json(res,200,{job});
+    }
+
     const ta=u.pathname.match(/^\/api\/tasks\/(\d+)\/listings\/(\d+)\/analyze$/);
     if(ta&&req.method==='POST'){
       const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(ta[1])));if(!task)return json(res,404,{error:'Tarea no encontrada'});

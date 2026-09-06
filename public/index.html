@@ -26,7 +26,8 @@
     <button data-page="dashboard"><span class="icon">◫</span><span class="label">Dashboard</span></button>
     <button data-page="create"><span class="icon">＋</span><span class="label">Crear tarea</span></button>
     <button data-page="tasks"><span class="icon">☷</span><span class="label">Tareas</span></button>
-    <button data-page="results"><span class="icon">◇</span><span class="label">Resultados</span></button>
+    <button data-page="results-success"><span class="icon">◆</span><span class="label">Resultados exitosos</span></button>
+    <button data-page="results-negative"><span class="icon">⊘</span><span class="label">Resultados negativos</span></button>
     <button data-page="logs"><span class="icon">≡</span><span class="label">Logs</span></button>
     <button data-page="settings"><span class="icon">⚙</span><span class="label">Configuración</span></button>
   </nav>
@@ -141,13 +142,56 @@
       <div class="card tablewrap"><table class="table"><thead><tr><th>Tarea</th><th>Fuentes</th><th>Filtros</th><th>Programación</th><th>Última ejecución</th><th></th></tr></thead><tbody id="tasksBody"></tbody></table></div>
     </section>
 
-    <section id="page-results" class="page">
-      <div class="section-head"><div><h2>Resultados</h2><p>Todos los anuncios interesantes agrupados por tarea, independientemente del origen.</p></div></div>
-      <div class="results-toolbar"><select id="resultTask" onchange="loadResults()"></select><select id="resultSource" onchange="renderResults()"><option value="">Todas las fuentes</option><option value="xianyu">Xianyu</option><option value="bunjang">Bunjang</option><option value="jp">Japón</option></select><select id="resultDecision" onchange="renderResults()"><option value="">Todas las decisiones</option><option>STRONG BUY</option><option>BUY</option><option>WATCH</option><option>REVIEW</option><option>REJECT</option><option value="UNANALYZED">Sin analizar</option></select><button class="btn" onclick="loadResults()">Recargar</button></div>
-      <div class="card" id="resultsList"><div class="empty">Selecciona una tarea.</div></div>
+
+    <section id="page-results-success" class="page">
+      <div class="section-head">
+        <div>
+          <h2>Resultados exitosos</h2>
+          <p>Oportunidades que merece la pena revisar: STRONG BUY, BUY y WATCH.</p>
+        </div>
+      </div>
+
+      <div class="results-toolbar">
+        <select id="resultTaskSuccess" onchange="loadResultsFor('success')"></select>
+
+        <select id="resultSourceSuccess" onchange="renderResultsFor('success')">
+          <option value="">Todas las fuentes</option>
+          <option value="xianyu">Xianyu</option>
+          <option value="bunjang">Bunjang</option>
+          <option value="jp">Japón</option>
+        </select>
+
+        <button class="btn" onclick="loadResultsFor('success')">Recargar</button>
+      </div>
+
+      <div id="resultsSuccessList"></div>
     </section>
 
-    <section id="page-logs" class="page">
+    <section id="page-results-negative" class="page">
+      <div class="section-head">
+        <div>
+          <h2>Resultados negativos</h2>
+          <p>Productos descartados. Los REJECT desaparecen de esta sección 5 días después de su última detección.</p>
+        </div>
+      </div>
+
+      <div class="results-toolbar">
+        <select id="resultTaskNegative" onchange="loadResultsFor('negative')"></select>
+
+        <select id="resultSourceNegative" onchange="renderResultsFor('negative')">
+          <option value="">Todas las fuentes</option>
+          <option value="xianyu">Xianyu</option>
+          <option value="bunjang">Bunjang</option>
+          <option value="jp">Japón</option>
+        </select>
+
+        <button class="btn" onclick="loadResultsFor('negative')">Recargar</button>
+      </div>
+
+      <div id="resultsNegativeList"></div>
+    </section>
+
+<section id="page-logs" class="page">
       <div class="section-head"><div><h2>Logs</h2><p>Historial de ejecuciones, estado de cada fuente y errores.</p></div><button class="btn" onclick="loadLogs()">Recargar</button></div>
       <div class="card tablewrap"><table class="table"><thead><tr><th>Tarea</th><th>Estado</th><th>Inicio</th><th>Fin</th><th>Fuentes</th><th>Error</th><th>Inspección</th></tr></thead><tbody id="logsBody"></tbody></table></div>
     </section>
@@ -185,12 +229,32 @@
   </div>
 </div>
 <script>
-const $=id=>document.getElementById(id);let tasks=[];let resultItems=[];let currentResultTask=null;const pages={dashboard:'Dashboard',create:'Crear tarea',tasks:'Tareas',results:'Resultados',logs:'Logs',settings:'Configuración'};
+const $=id=>document.getElementById(id);let tasks=[];let resultItems=[];let currentResultTask=null;const pages={dashboard:'Dashboard',create:'Crear tarea',tasks:'Tareas','results-success':'Resultados exitosos','results-negative':'Resultados negativos',logs:'Logs',settings:'Configuración'};
 async function api(url,opt){const r=await fetch(url,opt);let j;try{j=await r.json()}catch{throw new Error(await r.text())}if(!r.ok)throw new Error(j.error||r.statusText);return j}
 function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}function euro(n){return n==null||!Number.isFinite(Number(n))?'—':new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(n)}function num(n){return n==null?'—':new Intl.NumberFormat('es-ES',{maximumFractionDigits:0}).format(n)}function dt(s){if(!s)return'—';try{return new Date(s).toLocaleString('es-ES',{dateStyle:'short',timeStyle:'short'})}catch{return s}}
 function euro2(n){return n==null||!Number.isFinite(Number(n))?'—':new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR',minimumFractionDigits:2,maximumFractionDigits:2}).format(n)}
 function importCostHtml(i){const c=i.import_costs;if(!c)return'';const rows=[['Precio producto (conversión directa)',c.productPriceEur],['Envío doméstico',c.domesticShippingEur],['Agente / proxy',c.agentFeeEur],['Envío internacional',c.internationalShippingEur],[(c.lowValueDutyApplied?'Arancel fijo importación':'Arancel / aduanas'),c.customsDutyEur],['IVA importación ('+num(c.vatPercent)+'%)',c.importVatEur],['Gestión aduanera / courier',c.clearanceFeeEur],['Autenticación',c.authenticationFeeEur],['Otros costes',c.otherEur]];return `<div class="import-summary"><div class="import-summary-title">Coste estimado importado a España</div>${rows.map(([l,v])=>`<div class="cost-row"><span>${esc(l)}</span><b>${euro2(v)}</b></div>`).join('')}<div class="cost-row total"><span>PRECIO FINAL IMPORTADO</span><b>${euro2(c.importedTotalEur)}</b></div><div class="cost-note">Estimación según la configuración de importación de Luxury Hunter. El arancel y los costes logísticos pueden variar en la operación real.</div></div>`}
-function navigate(page){location.hash=page}function showPage(page){page=pages[page]?page:'dashboard';document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));$(`page-${page}`).classList.add('active');document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.page===page));$('pageTitle').textContent=pages[page];if(page==='dashboard')loadDashboard();if(page==='tasks')loadTasks();if(page==='results'){populateResultTasks();loadResults()}if(page==='logs')loadLogs();if(page==='settings')loadSettings();if(page==='create')loadAccounts()}
+function navigate(page){location.hash=page}
+function showPage(page){
+  page=pages[page]?page:'dashboard';
+
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+  $(`page-${page}`).classList.add('active');
+
+  document.querySelectorAll('.nav button').forEach(
+    b=>b.classList.toggle('active',b.dataset.page===page)
+  );
+
+  $('pageTitle').textContent=pages[page];
+
+  if(page==='dashboard')loadDashboard();
+  if(page==='tasks')loadTasks();
+  if(page==='results-success')initResultsPage('success');
+  if(page==='results-negative')initResultsPage('negative');
+  if(page==='logs')loadLogs();
+  if(page==='settings')loadSettings();
+  if(page==='create')loadAccounts();
+}
 window.addEventListener('hashchange',()=>showPage(location.hash.slice(1)));document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>navigate(b.dataset.page));
 function srcPills(srcs){return (srcs||[]).map(s=>`<span class="pill ${s==='xianyu'?'source-xianyu':s==='bunjang'?'source-bunjang':'source-jp'}">${s==='xianyu'?'Xianyu':s==='bunjang'?'Bunjang':'Japón'}</span>`).join('')}
 async function refreshStatus(){try{const s=await api('/api/status');$('topStatus').textContent=`${s.geminiConfigured?'Gemini ON':'Gemini OFF'} · ${s.bunjangCliExists?'Bunjang OK':'Bunjang ERROR'} · ${s.runningTasks.length} ejecutando`;return s}catch(e){$('topStatus').textContent='Error de estado: '+e.message;return null}}
@@ -206,15 +270,610 @@ async function loadTasks(){
   tasks=j.tasks||[]; const runs=rj.runs||[];
   const activeByTask=new Map(); const latestByTask=new Map();
   for(const r of runs){if(!latestByTask.has(r.task_id))latestByTask.set(r.task_id,r);if((r.status==='queued'||r.status==='running')&&!activeByTask.has(r.task_id))activeByTask.set(r.task_id,r)}
-  $('tasksBody').innerHTML=tasks.map(t=>{const active=activeByTask.get(t.id);const latest=latestByTask.get(t.id);return`<tr><td><div class="task-name">${esc(t.task_name)} ${t.enabled?'<span class="pill green">activa</span>':'<span class="pill">pausada</span>'}${active?'<span class="pill yellow">ejecutando</span>':''}</div><div class="subtext">${esc(t.product_query)} · ${t.decision_mode==='ai'?'AI':'keywords'}${active?` · Run #${active.id}`:''}</div></td><td>${srcPills(t.sources)}</td><td><div>${t.min_eur!=null?euro(t.min_eur):'—'} → ${t.max_eur!=null?euro(t.max_eur):'—'}</div><div class="subtext">${t.max_pages} pág. · ${t.max_items}/query${t.new_publish_option?' · '+esc(t.new_publish_option):''}</div></td><td>${t.interval_minutes?`<span class="pill purple">Cada ${Number(t.interval_minutes)/60} h</span>`:(t.cron?`<span class="pill purple">${esc(t.cron)}</span>`:'Manual')}${t.email_enabled?'<div class="subtext">✉ email activo</div>':''}</td><td>${dt(t.last_run_at)}</td><td><div class="split"><button class="btn small primary" onclick="runTask(${t.id},this)">▶ Ejecutar</button>${active?`<button class="btn small" onclick="inspectRun(${active.id})">⌘ Ver ejecución</button>`:`<button class="btn small" onclick="inspectTask(${t.id})">⌘ Ver código</button>`}<button class="btn small" onclick="editTask(${t.id})">Editar</button><button class="btn small" onclick="openTaskResults(${t.id})">Resultados</button><button class="btn small danger" onclick="deleteTask(${t.id})">Borrar</button></div>${!active&&latest?`<div class="subtext" style="margin-top:5px">Último run #${latest.id} · <a href="#" onclick="event.preventDefault();inspectRun(${latest.id})" style="color:#c4b5fd">inspeccionar</a></div>`:''}</td></tr>`}).join('')||'<tr><td colspan="6"><div class="empty">No hay tareas todavía. Crea la primera.</div></td></tr>';
+  $('tasksBody').innerHTML=tasks.map(t=>{const active=activeByTask.get(t.id);const latest=latestByTask.get(t.id);return`<tr><td><div class="task-name">${esc(t.task_name)} ${t.enabled?'<span class="pill green">activa</span>':'<span class="pill">pausada</span>'}${active?'<span class="pill yellow">ejecutando</span>':''}</div><div class="subtext">${esc(t.product_query)} · ${t.decision_mode==='ai'?'AI':'keywords'}${active?` · Run #${active.id}`:''}</div></td><td>${srcPills(t.sources)}</td><td><div>${t.min_eur!=null?euro(t.min_eur):'—'} → ${t.max_eur!=null?euro(t.max_eur):'—'}</div><div class="subtext">${t.max_pages} pág. · ${t.max_items}/query${t.new_publish_option?' · '+esc(t.new_publish_option):''}</div></td><td>${t.interval_minutes?`<span class="pill purple">Cada ${Number(t.interval_minutes)/60} h</span>`:(t.cron?`<span class="pill purple">${esc(t.cron)}</span>`:'Manual')}${t.email_enabled?'<div class="subtext">✉ email activo</div>':''}</td><td>${dt(t.last_run_at)}</td><td><div class="split"><button class="btn small primary" onclick="runTask(${t.id},this)">▶ Ejecutar</button>${active?`<button class="btn small" onclick="inspectRun(${active.id})">⌘ Ver ejecución</button>`:`<button class="btn small" onclick="inspectTask(${t.id})">⌘ Ver código</button>`}<button class="btn small" onclick="editTask(${t.id})">Editar</button><button class="btn small" onclick="openTaskResults(${t.id})">Resultados exitosos</button><button class="btn small danger" onclick="deleteTask(${t.id})">Borrar</button></div>${!active&&latest?`<div class="subtext" style="margin-top:5px">Último run #${latest.id} · <a href="#" onclick="event.preventDefault();inspectRun(${latest.id})" style="color:#c4b5fd">inspeccionar</a></div>`:''}</td></tr>`}).join('')||'<tr><td colspan="6"><div class="empty">No hay tareas todavía. Crea la primera.</div></td></tr>';
   populateResultTasks();refreshStatus();
 }
-async function runTask(id,btn){btn.disabled=true;btn.innerHTML='<span class="loading"></span>';try{const j=await api(`/api/tasks/${id}/run`,{method:'POST'});alert(`Tarea lanzada. Run #${j.runId}. Puedes seguirla en Logs.`);setTimeout(loadTasks,800)}catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent='▶ Ejecutar'}}async function deleteTask(id){if(!confirm('¿Eliminar esta tarea y sus análisis?'))return;try{await api(`/api/tasks/${id}`,{method:'DELETE'});loadTasks()}catch(e){alert(e.message)}}function openTaskResults(id){currentResultTask=String(id);navigate('results');setTimeout(()=>{$('resultTask').value=String(id);loadResults()},20)}
+async function runTask(id,btn){btn.disabled=true;btn.innerHTML='<span class="loading"></span>';try{const j=await api(`/api/tasks/${id}/run`,{method:'POST'});alert(`Tarea lanzada. Run #${j.runId}. Puedes seguirla en Logs.`);setTimeout(loadTasks,800)}catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent='▶ Ejecutar'}}async function deleteTask(id){if(!confirm('¿Eliminar esta tarea y sus análisis?'))return;try{await api(`/api/tasks/${id}`,{method:'DELETE'});loadTasks()}catch(e){alert(e.message)}}function openTaskResults(id){
+  currentResultTask=String(id);
+  navigate('results-success');
+  setTimeout(()=>{
+    const el=$('resultTaskSuccess');
+    if(el)el.value=String(id);
+    loadResultsFor('success');
+  },20);
+}
 function populateResultTasks(){const sel=$('resultTask');if(!sel)return;const cur=currentResultTask||sel.value;sel.innerHTML='<option value="">Selecciona una tarea…</option>'+tasks.map(t=>`<option value="${t.id}">${esc(t.task_name)}</option>`).join('');if(cur)sel.value=cur}
-async function loadResults(){const id=$('resultTask').value;if(!id){resultItems=[];renderResults();return}currentResultTask=id;try{const j=await api(`/api/tasks/${id}/results`);resultItems=j.items||[];renderResults()}catch(e){$('resultsList').innerHTML=`<div class="empty">${esc(e.message)}</div>`}}
+function activeResultsMode(){
+  return location.hash==='#results-negative'?'negative':'success';
+}
+
+function resultTaskElement(mode){
+  return $(mode==='negative'?'resultTaskNegative':'resultTaskSuccess');
+}
+
+function resultSourceElement(mode){
+  return $(mode==='negative'?'resultSourceNegative':'resultSourceSuccess');
+}
+
+function resultListElement(mode){
+  return $(mode==='negative'?'resultsNegativeList':'resultsSuccessList');
+}
+
+async function populateResultTasksFor(mode){
+  const select=resultTaskElement(mode);
+  if(!select)return;
+
+  if(!tasks.length){
+    try{
+      const j=await api('/api/tasks');
+      tasks=j.tasks||[];
+    }catch(e){
+      resultListElement(mode).innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+      return;
+    }
+  }
+
+  const wanted=currentResultTask||select.value;
+
+  select.innerHTML=
+    `<option value="">Todos los modelos</option>`+
+    tasks.map(t=>
+      `<option value="${t.id}">${esc(t.task_name)}</option>`
+    ).join('');
+
+  if(wanted && tasks.some(t=>String(t.id)===String(wanted))){
+    select.value=String(wanted);
+  }else{
+    select.value='';
+  }
+}
+
+async function initResultsPage(mode){
+  await populateResultTasksFor(mode);
+  await loadResultsFor(mode);
+}
+
+async function loadResultsFor(mode){
+  const select=resultTaskElement(mode);
+  const list=resultListElement(mode);
+  if(!select||!list)return;
+
+  const id=select.value;
+
+  try{
+    if(!id){
+      currentResultTask=null;
+
+      const responses=await Promise.all(
+        tasks.map(async t=>{
+          const j=await api(`/api/tasks/${t.id}/results`);
+          return (j.items||[]).map(i=>({
+            ...i,
+            result_task_id:t.id,
+            result_task_name:t.task_name
+          }));
+        })
+      );
+
+      resultItems=responses.flat();
+      renderResultsFor(mode);
+      return;
+    }
+
+    currentResultTask=String(id);
+
+    const task=tasks.find(t=>String(t.id)===String(id));
+    const j=await api(`/api/tasks/${id}/results`);
+
+    resultItems=(j.items||[]).map(i=>({
+      ...i,
+      result_task_id:Number(id),
+      result_task_name:task?.task_name||''
+    }));
+
+    renderResultsFor(mode);
+  }catch(e){
+    list.innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+async function loadResults(){
+  return loadResultsFor(activeResultsMode());
+}
 function sourceGroup(s){return s==='xianyu'?'xianyu':s==='bunjang'?'bunjang':'jp'}function decisionClass(d){return d==='STRONG BUY'?'green':d==='BUY'?'green':d==='WATCH'?'yellow':d==='REVIEW'?'purple':d==='REJECT'?'red':''}
 function parseReasonList(v){if(Array.isArray(v))return v.filter(Boolean).slice(0,4);try{const a=JSON.parse(v||'[]');return Array.isArray(a)?a.filter(Boolean).slice(0,4):[]}catch{return []}}
 function fallbackRejectReasons(i){const r=[];const m=String(i.model||'').toLowerCase();if(/le cagole|neo cagole/.test(m))r.push('El modelo identificado no es City / Le City.');else if(/mini|nano|\bxs\b/.test(m))r.push('El tamaño no cumple el objetivo Medium / Standard.');if(String(i.authenticity_risk||'').toUpperCase()==='HIGH')r.push('El riesgo de autenticidad es alto con la evidencia disponible.');const lo=Number(i.net_profit_low_eur),hi=Number(i.net_profit_high_eur);if(Number.isFinite(hi)&&hi<200)r.push('El beneficio neto estimado queda por debajo de 200 €.');else if(Number.isFinite(lo)&&lo<200)r.push('El margen conservador queda por debajo del objetivo.');if(String(i.liquidity||'').toUpperCase()==='LOW')r.push('La liquidez estimada de reventa en Europa es baja.');if(Number.isFinite(Number(i.opportunity_score))&&Number(i.opportunity_score)<60)r.push(`Opportunity Score bajo (${Math.round(Number(i.opportunity_score))}/100).`);if(!r.length)r.push('No cumple suficientemente los criterios principales de compra definidos para esta tarea.');return r.slice(0,4)}
+
+function marketAuditVerification(i){
+  try{
+    return JSON.parse(i.verification_json||'{}')||{};
+  }catch{
+    return {};
+  }
+}
+
+function marketAuditToggle(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  el.classList.toggle('hidden');
+}
+
+function marketAuditDateLabel(r){
+  if(r?.sold_date)return `Vendido: ${esc(r.sold_date)}`;
+  if(r?.listing_date)return `Publicado: ${esc(r.listing_date)}`;
+  if(r?.date_text)return `Fecha: ${esc(r.date_text)}`;
+  return 'Fecha no disponible';
+}
+
+function marketAuditPrice(r){
+  if(Number.isFinite(Number(r?.price_eur)) && Number(r.price_eur)>0){
+    return euro2(Number(r.price_eur));
+  }
+
+  if(Number.isFinite(Number(r?.price)) && Number(r.price)>0){
+    return `${num(r.price)} ${esc(r.currency||'')}`;
+  }
+
+  return 'Precio no disponible';
+}
+
+function marketAuditReferenceHtml(r){
+  const level=String(r?.match_level||'UNKNOWN').toUpperCase();
+  const status=String(r?.listing_status||'UNKNOWN').toUpperCase();
+
+  const accepted=['EXACT','NEAR'].includes(level);
+  const visualCandidate=level==='VISUAL_CANDIDATE';
+
+  const relation=String(
+    r?.condition_relation_to_target||'UNKNOWN'
+  ).toUpperCase();
+
+  const dateLabel=marketAuditDateLabel(r);
+
+  const url=String(r?.url||'').trim();
+
+  return `
+    <div style="
+      border:1px solid #303744;
+      border-radius:10px;
+      padding:12px;
+      margin-top:9px;
+      background:#0d1117;
+    ">
+      <div style="
+        display:flex;
+        justify-content:space-between;
+        gap:12px;
+        align-items:flex-start;
+      ">
+        <div>
+          <b>${esc(r?.source||'Fuente desconocida')}</b>
+
+          <div class="subtext" style="margin-top:3px">
+            ${esc(r?.title||'Sin título')}
+          </div>
+        </div>
+
+        <span class="pill ${
+          accepted
+            ? 'green'
+            : visualCandidate
+              ? 'purple'
+              : 'red'
+        }">
+          ${esc(level)}
+        </span>
+      </div>
+
+      <div style="
+        display:flex;
+        gap:6px;
+        flex-wrap:wrap;
+        margin-top:9px;
+      ">
+        <span class="pill">${esc(status)}</span>
+
+        <span class="pill">
+          ${marketAuditPrice(r)}
+        </span>
+
+        <span class="pill">
+          ${dateLabel}
+        </span>
+
+        ${
+          relation!=='UNKNOWN'
+            ? `<span class="pill purple">Condition ${esc(relation)}</span>`
+            : ''
+        }
+      </div>
+
+      ${
+        r?.match_reason_es
+          ? `<div class="subtext" style="margin-top:8px">
+              ${esc(r.match_reason_es)}
+             </div>`
+          : ''
+      }
+
+      ${
+        r?.date_evidence_es
+          ? `<div class="subtext" style="margin-top:5px">
+              Evidencia de fecha: ${esc(r.date_evidence_es)}
+             </div>`
+          : ''
+      }
+
+      ${
+        Array.isArray(r?.condition_evidence_es) &&
+        r.condition_evidence_es.length
+          ? `<div class="subtext" style="margin-top:5px">
+              Estado: ${r.condition_evidence_es.map(esc).join(' · ')}
+             </div>`
+          : ''
+      }
+
+      ${
+        url
+          ? `<div style="margin-top:8px">
+              <a
+                href="${esc(url)}"
+                target="_blank"
+                rel="noopener noreferrer"
+                style="color:#c4b5fd;text-decoration:none"
+              >
+                Abrir referencia ↗
+              </a>
+             </div>`
+          : ''
+      }
+    </div>
+  `;
+}
+
+function marketAuditHtml(i){
+  const v=marketAuditVerification(i);
+
+  if(!v?.exact || !v?.market){
+    return verificationHtml(i);
+  }
+
+  const exact=v.exact||{};
+  const market=v.market||{};
+
+  const modelCompN=Number(
+    market.model_relevant_comparable_count ??
+    market.relevant_comparable_count ??
+    0
+  );
+
+  const modelSourceN=Number(
+    market.model_independent_source_count ??
+    market.independent_source_count ??
+    0
+  );
+
+  const modelConfidence=String(
+    market.model_market_confidence ??
+    market.market_confidence ??
+    'LOW'
+  ).toUpperCase();
+
+  const modelVerified=
+    modelConfidence==='HIGH' &&
+    modelCompN>=3 &&
+    modelSourceN>=2;
+
+  const title=modelVerified
+    ? 'EXACT MODEL VERIFIED · MARKET VERIFIED'
+    : 'EXACT MODEL VERIFIED · MARKET INCONCLUSIVE';
+
+  const auditId=
+    `market-audit-${String(i.result_task_id||'task')}-${String(i.id)}`;
+
+  const references=Array.isArray(market.research_references)
+    ? market.research_references
+    : Array.isArray(market.comparables)
+      ? market.comparables
+      : [];
+
+  const queries=Array.isArray(market.web_search_queries)
+    ? market.web_search_queries
+    : [];
+
+  const grounding=Array.isArray(market.grounding_sources)
+    ? market.grounding_sources
+    : [];
+
+  const condition=market.target_condition||exact.condition||null;
+
+  const conditionCompN=Number(
+    market.condition_matched_comparable_count ?? 0
+  );
+
+  const conditionSourceN=Number(
+    market.condition_independent_source_count ?? 0
+  );
+
+  const conditionConfidence=String(
+    market.condition_market_confidence||''
+  ).toUpperCase();
+
+  const acceptedRefs=references.filter(r=>
+    ['EXACT','NEAR'].includes(
+      String(r?.match_level||'').toUpperCase()
+    )
+  );
+
+  const visualRefs=references.filter(r=>
+    String(
+      r?.match_level||''
+    ).toUpperCase()==='VISUAL_CANDIDATE'
+  );
+
+  const rejectedRefs=references.filter(r=>{
+    const level=String(
+      r?.match_level||''
+    ).toUpperCase();
+
+    return (
+      !['EXACT','NEAR'].includes(level) &&
+      level!=='VISUAL_CANDIDATE'
+    );
+  });
+
+  const checkedAt=market.checked_at
+    ? new Date(market.checked_at).toLocaleString('es-ES')
+    : 'No disponible';
+
+  return `
+    <div style="
+      margin-top:14px;
+      padding:16px;
+      border:1px solid #6948ae;
+      border-radius:14px;
+      background:rgba(101,76,180,.09);
+    ">
+
+      <div style="
+        display:flex;
+        justify-content:space-between;
+        gap:14px;
+        align-items:center;
+        margin-bottom:10px;
+      ">
+        <b style="color:#c4b5fd;font-size:14px;letter-spacing:.04em">
+          ${title}
+        </b>
+
+        <button
+          class="btn small"
+          onclick="marketAuditToggle('${auditId}')"
+          style="white-space:nowrap"
+        >
+          Ver análisis de mercado
+        </button>
+      </div>
+
+      <div>
+        <b>
+          ${esc(exact.exact_variant_label||exact.family||i.model||'Modelo')}
+        </b>
+        · visual confidence
+        ${Math.round(Number(exact.confidence||0)*100)}%
+      </div>
+
+      <div style="margin-top:4px">
+        ${[
+          exact.size,
+          exact.material,
+          exact.main_color,
+          exact.pattern
+        ].filter(x=>x&&x!=='unknown').map(esc).join(' · ')}
+      </div>
+
+      <div style="margin-top:5px">
+        Market:
+        <b>${esc(modelConfidence)}</b>
+        · ${modelCompN} relevant comps
+        · ${modelSourceN} sources
+      </div>
+
+      ${
+        condition
+          ? `<div style="margin-top:5px">
+              Condition:
+              <b>${esc(condition.grade||'UNKNOWN')}</b>
+              ${
+                condition.score!==null &&
+                condition.score!==undefined
+                  ? ` · ${num(condition.score)}/100`
+                  : ''
+              }
+              · confidence
+              ${Math.round(Number(condition.confidence||0)*100)}%
+             </div>`
+          : ''
+      }
+
+      ${
+        market.condition_market_confidence
+          ? `<div style="margin-top:5px">
+              Condition market:
+              <b>${esc(conditionConfidence||'LOW')}</b>
+              · ${conditionCompN} condition-matched comps
+              · ${conditionSourceN} sources
+             </div>`
+          : ''
+      }
+
+      <div id="${auditId}" class="hidden" style="
+        margin-top:16px;
+        padding-top:15px;
+        border-top:1px solid #39304f;
+      ">
+
+        <div style="
+          display:grid;
+          grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+          gap:8px;
+          margin-bottom:16px;
+        ">
+          <div class="inspect-stat">
+            <span>Rondas de búsqueda</span>
+            <b>${num(market.search_passes||1)}</b>
+          </div>
+
+          <div class="inspect-stat">
+            <span>Resultados encontrados</span>
+            <b>${num(market.research_candidate_count ?? references.length)}</b>
+          </div>
+
+          <div class="inspect-stat">
+            <span>Aceptados EXACT / NEAR</span>
+            <b>${acceptedRefs.length}</b>
+          </div>
+
+          <div class="inspect-stat">
+            <span>No usados</span>
+            <b>${rejectedRefs.length}</b>
+          </div>
+          <div class="inspect-stat">
+            <span>Coincidencias visuales</span>
+            <b>${visualRefs.length}</b>
+          </div>
+        </div>
+
+        <div class="subtext">
+          Chequeo realizado: ${esc(checkedAt)}
+        </div>
+
+        <div class="subtext" style="margin-top:6px">
+          Google Vision:
+          ${
+            market?.vision_web_detection?.ok
+              ? `OK · ${
+                  Number(
+                    market.visual_candidate_count||0
+                  )
+                } coincidencias`
+              : `ERROR / sin datos${
+                  market?.vision_web_detection?.error
+                    ? ' · '+esc(
+                        market.vision_web_detection.error
+                      )
+                    : ''
+                }`
+          }
+        </div>
+
+        <h4 style="margin:18px 0 8px">
+          Queries ejecutadas
+        </h4>
+
+        ${
+          queries.length
+            ? `<ol style="margin:0;padding-left:20px">
+                ${queries.map(q=>`
+                  <li style="margin:5px 0">${esc(q)}</li>
+                `).join('')}
+               </ol>`
+            : `<div class="subtext">
+                Google no devolvió el detalle de las queries para este análisis.
+               </div>`
+        }
+
+        <h4 style="margin:20px 0 8px">
+          Referencias encontradas
+        </h4>
+
+        ${
+          visualRefs.length
+            ? `<div class="subtext" style="margin-bottom:10px">
+                Google Vision ha encontrado
+                <b>${visualRefs.length}</b>
+                páginas mediante coincidencia visual.
+                Se muestran aunque todavía no hayan sido
+                validadas como EXACT o NEAR.
+               </div>`
+            : ''
+        }
+
+        ${
+          references.length
+            ? references.map(marketAuditReferenceHtml).join('')
+            : `<div class="empty">
+                Gemini no guardó ninguna referencia estructurada en este análisis.
+               </div>`
+        }
+
+        ${
+          rejectedRefs.length
+            ? `
+              <div class="subtext" style="margin-top:14px">
+                Las referencias ORIENTATIVE / no equivalentes se muestran
+                para poder auditar por qué no entraron en la valoración.
+              </div>
+            `
+            : ''
+        }
+
+        <h4 style="margin:20px 0 8px">
+          Fuentes Google consultadas
+        </h4>
+
+        ${
+          grounding.length
+            ? grounding.slice(0,30).map(g=>{
+                const url=String(g?.uri||g?.url||'').trim();
+                const title=String(g?.title||url||'Fuente Google');
+
+                return `
+                  <div style="margin:6px 0">
+                    ${
+                      url
+                        ? `<a
+                            href="${esc(url)}"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style="color:#c4b5fd;text-decoration:none"
+                          >
+                            ${esc(title)} ↗
+                          </a>`
+                        : esc(title)
+                    }
+                  </div>
+                `;
+              }).join('')
+            : `<div class="subtext">
+                No hay grounding sources guardadas para este análisis.
+               </div>`
+        }
+
+        ${
+          Array.isArray(market.research_notes_es) &&
+          market.research_notes_es.length
+            ? `
+              <h4 style="margin:20px 0 8px">Notas de investigación</h4>
+              <ul style="margin:0;padding-left:20px">
+                ${market.research_notes_es.map(x=>`
+                  <li style="margin:5px 0">${esc(x)}</li>
+                `).join('')}
+              </ul>
+            `
+            : ''
+        }
+
+        <div class="subtext" style="margin-top:18px">
+          Este panel muestra el rastro auditable de búsqueda:
+          queries, fuentes, referencias y criterios de inclusión.
+          No muestra razonamiento interno oculto del modelo.
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function rejectReasonsHtml(i){if(i.decision!=='REJECT')return '';const reasons=parseReasonList(i.decision_reasons_es_json);const rr=reasons.length?reasons:fallbackRejectReasons(i);return `<div class="reject-reasons"><div class="reject-reasons-title">Por qué se ha rechazado</div><ul>${rr.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`}
 function parseVerification(i){try{return JSON.parse(i.verification_json||'{}')}catch{return{}}}
 function verificationBadge(i){const v=parseVerification(i);if(v.status==='verified')return'<span class="pill purple">Market check</span>';if(v.status==='error'||v.status==='legacy_pending')return'<span class="pill yellow">Verification pending</span>';return''}
@@ -301,13 +960,520 @@ function hasFinalOpportunityScore(i){
   if(v?.status==='error'||v?.status==='legacy_pending')return false;
   return i.opportunity_score!==null&&i.opportunity_score!==undefined&&i.opportunity_score!=='';
 }
-function renderResults(){const sf=$('resultSource').value,df=$('resultDecision').value;let arr=resultItems.filter(i=>(!sf||sourceGroup(i.source)===sf)&&(!df||(df==='UNANALYZED'?!i.decision:i.decision===df)));$('resultsList').innerHTML=arr.map(i=>`<div class="listing"><img src="${esc(i.image_url||'')}" onerror="this.style.visibility='hidden'"><div><div><span class="pill">${esc(i.source)}</span>${i.purchase_via?`<span class="pill">Compra: ${esc(i.purchase_via)}</span>`:''}${i.decision?`<span class="pill ${decisionClass(i.decision)}">${esc(i.decision)}</span>`:'<span class="pill">sin analizar</span>'}${marketplaceVerificationBadge(i)}${verificationBadge(i)}</div><h3>${esc(i.title||'(sin título)')}</h3><div class="subtext">${esc(i.seller_name||'')}${i.brand||i.model?` · ${esc([i.brand,i.model].filter(Boolean).join(' '))}`:''}</div><div style="margin-top:7px"><a href="${esc(i.url||'#')}" target="_blank" style="color:#c4b5fd;text-decoration:none">Abrir anuncio original ↗</a></div>${marketplaceVerificationHtml(i)}${verificationHtml(i)}${importCostHtml(i)}${rejectReasonsHtml(i)}</div><div class="right"><div class="subtext">Precio del anuncio</div><div class="price">${num(i.original_price)} ${esc(i.currency||'')}</div><div class="price-eur">${euro2(i.price_eur)}</div>${i.import_costs?`<div class="subtext" style="margin-top:8px">Final importado</div><div class="price" style="color:#fff">${euro2(i.import_costs.importedTotalEur)}</div>`:''}${hasFinalOpportunityScore(i)?`<div class="economics">Score <b>${num(i.opportunity_score)}</b>/100<br>Reventa ${euro(i.resale_low_eur)}–${euro(i.resale_high_eur)}<br>Profit ${euro(i.net_profit_low_eur)}–${euro(i.net_profit_high_eur)}<br>Auth ${esc(i.authenticity_risk||'—')} · Liquidez ${esc(i.liquidity||'—')}</div>`:'<div class="subtext" style="margin-top:6px">Sin score final: verificación pendiente/incompleta</div>'}<button class="btn small" style="margin-top:8px" onclick="analyzeTaskItem(${i.id},this)">${i.decision?'Reanalizar + verificar':'Analizar + verificar'}</button></div></div>`).join('')||'<div class="empty">No hay resultados que coincidan con estos filtros.</div>'}
-async function analyzeTaskItem(listingId,btn){const taskId=$('resultTask').value;if(!taskId)return;btn.disabled=true;btn.innerHTML='<span class="loading"></span>';try{await api(`/api/tasks/${taskId}/listings/${listingId}/analyze`,{method:'POST'});await loadResults()}catch(e){alert('Gemini: '+e.message)}finally{btn.disabled=false;btn.textContent='Analizar + verificar'}}
-async function loadLogs(){const j=await api('/api/task-runs');$('logsBody').innerHTML=(j.runs||[]).map(r=>{let st={};try{st=JSON.parse(r.source_status_json||'{}')}catch{}const sourceSummary=Object.entries(st).map(([k,v])=>{if(k==='email')return`email: ${v?.sent?'SENT':'—'}`;const state=v?.state==='running'?'RUNNING':v?.ok===true?'OK':v?.ok===false?'ERROR':'…';return`${k}: ${state}${v?.kept!=null?' ('+v.kept+')':''}`}).join(' · ');return`<tr class="logrow"><td><b>${esc(r.task_name)}</b><div class="subtext">Run #${r.id}${r.session_id?' · '+esc(r.session_id.slice(0,8)):''}</div></td><td><span class="pill ${r.status==='finished'?'green':r.status==='error'?'red':'yellow'}">${esc(r.status)}</span></td><td>${dt(r.started_at)}</td><td>${dt(r.finished_at)}</td><td>${esc(sourceSummary||'—')}</td><td>${r.error?`<details><summary>Error</summary><div class="raw">${esc(r.error)}</div></details>`:'—'}</td><td><button class="btn small" onclick="inspectRun(${r.id})">⌘ Ver ejecución</button></td></tr>`}).join('')||'<tr><td colspan="7"><div class="empty">No hay logs todavía.</div></td></tr>'}
+function resultListingHtml(i){
+  return `<div class="listing">
+    <img src="${esc(i.image_url||'')}" onerror="this.style.visibility='hidden'">
+
+    <div>
+      <div>
+        <span class="pill">${esc(i.source)}</span>
+        ${i.result_task_name?`<span class="pill purple">${esc(i.result_task_name)}</span>`:''}
+        ${i.purchase_via?`<span class="pill">Compra: ${esc(i.purchase_via)}</span>`:''}
+        ${i.decision?`<span class="pill ${decisionClass(i.decision)}">${esc(i.decision)}</span>`:'<span class="pill">sin analizar</span>'}
+        ${marketplaceVerificationBadge(i)}
+        ${verificationBadge(i)}
+      </div>
+
+      <h3>${esc(i.title||'(sin título)')}</h3>
+
+      <div class="subtext">
+        ${esc(i.seller_name||'')}
+        ${i.brand||i.model?` · ${esc([i.brand,i.model].filter(Boolean).join(' '))}`:''}
+      </div>
+
+      <div style="margin-top:7px">
+        <a href="${esc(i.url||'#')}" target="_blank" style="color:#c4b5fd;text-decoration:none">
+          Abrir anuncio original ↗
+        </a>
+      </div>
+
+      ${marketplaceVerificationHtml(i)}
+      ${marketAuditHtml(i)}
+      ${importCostHtml(i)}
+      ${rejectReasonsHtml(i)}
+    </div>
+
+    <div class="right">
+      <div class="subtext">Precio del anuncio</div>
+      <div class="price">${num(i.original_price)} ${esc(i.currency||'')}</div>
+      <div class="price-eur">${euro2(i.price_eur)}</div>
+
+      ${i.import_costs?`
+        <div class="subtext" style="margin-top:8px">Final importado</div>
+        <div class="price" style="color:#fff">${euro2(i.import_costs.importedTotalEur)}</div>
+      `:''}
+
+      ${hasFinalOpportunityScore(i)?`
+        <div class="economics">
+          Score <b>${num(i.opportunity_score)}</b>/100<br>
+          Reventa ${euro(i.resale_low_eur)}–${euro(i.resale_high_eur)}<br>
+          Profit ${euro(i.net_profit_low_eur)}–${euro(i.net_profit_high_eur)}<br>
+          Auth ${esc(i.authenticity_risk||'—')} · Liquidez ${esc(i.liquidity||'—')}
+        </div>
+      `:`
+        <div class="subtext" style="margin-top:6px">
+          Sin score final: verificación pendiente/incompleta
+        </div>
+      `}
+
+      <button
+        class="btn small"
+        style="margin-top:8px"
+        onclick="analyzeTaskItem(${i.id},this,${i.result_task_id||'null'})">
+        ${i.decision?'Reanalizar + verificar':'Analizar + verificar'}
+      </button>
+    </div>
+  </div>`;
+}
+
+function rejectVisibleForFiveDays(i){
+  const raw=i.task_last_seen||'';
+  const t=Date.parse(raw);
+
+  // Si por cualquier motivo no tenemos una fecha válida,
+  // no ocultamos el anuncio accidentalmente.
+  if(!Number.isFinite(t)) return true;
+
+  const fiveDays=5*24*60*60*1000;
+  return (Date.now()-t) < fiveDays;
+}
+
+function renderResultsFor(mode){
+  const sourceEl=resultSourceElement(mode);
+  const list=resultListElement(mode);
+  if(!sourceEl||!list)return;
+
+  const sf=sourceEl.value;
+
+  let arr=resultItems.filter(i=>
+    !sf || sourceGroup(i.source)===sf
+  );
+
+  if(mode==='success'){
+    const rank={
+      'STRONG BUY':0,
+      'BUY':1,
+      'WATCH':2
+    };
+
+    arr=arr
+      .filter(i=>
+        ['STRONG BUY','BUY','WATCH'].includes(
+          String(i.decision||'').toUpperCase()
+        )
+      )
+      .sort((a,b)=>{
+        const da=String(a.decision||'').toUpperCase();
+        const db=String(b.decision||'').toUpperCase();
+
+        return (
+          (rank[da]??9)-(rank[db]??9) ||
+          (Number(b.opportunity_score)||0)-(Number(a.opportunity_score)||0) ||
+          (Date.parse(b.task_last_seen||'')||0)-(Date.parse(a.task_last_seen||'')||0)
+        );
+      });
+
+    list.innerHTML=`
+      <div class="section-head" style="margin:14px 0">
+        <div></div>
+        <span class="pill green">${arr.length} oportunidades</span>
+      </div>
+      ${
+        arr.length
+          ? arr.map(resultListingHtml).join('')
+          : '<div class="empty">No hay STRONG BUY, BUY ni WATCH para esta tarea.</div>'
+      }
+    `;
+
+    return;
+  }
+
+  arr=arr
+    .filter(i=>
+      String(i.decision||'').toUpperCase()==='REJECT' &&
+      rejectVisibleForFiveDays(i)
+    )
+    .sort((a,b)=>
+      (Date.parse(b.task_last_seen||'')||0)-
+      (Date.parse(a.task_last_seen||'')||0)
+    );
+
+  list.innerHTML=`
+    <div class="section-head" style="margin:14px 0">
+      <div></div>
+      <span class="pill red">${arr.length} descartados</span>
+    </div>
+    ${
+      arr.length
+        ? arr.map(resultListingHtml).join('')
+        : '<div class="empty">No hay resultados negativos recientes.</div>'
+    }
+  `;
+}
+
+function renderResults(){
+  return renderResultsFor(activeResultsMode());
+}
+async function analyzeTaskItem(
+  listingId,
+  btn,
+  itemTaskId=null
+){
+  let mode='success';
+
+  try{
+    if(typeof activeResultsMode==='function'){
+      mode=activeResultsMode();
+    }
+  }catch{}
+
+  let taskId=itemTaskId;
+
+  if(!taskId){
+    try{
+      if(typeof resultTaskElement==='function'){
+        taskId=resultTaskElement(mode)?.value;
+      }
+    }catch{}
+  }
+
+  // Compatibilidad con la antigua página unificada.
+  if(!taskId && $('resultTask')){
+    taskId=$('resultTask').value;
+  }
+
+  if(!taskId){
+    alert('Selecciona primero un modelo/tarea.');
+    return;
+  }
+
+  const originalText=btn.textContent;
+  const holder=document.createElement('div');
+
+  holder.style.marginTop='10px';
+
+  holder.innerHTML=progressBarHtml(
+    1,
+    'Preparando análisis',
+    '',
+    null
+  );
+
+  btn.insertAdjacentElement('afterend',holder);
+
+  btn.disabled=true;
+  btn.innerHTML='<span class="loading"></span> Analizando…';
+
+  try{
+    const started=await api(
+      `/api/tasks/${taskId}/listings/${listingId}/analyze-job`,
+      {method:'POST'}
+    );
+
+    const jobId=started.jobId;
+
+    if(!jobId){
+      throw new Error(
+        'El servidor no devolvió el ID del análisis.'
+      );
+    }
+
+    while(true){
+      await new Promise(
+        resolve=>setTimeout(resolve,1000)
+      );
+
+      const response=await api(
+        `/api/analysis-jobs/${encodeURIComponent(jobId)}`
+      );
+
+      const job=response.job||{};
+
+      holder.innerHTML=progressBarHtml(
+        job.progress_pct||0,
+        job.progress_stage||'Analizando',
+        job.progress_detail||'',
+        job.progress_eta_seconds
+      );
+
+      if(job.status==='finished'){
+        holder.innerHTML=progressBarHtml(
+          100,
+          'Análisis finalizado',
+          'Actualizando resultados',
+          0
+        );
+
+        if(typeof loadResultsFor==='function'){
+          await loadResultsFor(mode);
+        }else if(typeof loadResults==='function'){
+          await loadResults();
+        }
+
+        break;
+      }
+
+      if(job.status==='error'){
+        throw new Error(
+          job.error||'Error durante el análisis'
+        );
+      }
+    }
+  }catch(e){
+    holder.innerHTML=`
+      <div class="subtext" style="
+        color:#fda4af;
+        margin-top:6px;
+      ">
+        Error: ${esc(e.message)}
+      </div>
+    `;
+
+    alert('Gemini: '+e.message);
+  }finally{
+    btn.disabled=false;
+    btn.textContent=originalText;
+  }
+}
+function etaLabel(seconds){
+  const s=Number(seconds);
+
+  if(!Number.isFinite(s) || s<0){
+    return 'Tiempo restante: calculando…';
+  }
+
+  if(s<60){
+    return `Tiempo restante: ~${Math.max(1,Math.round(s))}s`;
+  }
+
+  const m=Math.floor(s/60);
+  const rem=Math.round(s%60);
+
+  return `Tiempo restante: ~${m}m ${rem}s`;
+}
+
+function progressBarHtml(
+  pct,
+  stage='Procesando',
+  detail='',
+  eta=null,
+  current=null,
+  total=null
+){
+  const p=Math.max(
+    0,
+    Math.min(100,Math.round(Number(pct)||0))
+  );
+
+  const count=
+    Number.isFinite(Number(current)) &&
+    Number.isFinite(Number(total)) &&
+    Number(total)>0
+      ? `${Number(current)}/${Number(total)}`
+      : '';
+
+  return `
+    <div style="margin-top:8px;min-width:180px">
+      <div style="
+        height:7px;
+        width:100%;
+        border-radius:999px;
+        background:#252b35;
+        overflow:hidden;
+      ">
+        <div style="
+          height:100%;
+          width:${p}%;
+          border-radius:999px;
+          background:#8b5cf6;
+          transition:width .35s ease;
+        "></div>
+      </div>
+
+      <div style="
+        display:flex;
+        justify-content:space-between;
+        gap:8px;
+        margin-top:5px;
+        font-size:12px;
+      ">
+        <b>${p}%</b>
+        <span>${esc(stage||'Procesando')}</span>
+      </div>
+
+      ${
+        detail
+          ? `<div class="subtext" style="margin-top:2px">
+              ${esc(detail)}
+             </div>`
+          : ''
+      }
+
+      <div class="subtext" style="margin-top:2px">
+        ${count?`${esc(count)} · `:''}${esc(etaLabel(eta))}
+      </div>
+    </div>
+  `;
+}
+
+let logsRefreshTimer=null;
+
+async function loadLogs(){
+  if(logsRefreshTimer){
+    clearTimeout(logsRefreshTimer);
+    logsRefreshTimer=null;
+  }
+
+  const j=await api('/api/task-runs');
+  const runs=j.runs||[];
+
+  $('logsBody').innerHTML=runs.map(r=>{
+    let st={};
+
+    try{
+      st=JSON.parse(r.source_status_json||'{}');
+    }catch{}
+
+    const sourceSummary=Object.entries(st)
+      .map(([k,v])=>{
+        if(k==='email'){
+          return `email: ${v?.sent?'SENT':'—'}`;
+        }
+
+        const state=
+          v?.state==='running'
+            ? 'RUNNING'
+            : v?.ok===true
+              ? 'OK'
+              : v?.ok===false
+                ? 'ERROR'
+                : '…';
+
+        return `${k}: ${state}${
+          v?.kept!=null?' ('+v.kept+')':''
+        }`;
+      })
+      .join(' · ');
+
+    const active=['running','queued'].includes(r.status);
+
+    const progress=active
+      ? progressBarHtml(
+          r.progress_pct||0,
+          r.progress_stage||(
+            r.status==='queued'
+              ? 'En cola'
+              : 'Ejecutando'
+          ),
+          r.progress_detail||'',
+          r.progress_eta_seconds,
+          r.progress_current,
+          r.progress_total
+        )
+      : '';
+
+    return `
+      <tr class="logrow">
+        <td>
+          <b>${esc(r.task_name)}</b>
+
+          <div class="subtext">
+            Run #${r.id}${
+              r.session_id
+                ? ' · '+esc(r.session_id.slice(0,8))
+                : ''
+            }
+          </div>
+
+          ${progress}
+        </td>
+
+        <td>
+          <span class="pill ${
+            r.status==='finished'
+              ? 'green'
+              : (r.status==='error'||r.status==='aborted')
+                ? 'red'
+                : 'yellow'
+          }">
+            ${esc(r.status)}
+          </span>
+        </td>
+
+        <td>${dt(r.started_at)}</td>
+        <td>${dt(r.finished_at)}</td>
+
+        <td>${esc(sourceSummary||'—')}</td>
+
+        <td>
+          ${
+            r.error
+              ? `<details>
+                  <summary>Error</summary>
+                  <div class="raw">${esc(r.error)}</div>
+                 </details>`
+              : '—'
+          }
+        </td>
+
+        <td>
+          <div class="split">
+            ${
+              active
+                ? `<button
+                    class="btn small danger"
+                    onclick="abortRun(${r.id},this)"
+                  >
+                    ■ Abortar
+                  </button>`
+                : ''
+            }
+
+            <button
+              class="btn small"
+              onclick="inspectRun(${r.id})"
+            >
+              ⌘ Ver ejecución
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('') ||
+  '<tr><td colspan="7"><div class="empty">No hay logs todavía.</div></td></tr>';
+
+  const hasActive=runs.some(r=>
+    ['running','queued'].includes(r.status)
+  );
+
+  if(hasActive && location.hash==='#logs'){
+    logsRefreshTimer=setTimeout(
+      loadLogs,
+      1500
+    );
+  }
+}
 
 let inspectorRef=null,inspectorJson=null,inspectorTimer=null;
 function pretty(v){return JSON.stringify(v,null,2)}
 function codeHtml(v){return `<pre class="codeblock">${esc(typeof v==='string'?v:pretty(v))}</pre>`}
+async function abortRun(id,btn){
+  if(!confirm('¿Seguro que quieres abortar esta ejecución?'))return;
+
+  btn.disabled=true;
+  btn.textContent='Abortando…';
+
+  try{
+    await api(`/api/task-runs/${id}/abort`,{method:'POST'});
+    await loadLogs();
+    await loadTasks();
+  }catch(e){
+    alert(e.message);
+    btn.disabled=false;
+    btn.textContent='■ Abortar';
+  }
+}
+
 function statusDot(v){return v?.state==='running'?'<span class="live-dot"></span>':v?.ok===false?'<span class="live-dot err"></span>':'<span class="live-dot done"></span>'}
 function renderInspector(m){
   inspectorJson=m;
