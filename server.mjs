@@ -2351,10 +2351,23 @@ async function searchJapanRadarLive(opts){
 }
 
 // POSITIVE MARKET VERIFICATION V1.6
-const CENTRAL_AI_INSTRUCTION = `You are the first-pass central AI screening engine for Luxury Hunter. Analyze this second-hand luxury handbag listing conservatively for resale in Europe. First verify that the listing appears to match the target product family; search-query similarity is not proof. The user's task requirements below are mandatory evaluation context. Never certify authenticity from photos alone. Treat implausibly cheap current luxury as counterfeit risk.
+const CENTRAL_AI_INSTRUCTION = `You are the first-pass central AI screening engine for Luxury Hunter. Analyze this second-hand luxury handbag listing conservatively for resale in Europe. First verify that the listing appears to match the target product family; search-query similarity is not proof. The user's task requirements below are mandatory evaluation context. Never certify authenticity from photos alone.
+
+AUTHENTICITY RISK STABILITY RULES:
+- An implausibly low price is an authenticity RISK SIGNAL, but price alone is NOT sufficient evidence for HIGH authenticity risk or REJECT.
+- Missing seller sales, reviews or public history is a risk signal, but is NOT sufficient by itself, or combined only with a low price, to justify HIGH authenticity risk.
+- The fact that a model is frequently counterfeited is contextual risk only and is NOT sufficient evidence for HIGH authenticity risk.
+- When the product appears to match the target and the authenticity concerns are circumstantial or uncertain, use at most MEDIUM authenticity risk and prefer WATCH so that the exact-model and live-market verification stages can investigate it.
+- Use HIGH authenticity risk at the preliminary stage only when there is concrete listing-specific evidence of a serious authenticity problem, such as explicit replica/fake/counterfeit language, a failed marketplace verification, a seller explicitly refusing verification while disclaiming authenticity, clear visual/product inconsistencies strongly incompatible with the claimed item, or similarly strong grounded evidence.
+- A clearly wrong product, explicit counterfeit/replica listing, failed marketplace verification, or other objective disqualifier may be REJECT immediately.
+- Marketplace verification AVAILABLE is a positive risk-reduction signal only, never proof of authenticity. PASSED is stronger positive evidence. FAILED is disqualifying.
+- Do not invent authenticity defects that are not visible or grounded in the listing evidence.
+
 Luxury Hunter calculates import/shipping/tax costs deterministically and supplies the IMPORTED TOTAL; use that supplied total as landed_cost_eur and DO NOT invent a different import-cost figure. This is ONLY the preliminary screen. Any preliminary WATCH, BUY or STRONG BUY will be blocked from final publication until a second visual exact-model check and a live market-comparable check are completed.
+
 Return ONLY valid JSON with keys: brand, model, authenticity_risk (LOW|MEDIUM|HIGH), liquidity (LOW|MEDIUM|HIGH), decision (STRONG BUY|BUY|WATCH|REJECT), opportunity_score (0-100), resale_low_eur, resale_high_eur, landed_cost_eur, net_profit_low_eur, net_profit_high_eur, decision_reasons_es, notes.
-decision_reasons_es MUST be an array of 1 to 4 short bullet-style reasons written in Spanish. For REJECT, make the reasons specific and practical. If evidence is insufficient, prefer WATCH or REJECT rather than inventing facts.`;
+
+decision_reasons_es MUST be an array of 1 to 4 short bullet-style reasons written in Spanish. For REJECT, make the reasons specific, practical and grounded in concrete evidence. If the item plausibly matches the target but evidence is insufficient mainly because authenticity, exact variant or market value still requires verification, prefer WATCH rather than REJECT. Never invent facts.`
 
 const POSITIVE_DECISIONS = new Set(['WATCH','BUY','STRONG BUY']);
 
@@ -2429,6 +2442,101 @@ function percentile(values,p){
   if(lo===hi)return a[lo];
   return a[lo]+(a[hi]-a[lo])*(i-lo);
 }
+function weightedMean(entries){
+  const rows=(entries||[])
+    .map(x=>({
+      value:Number(x?.value),
+      weight:Number(x?.weight)
+    }))
+    .filter(x=>
+      Number.isFinite(x.value) &&
+      Number.isFinite(x.weight) &&
+      x.weight>0
+    );
+
+  if(!rows.length)return null;
+
+  const totalWeight=rows.reduce(
+    (sum,x)=>sum+x.weight,
+    0
+  );
+
+  if(!(totalWeight>0))return null;
+
+  return rows.reduce(
+    (sum,x)=>sum+(x.value*x.weight),
+    0
+  )/totalWeight;
+}
+
+function weightedPercentile(entries,p){
+  const rows=(entries||[])
+    .map(x=>({
+      value:Number(x?.value),
+      weight:Number(x?.weight)
+    }))
+    .filter(x=>
+      Number.isFinite(x.value) &&
+      Number.isFinite(x.weight) &&
+      x.weight>0
+    )
+    .sort((a,b)=>a.value-b.value);
+
+  if(!rows.length)return null;
+
+  const q=Math.max(
+    0,
+    Math.min(1,Number(p)||0)
+  );
+
+  const totalWeight=rows.reduce(
+    (sum,x)=>sum+x.weight,
+    0
+  );
+
+  const target=totalWeight*q;
+  let cumulative=0;
+
+  for(const row of rows){
+    cumulative+=row.weight;
+    if(cumulative>=target){
+      return row.value;
+    }
+  }
+
+  return rows[rows.length-1].value;
+}
+
+function luxuryComparableValuationWeight(c){
+  const url=String(c?.url||'').trim();
+  const tier=luxuryMarketTier(url);
+  const europe=europeanLuxuryMarketUrl(url);
+  const status=String(
+    c?.listing_status||'UNKNOWN'
+  ).toUpperCase();
+
+  let weight=1;
+
+  // eBay sigue siendo evidencia complementaria.
+  if(tier==='TIER_2'){
+    weight*=0.70;
+  }
+
+  // Mayor relevancia para el mercado europeo.
+  if(europe){
+    weight*=1.35;
+  }
+
+  // Una venta confirmada tiene más valor que un asking price.
+  if(status==='SOLD'){
+    weight*=1.50;
+  }else if(status==='UNKNOWN'){
+    weight*=0.75;
+  }
+
+  return weight;
+}
+
 function normalizeCurrency(v){
   const s=String(v||'EUR').trim().toUpperCase();
   if(s==='EURO'||s==='EUROS')return'EUR';
@@ -2444,9 +2552,36 @@ function comparableToEur(c){
   return Number.isFinite(Number(converted))?roundMoney(converted):null;
 }
 function sourceKey(c){
-  const source=String(c?.source||'').trim();
-  if(source)return source.toLowerCase();
-  try{return new URL(c?.url||'').hostname.replace(/^www\./,'').toLowerCase()}catch{return''}
+  const url=String(
+    c?.url||
+    c?.link||
+    c?.uri||
+    ''
+  ).trim();
+
+  const approved=
+    approvedLuxuryMarketSourceName(url);
+
+  if(approved){
+    return approved.toLowerCase();
+  }
+
+  const source=String(
+    c?.source||''
+  ).trim();
+
+  if(source){
+    return source.toLowerCase();
+  }
+
+  try{
+    return new URL(url)
+      .hostname
+      .replace(/^www\./,'')
+      .toLowerCase();
+  }catch{
+    return '';
+  }
 }
 function collectListingImageUrls(item,max=4){
   const out=[];
@@ -2542,21 +2677,28 @@ ${String(rawText||'').slice(0,60000)}`;
 
 async function geminiJsonRequest({key,model,parts,googleSearch=false}){
   const u=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
-  const payload={contents:[{role:'user',parts}],generationConfig:{responseMimeType:'application/json'}};
-  if(googleSearch)payload.tools=[{google_search:{}}];
+  const payload={contents:[{role:'user',parts}]};
+
+  if(googleSearch){
+    payload.tools=[{google_search:{}}];
+  }else{
+    payload.generationConfig={responseMimeType:'application/json'};
+  }
 
   let r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
   let body=await r.json();
 
-  if(!r.ok&&googleSearch){
+  let rawText=body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
+
+  if(googleSearch&&(!r.ok||!rawText.trim())){
     const retry={contents:[{role:'user',parts}],tools:[{google_search:{}}]};
     r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(retry)});
     body=await r.json();
+    rawText=body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
   }
 
   if(!r.ok)throw new Error(body?.error?.message||`Gemini HTTP ${r.status}`);
-
-  const rawText=body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
+  if(googleSearch&&!rawText.trim())throw new Error('Gemini Google Search devolvió una respuesta vacía');
   const gm=body?.candidates?.[0]?.groundingMetadata||{};
   const groundingSources=(gm.groundingChunks||[])
     .map(x=>x?.web)
@@ -2734,8 +2876,59 @@ const TRUSTED_LUXURY_MARKET_DOMAINS=Object.freeze([
   'annsfabulousfinds.com',
   'hardlyeverwornit.com',
   'sothebys.com',
-  'christies.com'
+  'christies.com',
+  'saclab.com',
+  'sellierknightsbridge.com',
+  'luxurypromise.com',
+  'handbagclinic.co.uk',
+  'resee.com'
 ]);
+
+const SECONDARY_LUXURY_MARKET_DOMAINS=Object.freeze([
+  'ebay.com',
+  'ebay.co.uk',
+  'ebay.de',
+  'ebay.fr',
+  'ebay.it',
+  'ebay.es'
+]);
+
+const EUROPE_PRIORITY_LUXURY_MARKET_DOMAINS=Object.freeze([
+  'vestiairecollective.com',
+  'collectorsquare.com',
+  'hardlyeverwornit.com',
+  'saclab.com',
+  'sellierknightsbridge.com',
+  'luxurypromise.com',
+  'handbagclinic.co.uk',
+  'resee.com',
+  'ebay.co.uk',
+  'ebay.de',
+  'ebay.fr',
+  'ebay.it',
+  'ebay.es'
+]);
+
+function europeanLuxuryMarketUrl(value){
+  const host=luxuryMarketHostname(value);
+  if(!host)return false;
+  return EUROPE_PRIORITY_LUXURY_MARKET_DOMAINS.some(
+    domain=>
+      host===domain ||
+      host.endsWith(`.${domain}`)
+  );
+}
+
+function luxuryMarketPriorityRank(value){
+  const tier=luxuryMarketTier(value);
+  const europe=europeanLuxuryMarketUrl(value);
+
+  if(tier==='TIER_1' && europe)return 0;
+  if(tier==='TIER_1')return 1;
+  if(tier==='TIER_2' && europe)return 2;
+  if(tier==='TIER_2')return 3;
+  return 9;
+}
 
 function luxuryMarketHostname(value){
   try{
@@ -2771,6 +2964,39 @@ function trustedLuxuryMarketEntry(entry){
   return trustedLuxuryMarketUrl(url);
 }
 
+function secondaryLuxuryMarketUrl(value){
+  const host=luxuryMarketHostname(value);
+  if(!host)return false;
+  return SECONDARY_LUXURY_MARKET_DOMAINS.some(
+    domain=>
+      host===domain ||
+      host.endsWith(`.${domain}`)
+  );
+}
+
+function approvedLuxuryMarketUrl(value){
+  return (
+    trustedLuxuryMarketUrl(value) ||
+    secondaryLuxuryMarketUrl(value)
+  );
+}
+
+function approvedLuxuryMarketEntry(entry){
+  const url=String(
+    entry?.url ||
+    entry?.link ||
+    entry?.uri ||
+    ''
+  ).trim();
+  return approvedLuxuryMarketUrl(url);
+}
+
+function luxuryMarketTier(value){
+  if(trustedLuxuryMarketUrl(value))return 'TIER_1';
+  if(secondaryLuxuryMarketUrl(value))return 'TIER_2';
+  return 'UNAPPROVED';
+}
+
 function trustedLuxuryMarketSourceName(value){
   const host=luxuryMarketHostname(value);
 
@@ -2786,7 +3012,12 @@ function trustedLuxuryMarketSourceName(value){
     'annsfabulousfinds.com':"Ann's Fabulous Finds",
     'hardlyeverwornit.com':'HEWI',
     'sothebys.com':"Sotheby's",
-    'christies.com':"Christie's"
+    'christies.com':"Christie's",
+    'saclab.com':'SACLÀB',
+    'sellierknightsbridge.com':'Sellier Knightsbridge',
+    'luxurypromise.com':'Luxury Promise',
+    'handbagclinic.co.uk':'Handbag Clinic',
+    'resee.com':'ReSee'
   };
 
   for(const [domain,label] of Object.entries(labels)){
@@ -2799,6 +3030,11 @@ function trustedLuxuryMarketSourceName(value){
   }
 
   return '';
+}
+
+function approvedLuxuryMarketSourceName(value){
+  if(secondaryLuxuryMarketUrl(value))return 'eBay';
+  return trustedLuxuryMarketSourceName(value);
 }
 
 async function googleVisionWebDetection(item){
@@ -3029,6 +3265,293 @@ async function googleVisionWebDetection(item){
   }
 }
 
+
+async function googleLensSerpApiSearch(item){
+
+  const apiKey=String(
+    process.env.SERPAPI_API_KEY||''
+  ).trim();
+
+  const imageUrl=String(
+    item?.image_url||''
+  ).trim();
+
+  const base={
+    enabled:!!apiKey,
+    ok:false,
+    checked_at:new Date().toISOString(),
+    image_url:imageUrl||null,
+    input_mode:null,
+    visual_matches:[],
+    exact_matches:[],
+    error:null
+  };
+
+  if(!apiKey){
+    return {
+      ...base,
+      error:'SERPAPI_API_KEY no configurada'
+    };
+  }
+
+  if(!imageUrl){
+    return {
+      ...base,
+      error:'El anuncio no tiene image_url'
+    };
+  }
+
+  const runLens=async params=>{
+
+    const qs=new URLSearchParams({
+      engine:'google_lens',
+      type:'all',
+      hl:'en',
+      api_key:apiKey,
+      ...params
+    });
+
+    const response=await fetch(
+      `https://serpapi.com/search.json?${qs.toString()}`,
+      {
+        headers:{
+          accept:'application/json'
+        },
+        signal:AbortSignal.timeout(45000)
+      }
+    );
+
+    let body={};
+
+    try{
+      body=await response.json();
+    }catch{}
+
+    if(!response.ok || body?.error){
+      throw new Error(
+        String(
+          body?.error ||
+          `SerpApi HTTP ${response.status}`
+        )
+      );
+    }
+
+    return body;
+  };
+
+  const normalizeMatches=body=>{
+
+    const visual=(
+      Array.isArray(body?.visual_matches)
+        ? body.visual_matches
+        : []
+    ).map((x,idx)=>({
+
+      position:
+        x?.position==null
+          ? idx+1
+          : Number.isFinite(Number(x.position))
+            ? Number(x.position)
+            : idx+1,
+
+      title:String(x?.title||'').trim(),
+
+      source:String(x?.source||'').trim(),
+
+      url:String(x?.link||'').trim(),
+
+      image_url:String(
+        x?.image ||
+        x?.thumbnail ||
+        ''
+      ).trim(),
+
+      exact_match:x?.exact_matches===true,
+
+      price:
+        x?.price?.extracted_value==null
+          ? null
+          : Number.isFinite(
+              Number(x.price.extracted_value)
+            )
+            ? Number(x.price.extracted_value)
+            : null,
+
+      currency:String(
+        x?.price?.currency||''
+      ).trim()||null,
+
+      condition:String(
+        x?.condition||''
+      ).trim()||null,
+
+      in_stock:
+        typeof x?.in_stock==='boolean'
+          ? x.in_stock
+          : null
+
+    })).filter(x=>x.url);
+
+    return {
+      visual,
+      exact:visual.filter(x=>x.exact_match)
+    };
+  };
+
+  try{
+
+    let body=null;
+    let inputMode='url';
+
+    try{
+
+      body=await runLens({
+        url:imageUrl
+      });
+
+      if(
+        !Array.isArray(body?.visual_matches) ||
+        body.visual_matches.length===0
+      ){
+        throw new Error(
+          'Lens por URL no devolvió coincidencias'
+        );
+      }
+
+    }catch(urlError){
+
+      const imageResponse=await fetch(
+        imageUrl,
+        {
+          headers:{
+            'user-agent':
+              'Mozilla/5.0 LuxuryHunter/1.7',
+            accept:
+              'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+          },
+          signal:AbortSignal.timeout(20000)
+        }
+      );
+
+      if(!imageResponse.ok){
+        throw urlError;
+      }
+
+      const contentType=String(
+        imageResponse.headers.get('content-type')||''
+      ).toLowerCase();
+
+      const buffer=Buffer.from(
+        await imageResponse.arrayBuffer()
+      );
+
+      if(
+        !buffer.length ||
+        buffer.length>500*1024
+      ){
+        throw urlError;
+      }
+
+      if(
+        !(
+          contentType.includes('jpeg') ||
+          contentType.includes('jpg') ||
+          contentType.includes('png') ||
+          contentType.includes('webp')
+        )
+      ){
+        throw urlError;
+      }
+
+      const form=new FormData();
+
+      form.append(
+        'api_key',
+        apiKey
+      );
+
+      form.append(
+        'image',
+        new Blob(
+          [buffer],
+          {type:contentType}
+        ),
+        contentType.includes('png')
+          ? 'listing.png'
+          : contentType.includes('webp')
+            ? 'listing.webp'
+            : 'listing.jpg'
+      );
+
+      const uploadResponse=await fetch(
+        'https://serpapi.com/image',
+        {
+          method:'POST',
+          body:form,
+          signal:AbortSignal.timeout(30000)
+        }
+      );
+
+      let uploadBody={};
+
+      try{
+        uploadBody=await uploadResponse.json();
+      }catch{}
+
+      const imageId=String(
+        uploadBody?.image_id||''
+      ).trim();
+
+      if(
+        !uploadResponse.ok ||
+        !imageId
+      ){
+        throw new Error(
+          String(
+            uploadBody?.error ||
+            'No se pudo subir la imagen a SerpApi'
+          )
+        );
+      }
+
+      body=await runLens({
+        image_id:imageId
+      });
+
+      inputMode='upload';
+    }
+
+    const matches=normalizeMatches(body);
+
+    return {
+      enabled:true,
+      ok:true,
+      checked_at:new Date().toISOString(),
+      image_url:imageUrl,
+      input_mode:inputMode,
+      visual_matches:matches.visual,
+      exact_matches:matches.exact,
+      search_metadata:{
+        id:String(
+          body?.search_metadata?.id||''
+        ).trim()||null,
+        status:String(
+          body?.search_metadata?.status||''
+        ).trim()||null
+      },
+      error:null
+    };
+
+  }catch(e){
+
+    return {
+      ...base,
+      error:e?.message||String(e)
+    };
+  }
+}
+
+
 async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
   const reportMarket=(pct,stage,detail='')=>{
     try{
@@ -3054,6 +3577,17 @@ async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
 
   const visionWeb=
     await googleVisionWebDetection(item);
+
+  if(typeof onProgress==='function'){
+    onProgress(
+      67,
+      'Búsqueda visual',
+      'Buscando coincidencias de la imagen en Google Lens'
+    );
+  }
+
+  const lensWeb=
+    await googleLensSerpApiSearch(item);
 
   const visionCandidates=(
     Array.isArray(
@@ -3083,6 +3617,57 @@ async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
       }))
     : [];
 
+  const lensRawCandidates=(
+    Array.isArray(lensWeb?.visual_matches)
+      ? lensWeb.visual_matches
+      : []
+  );
+
+  const lensCandidates=lensRawCandidates
+    .filter(p=>approvedLuxuryMarketUrl(p?.url))
+    .sort((a,b)=>{
+      const priorityDiff=
+        luxuryMarketPriorityRank(a?.url)-
+        luxuryMarketPriorityRank(b?.url);
+
+      if(priorityDiff!==0)return priorityDiff;
+
+      const ap=
+        a?.position==null
+          ? 9999
+          : Number.isFinite(Number(a.position))
+            ? Number(a.position)
+            : 9999;
+
+      const bp=
+        b?.position==null
+          ? 9999
+          : Number.isFinite(Number(b.position))
+            ? Number(b.position)
+            : 9999;
+
+      return ap-bp;
+    })
+    .slice(0,30);
+
+  const lensContext=lensCandidates.map((p,idx)=>({
+    candidate:idx+1,
+    source:
+      approvedLuxuryMarketSourceName(p.url) ||
+      p.source ||
+      visionSourceName(p.url),
+    title:p.title||'',
+    url:p.url,
+    image_url:p.image_url||'',
+    position:p.position,
+    exact_match:p.exact_match===true,
+    price:p.price,
+    currency:p.currency,
+    condition:p.condition,
+    in_stock:p.in_stock,
+    market_tier:luxuryMarketTier(p.url)
+  }));
+
   const prompt=`You are the LIVE MARKET COMPARABLES researcher for Luxury Hunter.
 Current date: ${new Date().toISOString().slice(0,10)}.
 
@@ -3100,34 +3685,82 @@ ${item.url||''}
 GOOGLE CLOUD VISION WEB-DETECTION CANDIDATES:
 ${JSON.stringify(visionContext)}
 
+GOOGLE LENS / SERPAPI VISUAL CANDIDATES:
+
+${JSON.stringify(lensContext)}
+
 VISUAL-CANDIDATE RULES:
-- The URLs above were discovered from the LISTING IMAGE itself using Google Cloud Vision Web Detection.
+- The URLs above were discovered from the LISTING IMAGE itself using Google Cloud Vision Web Detection and Google Lens via SerpApi.
 - They are research leads, NOT automatically valid comparables.
 - You MUST investigate these visual candidates before concluding that no market references exist.
 - A visual candidate may be old, archived or sold. Do not discard it merely because of age.
 - Historical exact-model references remain useful evidence of model identity and historic market activity.
 - For each grounded candidate classify it as EXACT, NEAR or ORIENTATIVE.
 - Extract the real source, title, URL, observed price, currency, SOLD/CURRENT status, publication/sale date when genuinely available and condition evidence.
+
+- A price supplied by Google Lens / SerpApi is a DISCOVERY HINT only. Do not treat it as validated market evidence by itself.
+
+- For every Lens candidate, verify the price against the final/direct approved reseller page or grounded Google evidence for that exact listing.
+
+- If Lens returns price=null, actively inspect the final/direct approved page and extract a price only when it is genuinely grounded.
+
+- Never invent, infer or silently reuse a stale snippet price when the direct listing evidence does not support it.
 - Different reseller terminology is NOT a reason to reject an otherwise matching product.
 - If the candidate is visually relevant but pricing/date evidence cannot be validated, preserve it as research evidence rather than inventing information.
 - Do not return zero research results without considering the visual candidates above when they exist.
 
-SOURCE POLICY — HARD WHITELIST:
-Google Search and Google Cloud Vision are DISCOVERY mechanisms only.
-A result becomes market evidence ONLY when its final/direct URL belongs to one of these approved domains:
+SOURCE POLICY — APPROVED LUXURY RESALE SOURCES:
 
+Google Search, Google Cloud Vision and Google Lens via SerpApi are DISCOVERY mechanisms only.
+
+A result becomes market evidence ONLY when its final/direct URL belongs to one of the approved Tier 1 or Tier 2 domains below.
+
+TIER 1 — PRIMARY VALUATION EVIDENCE:
+
+EUROPE-PRIORITY TIER 1:
 1. vestiairecollective.com — Vestiaire Collective
 2. collectorsquare.com — Collector Square
-3. therealreal.com — The RealReal
-4. fashionphile.com — Fashionphile
-5. rebag.com — Rebag
-6. 1stdibs.com — 1stDibs
-7. yoogiscloset.com — Yoogi's Closet
-8. whatgoesaroundnyc.com — What Goes Around Comes Around
-9. annsfabulousfinds.com — Ann's Fabulous Finds
-10. hardlyeverwornit.com — HEWI
-11. sothebys.com — Sotheby's
-12. christies.com — Christie's
+3. hardlyeverwornit.com — HEWI
+4. saclab.com — SACLÀB
+5. sellierknightsbridge.com — Sellier Knightsbridge
+6. luxurypromise.com — Luxury Promise
+7. handbagclinic.co.uk — Handbag Clinic
+8. resee.com — ReSee
+
+OTHER TIER 1:
+9. therealreal.com — The RealReal
+10. fashionphile.com — Fashionphile
+11. rebag.com — Rebag
+12. 1stdibs.com — 1stDibs
+13. yoogiscloset.com — Yoogi's Closet
+14. whatgoesaroundnyc.com — What Goes Around Comes Around
+15. annsfabulousfinds.com — Ann's Fabulous Finds
+16. sothebys.com — Sotheby's
+17. christies.com — Christie's
+
+TIER 2 — COMPLEMENTARY EVIDENCE ONLY:
+- ebay.com
+- ebay.co.uk
+- ebay.de
+- ebay.fr
+- ebay.it
+- ebay.es
+
+EUROPEAN MARKET PRIORITY:
+
+- The resale target is Europe.
+- When product match quality and condition evidence are comparable, prioritize European or Europe-active Tier 1 evidence.
+- European preference must NEVER override product mismatch. EXACT/NEAR identity and condition similarity remain more important than geography.
+- Non-European Tier 1 evidence remains useful supporting market context when European evidence is insufficient.
+
+TIER RULES:
+
+- Tier 1 is the primary valuation evidence.
+- eBay is Tier 2 complementary evidence only.
+- eBay alone must never be treated as sufficient primary evidence for a strong market conclusion.
+- Treat all localized eBay domains as ONE independent market source.
+- Prefer genuinely SOLD / completed eBay evidence over active asking prices when available.
+- A SOLD label is valid only when the final/direct page or grounded evidence genuinely supports that the item sold.
 
 HARD SOURCE RULES:
 - Do NOT use or return YouTube.
@@ -3135,16 +3768,16 @@ HARD SOURCE RULES:
 - Do NOT use ShopMy.
 - Do NOT use blogs, SEO pages, generic shops, affiliate pages or unknown domains.
 - Do NOT use a Google search-result page itself as a comparable.
-- Do NOT treat an image-match host as a market source unless the landing page belongs to the whitelist above.
+- Do NOT treat an image-match host as market evidence unless the final/direct landing page belongs to an approved Tier 1 or Tier 2 domain above.
 - Brand-new retail MSRP pages are not resale comparables.
-- If the whitelist does not provide enough evidence, report insufficient market evidence. Never relax the whitelist.
+- If the approved Tier 1 and Tier 2 sources do not provide enough evidence, report insufficient market evidence. Never relax the approved-source policy.
 
 COMPARABLE RULES:
 - Same exact variant/size/material/pattern/edition = EXACT.
 - Same variant and size/material but another ordinary colour = NEAR.
 - Same family but meaningfully different size/material/edition = ORIENTATIVE and must not drive valuation.
 - A sequined or special-edition Baguette is not an exact comparable for an ordinary Zucca canvas Baguette.
-- Prefer sold prices when genuinely visible. Otherwise label CURRENT.
+- Prefer sold prices when genuinely visible. SOLD / completed transactions are stronger price evidence than active asking prices. Otherwise label CURRENT.
 - Do not use new-retail MSRP.
 - Do not fabricate a listing, price, URL, sold status or source.
 - Historical sold/archive listings are valid research references when they genuinely correspond to the identified model.
@@ -3163,7 +3796,7 @@ COMPARABLE RULES:
 - Progressively remove over-specific wording if an exact query has weak recall.
 - A different listing title does NOT make a result irrelevant if the photographed object and defining visual attributes correspond to the same variant.
 - Use image-derived attributes from the exact visual identification as the primary matching criteria.
-- Search across Vestiaire Collective, The RealReal, Fashionphile, Rebag, Collector Square, specialist European luxury resellers and other credible second-hand sources surfaced by Google.
+- Search Europe-first across the approved Tier 1 sources above, then use other approved Tier 1 sources as supporting evidence and eBay only as Tier 2 complementary evidence.
 - Use ONLY these match_level values: EXACT, NEAR, ORIENTATIVE.
 - EXACT = same model variant with matching size, material/construction, pattern/edition and materially equivalent characteristics.
 - NEAR = same genuine model/variant and broadly equivalent size/material, with only ordinary colour, season or minor specification differences that still make it useful for resale valuation.
@@ -3228,7 +3861,7 @@ Return ONLY JSON:
 
   let comps=
     rawFirstPassComps.filter(
-      trustedLuxuryMarketEntry
+      approvedLuxuryMarketEntry
     );
 
   let rejectedUntrustedReferenceCount=
@@ -3241,7 +3874,7 @@ Return ONLY JSON:
 
   let marketGroundingSources=
     rawFirstPassGrounding.filter(
-      trustedLuxuryMarketEntry
+      approvedLuxuryMarketEntry
     );
   let marketWebSearchQueries=Array.isArray(result.webSearchQueries)
     ? result.webSearchQueries
@@ -3258,7 +3891,7 @@ Return ONLY JSON:
 
   const firstPassSources=new Set(
     firstPassRelevant
-      .map(c=>String(c?.source||'').trim().toLowerCase())
+      .map(sourceKey)
       .filter(Boolean)
   );
 
@@ -3282,7 +3915,7 @@ Return ONLY JSON:
 
   const firstPassConditionSources=new Set(
     firstPassConditionMatched
-      .map(c=>String(c?.source||'').trim().toLowerCase())
+      .map(sourceKey)
       .filter(Boolean)
   );
 
@@ -3336,7 +3969,7 @@ Requirements:
 10. Prioritize finding comparables whose physical condition is SIMILAR to the target condition.
 11. Do not infer a condition from price alone.
 12. Do not convert better/worse condition listings into the target value using a fixed discount or premium.
-9. Search specifically for additional results ONLY on the HARD WHITELIST defined above. Do not use specialist resellers outside that whitelist, even when Google surfaces them.
+9. Search specifically for additional results ONLY on the approved Tier 1 sources above plus eBay as Tier 2 complementary evidence. Prioritize European Tier 1 sources. Do not use any other reseller domain, even when Google surfaces it.
 10. Continue broadening until you either obtain at least 3 useful EXACT/NEAR comparables from at least 2 independent sources, or the available grounded evidence is genuinely exhausted.
 11. Return real URLs and evidence-backed prices whenever available.
 12. Do not invent comparables if a page cannot be grounded.
@@ -3410,7 +4043,7 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
   const preFinalTrustFilterCount=comps.length;
 
   comps=comps.filter(
-    trustedLuxuryMarketEntry
+    approvedLuxuryMarketEntry
   );
 
   rejectedUntrustedReferenceCount+=
@@ -3418,7 +4051,7 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
 
   marketGroundingSources=
     marketGroundingSources.filter(
-      trustedLuxuryMarketEntry
+      approvedLuxuryMarketEntry
     );
 
   const structuredResearchReferences=
@@ -3427,9 +4060,12 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
       title:String(c?.title||'').trim(),
       url:String(c?.url||c?.link||'').trim(),
 
-      price:Number.isFinite(Number(c?.price))
-        ? Number(c.price)
-        : null,
+      price:
+        c?.price==null
+          ? null
+          : Number.isFinite(Number(c.price))
+            ? Number(c.price)
+            : null,
 
       currency:normalizeCurrency(c?.currency),
       price_eur:comparableToEur(c),
@@ -3496,7 +4132,10 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
 
       date_evidence_es:String(
         c?.date_evidence_es||''
-      ).trim()
+      ).trim(),
+      market_tier:luxuryMarketTier(
+        c?.url||c?.link||''
+      )
     })).filter(r=>
       r.source||
       r.title||
@@ -3587,13 +4226,36 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
   const rankedComps=[...comps].sort((a,b)=>{
     const al=String(a?.match_level||'').toUpperCase();
     const bl=String(b?.match_level||'').toUpperCase();
-    return (compRank[al]??3)-(compRank[bl]??3);
+
+    const matchDiff=
+      (compRank[al]??3)-
+      (compRank[bl]??3);
+
+    if(matchDiff!==0)return matchDiff;
+
+    const aUrl=String(
+      a?.url||a?.link||''
+    ).trim();
+
+    const bUrl=String(
+      b?.url||b?.link||''
+    ).trim();
+
+    return (
+      luxuryMarketPriorityRank(aUrl)-
+      luxuryMarketPriorityRank(bUrl)
+    );
   });
 
   for(const c of rankedComps.slice(0,24)){
     const eur=comparableToEur(c);
-    const url=String(c?.url||'').trim();
-    const source=String(c?.source||'').trim()||sourceKey(c);
+    const url=String(
+      c?.url||c?.link||''
+    ).trim();
+    const source=
+      approvedLuxuryMarketSourceName(url) ||
+      String(c?.source||'').trim() ||
+      sourceKey(c);
     if(!eur||!source)continue;
     const level=['EXACT','NEAR','ORIENTATIVE'].includes(String(c?.match_level||'').toUpperCase())?String(c.match_level).toUpperCase():'ORIENTATIVE';
     const status=['SOLD','CURRENT','UNKNOWN'].includes(String(c?.listing_status||'').toUpperCase())?String(c.listing_status).toUpperCase():'UNKNOWN';
@@ -3638,7 +4300,8 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
       condition_relation_to_target:conditionRelation,
       condition_evidence_es:Array.isArray(c?.condition_evidence_es)
         ? c.condition_evidence_es.slice(0,6)
-        : []
+        : [],
+      market_tier:luxuryMarketTier(url)
     });
   }
   const relevant=normalized.filter(
@@ -3647,6 +4310,14 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
 
   const exactOnly=relevant.filter(
     c=>c.match_level==='EXACT'
+  );
+
+  const primaryRelevant=relevant.filter(
+    c=>c.market_tier==='TIER_1'
+  );
+
+  const secondaryRelevant=relevant.filter(
+    c=>c.market_tier==='TIER_2'
   );
 
   // ---------------------------------------------------------
@@ -3662,17 +4333,24 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     ...new Set(relevant.map(sourceKey).filter(Boolean))
   ];
 
+  const primaryModelSources=[
+    ...new Set(
+      primaryRelevant.map(sourceKey).filter(Boolean)
+    )
+  ];
+
   let modelMarketConfidence='LOW';
 
   if(
     relevant.length>=3 &&
-    modelSources.length>=2 &&
+    primaryRelevant.length>=2 &&
+    primaryModelSources.length>=2 &&
     exact.confidence>=0.85
   ){
     modelMarketConfidence='HIGH';
   }else if(
     relevant.length>=2 &&
-    modelSources.length>=1 &&
+    primaryRelevant.length>=1 &&
     exact.confidence>=0.70
   ){
     modelMarketConfidence='MEDIUM';
@@ -3709,6 +4387,16 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     c=>c.match_level==='EXACT'
   );
 
+  const primaryConditionMatched=
+    conditionMatched.filter(
+      c=>c.market_tier==='TIER_1'
+    );
+
+  const secondaryConditionMatched=
+    conditionMatched.filter(
+      c=>c.market_tier==='TIER_2'
+    );
+
   const conditionSources=[
     ...new Set(conditionMatched.map(sourceKey).filter(Boolean))
   ];
@@ -3717,20 +4405,29 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     .map(c=>roundMoney(c.price_eur))
     .filter(v=>Number.isFinite(v)&&v>0);
 
+  const primaryConditionSources=[
+    ...new Set(
+      primaryConditionMatched
+        .map(sourceKey)
+        .filter(Boolean)
+    )
+  ];
+
   let conditionMarketConfidence='LOW';
 
   if(
     targetConditionKnown &&
     targetConditionConfidenceFinal>=0.70 &&
     conditionMatched.length>=3 &&
-    conditionSources.length>=2
+    primaryConditionMatched.length>=2 &&
+    primaryConditionSources.length>=2
   ){
     conditionMarketConfidence='HIGH';
   }else if(
     targetConditionKnown &&
     targetConditionConfidenceFinal>=0.50 &&
     conditionMatched.length>=2 &&
-    conditionSources.length>=1
+    primaryConditionMatched.length>=1
   ){
     conditionMarketConfidence='MEDIUM';
   }
@@ -3741,35 +4438,62 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     conditionMarketConfidence==='HIGH' ||
     conditionMarketConfidence==='MEDIUM';
 
-  const valuationPrices=conditionValuationUsable
-    ? conditionPrices
+  const valuationEntries=conditionValuationUsable
+    ? conditionMatched
+        .map(c=>({
+          value:roundMoney(c.price_eur),
+          weight:luxuryComparableValuationWeight(c),
+          source:c.source,
+          url:c.url,
+          listing_status:c.listing_status,
+          market_tier:c.market_tier,
+          europe:europeanLuxuryMarketUrl(c.url)
+        }))
+        .filter(x=>
+          Number.isFinite(x.value) &&
+          x.value>0 &&
+          Number.isFinite(x.weight) &&
+          x.weight>0
+        )
     : [];
 
-  const conditionLow=valuationPrices.length
-    ? roundMoney(percentile(valuationPrices,0.10)??0)||null
+  const conditionWeightedMean=valuationEntries.length
+    ? roundMoney(weightedMean(valuationEntries)??0)||null
     : null;
 
-  const conditionMedian=valuationPrices.length
-    ? roundMoney(percentile(valuationPrices,0.50)??0)||null
+  const conditionLow=valuationEntries.length
+    ? roundMoney(weightedPercentile(valuationEntries,0.10)??0)||null
     : null;
 
-  const conditionHigh=valuationPrices.length
-    ? roundMoney(percentile(valuationPrices,0.90)??0)||null
+  const conditionMedian=valuationEntries.length
+    ? roundMoney(weightedPercentile(valuationEntries,0.50)??0)||null
     : null;
 
-  const conditionConservative=valuationPrices.length
-    ? roundMoney(percentile(valuationPrices,0.25)??0)||null
+  const conditionHigh=valuationEntries.length
+    ? roundMoney(weightedPercentile(valuationEntries,0.90)??0)||null
     : null;
 
-  const conditionQuick=valuationPrices.length
-    ? roundMoney(percentile(valuationPrices,0.15)??0)||null
+  const conditionConservative=valuationEntries.length
+    ? roundMoney(weightedPercentile(valuationEntries,0.25)??0)||null
+    : null;
+
+  const conditionQuick=valuationEntries.length
+    ? roundMoney(weightedPercentile(valuationEntries,0.15)??0)||null
     : null;
 
   return {
     comparables:normalized,
     research_references:researchReferences,
+
     vision_web_detection:visionWeb,
+    lens_serpapi:lensWeb,
+
     visual_candidate_count:visionCandidates.length,
+    lens_candidate_count:lensCandidates.length,
+    total_visual_candidate_count:
+      visionCandidates.length+
+      lensCandidates.length,
+
     research_candidate_count:researchReferences.length,
 
     trusted_market_source_policy:'strict_allowlist',
@@ -3824,6 +4548,32 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     condition_exact_comparable_count:conditionExact.length,
     condition_independent_source_count:conditionSources.length,
     condition_market_confidence:conditionMarketConfidence,
+
+    valuation_method:
+      'weighted_condition_similar_comparables',
+
+    condition_weighted_mean_eur:
+      conditionWeightedMean,
+
+    valuation_weight_policy:{
+      tier_1_base:1.00,
+      tier_2_ebay_base:0.70,
+      europe_multiplier:1.35,
+      sold_multiplier:1.50,
+      current_multiplier:1.00,
+      unknown_status_multiplier:0.75
+    },
+
+    valuation_entries:
+      valuationEntries.map(x=>({
+        source:x.source,
+        url:x.url,
+        price_eur:x.value,
+        listing_status:x.listing_status,
+        market_tier:x.market_tier,
+        europe:x.europe,
+        weight:x.weight
+      })),
 
     condition_market_low_eur:conditionLow,
     condition_market_median_eur:conditionMedian,
@@ -4291,11 +5041,7 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
 
   const low=
     resaleEstimateSource==='MARKET_ANALYSIS'
-      ? (
-          Number.isFinite(marketLow)
-            ? marketLow
-            : marketConservative
-        )
+      ? marketConservative
       : resaleEstimateSource==='AI_ESTIMATE'
         ? aiLow
         : null;
