@@ -7,3 +7,5 @@ cloud/config.json
 cloud/*.tmp
 *.log
 .DS_Store
+
+*.bak
