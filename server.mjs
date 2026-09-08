@@ -25,6 +25,47 @@ const PORT = Number(process.env.PORT || 8200);
 const XIANYU_BASE_URL = String(process.env.XIANYU_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 const DB_PATH = path.join(__dirname, 'data', 'luxury-hunter.sqlite3');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+// AUTO CLOUD STATE SYNC V1
+const cloudStateSyncDisabled=
+  ['1','true','yes','on'].includes(
+    String(process.env.DISABLE_CLOUD_STATE_SYNC||'').toLowerCase()
+  );
+
+const cloudStateSyncInGithubActions=
+  String(process.env.GITHUB_ACTIONS||'').toLowerCase()==='true';
+
+if(!cloudStateSyncDisabled&&!cloudStateSyncInGithubActions){
+  try{
+    const output=execFileSync(
+      process.execPath,
+      [
+        path.join(__dirname,'scripts','sync-cloud-state.mjs'),
+        '--local-db',
+        DB_PATH
+      ],
+      {
+        cwd:__dirname,
+        encoding:'utf8',
+        timeout:120000,
+        maxBuffer:20*1024*1024,
+        env:{...process.env}
+      }
+    );
+    const message=String(output||'').trim();
+    if(message){
+      console.log('[Cloud state sync]\n'+message);
+    }
+  }catch(e){
+    const stdout=String(e?.stdout||'').trim();
+    const stderr=String(e?.stderr||'').trim();
+    console.error(
+      '[Cloud state sync skipped]',
+      stderr||stdout||e?.message||e
+    );
+  }
+}
+
 const db = new DatabaseSync(DB_PATH);
 
 db.exec(`
