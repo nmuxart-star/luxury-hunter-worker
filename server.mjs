@@ -3552,6 +3552,223 @@ async function googleLensSerpApiSearch(item){
 }
 
 
+// LENS TIER 1 BROWSER ENRICHMENT V1
+// Lens descubre candidatos visuales. Para Tier 1 intentamos abrir
+// la ficha real con navegador renderizado y obtener evidencia visible.
+// Esto NO convierte el candidato en comparable automaticamente:
+// Gemini sigue validando identidad, precio, estado y condicion.
+
+async function enrichLuxuryLensCandidatesRendered(
+  candidates,
+  {maxCandidates=8}={}
+){
+  const pool=(
+    Array.isArray(candidates)
+      ? candidates
+      : []
+  ).filter(
+    p=>
+      p?.url &&
+      trustedLuxuryMarketUrl(p.url)
+  );
+
+  if(!pool.length)return [];
+
+  const selected=[];
+  const selectedUrls=new Set();
+  const seenSources=new Set();
+
+  const pushCandidate=p=>{
+    const url=String(p?.url||'').trim();
+
+    if(
+      !url ||
+      selectedUrls.has(url) ||
+      selected.length>=maxCandidates
+    ){
+      return;
+    }
+
+    selected.push(p);
+    selectedUrls.add(url);
+  };
+
+  // Primero diversidad de fuentes Tier 1.
+  for(const candidate of pool){
+    const source=
+      approvedLuxuryMarketSourceName(candidate.url) ||
+      luxuryMarketHostname(candidate.url);
+
+    if(seenSources.has(source))continue;
+
+    seenSources.add(source);
+    pushCandidate(candidate);
+
+    if(selected.length>=maxCandidates)break;
+  }
+
+  // Luego completar con segundos resultados de las mismas fuentes.
+  if(selected.length<maxCandidates){
+    for(const candidate of pool){
+      pushCandidate(candidate);
+
+      if(selected.length>=maxCandidates)break;
+    }
+  }
+
+  let browser=null;
+  let context=null;
+
+  const results=[];
+
+  try{
+    const {chromium}=await import('playwright');
+
+    browser=await chromium.launch({
+      headless:true,
+      args:[
+        '--disable-dev-shm-usage',
+        '--no-sandbox'
+      ]
+    });
+
+    context=await browser.newContext({
+      locale:'es-ES',
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '+
+        'AppleWebKit/537.36 Chrome/152 Safari/537.36'
+    });
+
+    await context.route('**/*',route=>{
+      const type=route.request().resourceType();
+
+      if(
+        type==='image' ||
+        type==='media' ||
+        type==='font'
+      ){
+        return route.abort();
+      }
+
+      return route.continue();
+    });
+
+    for(const candidate of selected){
+      const originalUrl=String(
+        candidate?.url||''
+      ).trim();
+
+      let page=null;
+
+      try{
+        page=await context.newPage();
+
+        const response=await page.goto(
+          originalUrl,
+          {
+            waitUntil:'domcontentloaded',
+            timeout:25000
+          }
+        );
+
+        await page.waitForTimeout(2500);
+
+        const bodyText=String(
+          await page
+            .locator('body')
+            .innerText({timeout:5000})
+            .catch(()=>'')
+        ).trim();
+
+        const finalUrl=String(
+          page.url()||originalUrl
+        ).trim();
+
+        const httpStatus=
+          response?.status?.()??null;
+
+        const finalUrlTrusted=
+          trustedLuxuryMarketUrl(finalUrl);
+
+        const httpOk=
+          httpStatus==null ||
+          (
+            httpStatus>=200 &&
+            httpStatus<400
+          );
+
+        const pageOk=
+          !!bodyText &&
+          finalUrlTrusted &&
+          httpOk;
+
+        results.push({
+          url:originalUrl,
+          ok:pageOk,
+          final_url:finalUrl,
+          http_status:httpStatus,
+          title:String(
+            await page.title().catch(()=>'')
+          ).trim(),
+          text:pageOk
+            ? bodyText.slice(0,6000)
+            : '',
+          error:pageOk
+            ? null
+            : (
+                !finalUrlTrusted
+                  ? 'Redirect fuera de Tier 1'
+                  : !httpOk
+                    ? `HTTP ${httpStatus}`
+                    : 'Pagina sin texto util'
+              )
+        });
+
+      }catch(e){
+        results.push({
+          url:originalUrl,
+          ok:false,
+          final_url:page
+            ? String(page.url()||originalUrl)
+            : originalUrl,
+          http_status:null,
+          title:'',
+          text:'',
+          error:e?.message||String(e)
+        });
+
+      }finally{
+        if(page){
+          await page.close().catch(()=>{});
+        }
+      }
+    }
+
+  }catch(e){
+    return selected.map(candidate=>({
+      url:String(candidate?.url||'').trim(),
+      ok:false,
+      final_url:null,
+      http_status:null,
+      title:'',
+      text:'',
+      error:e?.message||String(e)
+    }));
+
+  }finally{
+    if(context){
+      await context.close().catch(()=>{});
+    }
+
+    if(browser){
+      await browser.close().catch(()=>{});
+    }
+  }
+
+  return results;
+}
+
+
 async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
   const reportMarket=(pct,stage,detail='')=>{
     try{
@@ -3668,6 +3885,35 @@ async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
     market_tier:luxuryMarketTier(p.url)
   }));
 
+  reportMarket(
+    70,
+    'Verificando candidatos Tier 1',
+    'Abriendo fichas directas encontradas por Google Lens'
+  );
+
+  const lensRenderedEvidence=
+    await enrichLuxuryLensCandidatesRendered(
+      lensCandidates,
+      {maxCandidates:6}
+    );
+
+  const lensRenderedContext=
+    lensRenderedEvidence.map((entry,idx)=>({
+      candidate:idx+1,
+      source:
+        approvedLuxuryMarketSourceName(
+          entry.final_url||entry.url
+        ) ||
+        approvedLuxuryMarketSourceName(entry.url),
+      original_url:entry.url,
+      final_url:entry.final_url,
+      http_status:entry.http_status,
+      ok:entry.ok===true,
+      page_title:entry.title||'',
+      visible_page_text:entry.text||'',
+      error:entry.error||null
+    }));
+
   const prompt=`You are the LIVE MARKET COMPARABLES researcher for Luxury Hunter.
 Current date: ${new Date().toISOString().slice(0,10)}.
 
@@ -3688,6 +3934,24 @@ ${JSON.stringify(visionContext)}
 GOOGLE LENS / SERPAPI VISUAL CANDIDATES:
 
 ${JSON.stringify(lensContext)}
+
+RENDERED DIRECT-PAGE EVIDENCE FROM APPROVED TIER 1 LENS CANDIDATES:
+
+${JSON.stringify(lensRenderedContext)}
+
+RENDERED-EVIDENCE RULES:
+
+- This browser-rendered evidence comes from direct Tier 1 reseller pages that Google Lens discovered from the target image.
+- Treat visible_page_text as direct-page evidence for that specific URL when ok=true.
+- Use it to verify model wording, collaboration/edition, material, colour, condition, SOLD/CURRENT status and visible price when explicitly present.
+- A rendered candidate is still NOT automatically a valid comparable.
+- You must still classify product identity as EXACT, NEAR or ORIENTATIVE against EXACT VISUAL IDENTIFICATION.
+- Do not invent any field that is absent from the rendered page.
+- If the rendered page explicitly says sold, you may classify listing_status as SOLD.
+- If the rendered page explicitly shows a price, use that observed price and its visible currency.
+- Prefer this direct rendered evidence over an unverified Lens snippet when they conflict.
+- A redirect to a localized version of the same approved Tier 1 domain is acceptable.
+- Never promote a rendered page into valuation when its product match is only ORIENTATIVE.
 
 VISUAL-CANDIDATE RULES:
 - The URLs above were discovered from the LISTING IMAGE itself using Google Cloud Vision Web Detection and Google Lens via SerpApi.
@@ -4487,6 +4751,11 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
 
     vision_web_detection:visionWeb,
     lens_serpapi:lensWeb,
+
+    lens_rendered_evidence:lensRenderedEvidence,
+    lens_rendered_candidate_count:lensRenderedEvidence.length,
+    lens_rendered_success_count:
+      lensRenderedEvidence.filter(x=>x?.ok===true).length,
 
     visual_candidate_count:visionCandidates.length,
     lens_candidate_count:lensCandidates.length,
