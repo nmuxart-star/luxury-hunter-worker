@@ -666,15 +666,85 @@ function normalizeMarketplaceQueries(queries, westernProduct, marketplace) {
   return [local, western];
 }
 
+// GEMINI REQUEST GUARD V1
+const GEMINI_HTTP_TIMEOUT_MS=(()=>{
+  const n=Number(process.env.GEMINI_HTTP_TIMEOUT_MS||45000);
+  return Number.isFinite(n)
+    ? Math.max(5000,Math.min(90000,Math.trunc(n)))
+    : 45000;
+})();
+
+function geminiErrorMessage(body,status){
+  return String(
+    body?.error?.message||
+    body?.message||
+    `Gemini HTTP ${status}`
+  );
+}
+
+function geminiCapacityError(body,status){
+  const msg=geminiErrorMessage(body,status).toLowerCase();
+  return Number(status)===429 ||
+    /spending cap|quota|resource[_ -]?exhausted|rate limit|billing|exceeded.*cap/.test(msg);
+}
+
+function geminiHttpError(body,status){
+  const err=new Error(geminiErrorMessage(body,status));
+  err.geminiCapacity=geminiCapacityError(body,status);
+  err.httpStatus=Number(status)||null;
+  return err;
+}
+
+async function geminiFetchJson(url,payload,timeoutMs=GEMINI_HTTP_TIMEOUT_MS){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+
+  try{
+    const r=await fetch(url,{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify(payload),
+      signal:controller.signal
+    });
+
+    const text=await r.text();
+    let body={};
+
+    if(text){
+      try{
+        body=JSON.parse(text);
+      }catch{
+        body={message:text.slice(0,2000)};
+      }
+    }
+
+    return {r,body};
+  }catch(e){
+    if(e?.name==='AbortError'){
+      const err=new Error(`Gemini timeout after ${timeoutMs}ms`);
+      err.code='GEMINI_TIMEOUT';
+      throw err;
+    }
+    throw e;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
 async function generateQueryPlanWithGemini(product) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return null;
   const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
   const prompt = `You generate marketplace search queries for second-hand luxury goods. Return ONLY JSON with keys xianyu, bunjang, japan. Each value MUST contain exactly 2 concise search strings. Query 1 MUST be the natural local-language marketplace query: Simplified Chinese for Xianyu, Korean for Bunjang, Japanese for Japan. Query 2 MUST be the Western/original product name. Keep the exact product family; do not broaden to unrelated models. Product: ${product}`;
   const u = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
-  const r = await fetch(u, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ contents:[{role:'user',parts:[{text:prompt}]}], generationConfig:{responseMimeType:'application/json'} }) });
-  if (!r.ok) return null;
-  const body = await r.json();
+  const {r,body}=await geminiFetchJson(
+    u,
+    {
+      contents:[{role:'user',parts:[{text:prompt}]}],
+      generationConfig:{responseMimeType:'application/json'}
+    }
+  );
+  if(!r.ok)return null;
   const raw = body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('') || '';
   try { return JSON.parse(raw); } catch { return null; }
 }
@@ -2702,15 +2772,23 @@ ${String(rawText||'').slice(0,60000)}`;
     contents:[{role:'user',parts:[{text:repairPrompt}]}],
     generationConfig:{responseMimeType:'application/json'}
   };
-  let r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
-  let body=await r.json();
+  let {r,body}=await geminiFetchJson(u,payload);
 
   if(!r.ok){
-    payload={contents:[{role:'user',parts:[{text:repairPrompt}]}]};
-    r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
-    body=await r.json();
+    if(geminiCapacityError(body,r.status)){
+      throw geminiHttpError(body,r.status);
+    }
+
+    payload={
+      contents:[{role:'user',parts:[{text:repairPrompt}]}]
+    };
+
+    ({r,body}=await geminiFetchJson(u,payload));
   }
-  if(!r.ok)throw new Error(body?.error?.message||`Gemini JSON repair HTTP ${r.status}`);
+
+  if(!r.ok){
+    throw geminiHttpError(body,r.status);
+  }
 
   const repairedText=body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
   return parseJsonLoose(repairedText);
@@ -2726,19 +2804,34 @@ async function geminiJsonRequest({key,model,parts,googleSearch=false}){
     payload.generationConfig={responseMimeType:'application/json'};
   }
 
-  let r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
-  let body=await r.json();
+  let {r,body}=await geminiFetchJson(u,payload);
 
-  let rawText=body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
+  let rawText=
+    body?.candidates?.[0]?.content?.parts
+      ?.map(p=>p.text||'')
+      .join('')||'';
 
-  if(googleSearch&&(!r.ok||!rawText.trim())){
-    const retry={contents:[{role:'user',parts}],tools:[{google_search:{}}]};
-    r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(retry)});
-    body=await r.json();
-    rawText=body?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
+  if(!r.ok){
+    throw geminiHttpError(body,r.status);
   }
 
-  if(!r.ok)throw new Error(body?.error?.message||`Gemini HTTP ${r.status}`);
+  if(googleSearch&&!rawText.trim()){
+    const retry={
+      contents:[{role:'user',parts}],
+      tools:[{google_search:{}}]
+    };
+
+    ({r,body}=await geminiFetchJson(u,retry));
+
+    if(!r.ok){
+      throw geminiHttpError(body,r.status);
+    }
+
+    rawText=
+      body?.candidates?.[0]?.content?.parts
+        ?.map(p=>p.text||'')
+        .join('')||'';
+  }
   if(googleSearch&&!rawText.trim())throw new Error('Gemini Google Search devolvió una respuesta vacía');
   const gm=body?.candidates?.[0]?.groundingMetadata||{};
   const groundingSources=(gm.groundingChunks||[])
@@ -5662,6 +5755,10 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
             }
 
           }catch(aiEstimateError){
+            if(aiEstimateError?.geminiCapacity===true){
+              throw aiEstimateError;
+            }
+
             console.error(
               `AI resale fallback failed for listing ${item.id}:`,
               aiEstimateError?.message||
@@ -5715,6 +5812,10 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
         a.notes=[a.notes,`Exact-model + live-market verification completed. Market confidence: ${market.market_confidence}.`].filter(Boolean).join(' ');
       }
     }catch(e){
+      if(e?.geminiCapacity===true){
+        throw e;
+      }
+
       verification={status:'error',preliminary_decision:preliminaryDecision,ai_preliminary_decision:aiPreliminaryDecision,marketplace_verification:marketplaceVerification,error:e?.message||String(e),failed_at:new Date().toISOString()};
       a.decision='REVIEW';
       a.opportunity_score=null;
@@ -5855,7 +5956,45 @@ async function globalSearch(body) {
   const sources=Array.isArray(body.sources)&&body.sources.length?body.sources:['xianyu','bunjang','buyee'];
   const sessionId=randomUUID();
   const startedAt=new Date().toISOString();
-  const basePlan=await buildQueryPlan(product);
+
+  const configuredPlan={
+    product,
+    xianyu:normalizeLines(
+      body.xianyu_queries ??
+      body.xianyuQueries ??
+      []
+    ),
+    bunjang:normalizeLines(
+      body.bunjang_queries ??
+      body.bunjangQueries ??
+      []
+    ),
+    japan:normalizeLines(
+      body.japan_queries ??
+      body.japanQueries ??
+      []
+    ),
+    generatedBy:'configured'
+  };
+
+  const configuredComplete=
+    (
+      !sources.includes('xianyu') ||
+      configuredPlan.xianyu.length>0
+    ) &&
+    (
+      !sources.includes('bunjang') ||
+      configuredPlan.bunjang.length>0
+    ) &&
+    (
+      !sources.includes('buyee') ||
+      configuredPlan.japan.length>0
+    );
+
+  const basePlan=configuredComplete
+    ? configuredPlan
+    : await buildQueryPlan(product);
+
   const plan=effectivePlan(basePlan,body);
   const taskId=body.taskId?Number(body.taskId):null;
   db.prepare('INSERT INTO search_sessions(id,product_query,query_plan_json,status,started_at,task_id) VALUES(?,?,?,?,?,?)').run(sessionId,product,JSON.stringify(plan),'running',startedAt,taskId);
@@ -6515,64 +6654,178 @@ async function executeTask(taskId, runId=null) {
         );
       }
 
-      for(let idx=0;idx<total;idx++){
-        if(runIsAborted(runId)){
-          return abortedResult(runId,result.sessionId);
-        }
+      const requestedConcurrency=
+        Number(process.env.AI_ANALYSIS_CONCURRENCY||2);
 
-        const item=pendingItems[idx];
+      const concurrency=Math.max(
+        1,
+        Math.min(
+          4,
+          Number.isFinite(requestedConcurrency)
+            ? Math.trunc(requestedConcurrency)
+            : 2
+        )
+      );
 
-        const itemProgress=(pct,stage,detail='')=>{
-          const local=Math.max(
-            0,
-            Math.min(100,Number(pct)||0)
-          );
+      let nextIndex=0;
+      let processed=0;
+      let succeeded=0;
+      let failed=0;
+      let stopRequested=false;
+      let capacityError=null;
+      let lastReportedProgress=30;
 
-          const overall=
-            30 +
-            Math.round(
-              60*((idx+(local/100))/Math.max(total,1))
+      const worker=async()=>{
+        while(!stopRequested){
+          const idx=nextIndex++;
+
+          if(idx>=total)return;
+
+          if(runIsAborted(runId)){
+            stopRequested=true;
+            return;
+          }
+
+          const item=pendingItems[idx];
+
+          const itemProgress=(pct,stage,detail='')=>{
+            const local=Math.max(
+              0,
+              Math.min(100,Number(pct)||0)
             );
+
+            const fractional=
+              Math.min(
+                total,
+                processed+(local/100)
+              );
+
+            const calculated=
+              30+
+              Math.round(
+                60*(fractional/Math.max(total,1))
+              );
+
+            lastReportedProgress=Math.max(
+              lastReportedProgress,
+              Math.min(89,calculated)
+            );
+
+            setTaskRunProgress(
+              runId,
+              lastReportedProgress,
+              stage,
+              `Anuncio ${idx+1}/${total}${detail?' · '+detail:''}`,
+              processed,
+              total
+            );
+          };
+
+          try{
+            await analyzeWithGemini(
+              item.id,
+              taskId,
+              task.analyze_images,
+              itemProgress
+            );
+
+            succeeded++;
+            await sleep(250);
+          }catch(e){
+            failed++;
+
+            console.error(
+              `AI task ${taskId} listing ${item.id}:`,
+              e.message
+            );
+
+            if(
+              e?.geminiCapacity===true ||
+              /spending cap|quota|resource[_ -]?exhausted|rate limit|billing|exceeded.*cap/i
+                .test(String(e?.message||''))
+            ){
+              capacityError=e;
+              stopRequested=true;
+            }
+          }
+
+          processed++;
+
+          lastReportedProgress=Math.max(
+            lastReportedProgress,
+            30+
+            Math.round(
+              60*(processed/Math.max(total,1))
+            )
+          );
 
           setTaskRunProgress(
             runId,
-            Math.min(90,overall),
-            stage,
-            `Anuncio ${idx+1}/${total}${detail?' · '+detail:''}`,
-            idx,
+            Math.min(90,lastReportedProgress),
+            `Procesados ${processed}/${total}`,
+            processed<total
+              ? 'Analizando anuncios restantes'
+              : 'Análisis de anuncios completado',
+            processed,
             total
           );
-        };
-
-        try{
-          await analyzeWithGemini(
-            item.id,
-            taskId,
-            task.analyze_images,
-            itemProgress
-          );
-
-          await sleep(250);
-        }catch(e){
-          console.error(
-            `AI task ${taskId} listing ${item.id}:`,
-            e.message
-          );
         }
+      };
 
-        const completed=idx+1;
-
-        setTaskRunProgress(
-          runId,
-          30+Math.round(60*(completed/Math.max(total,1))),
-          `Analizados ${completed}/${total}`,
-          completed<total
-            ? 'Preparando siguiente anuncio'
-            : 'Análisis de anuncios completado',
-          completed,
+      if(total){
+        const activeWorkers=Math.min(
+          concurrency,
           total
         );
+
+        console.log(
+          `Task ${taskId}: analizando ${total} anuncios `+
+          `con concurrencia ${activeWorkers}.`
+        );
+
+        await Promise.all(
+          Array.from(
+            {length:activeWorkers},
+            ()=>worker()
+          )
+        );
       }
+
+      result.status.aiAnalysis={
+        ok:!capacityError,
+        state:capacityError?'blocked':'finished',
+        processed,
+        succeeded,
+        failed,
+        total,
+        concurrency:Math.min(concurrency,total||1),
+        error:capacityError
+          ? String(capacityError.message||capacityError)
+          : null
+      };
+
+      if(capacityError){
+        console.error(
+          `AI task ${taskId}: Gemini bloqueado por cuota/capacidad; `+
+          `se detiene el análisis restante de esta tarea.`
+        );
+
+        db.prepare(
+          'UPDATE task_runs SET source_status_json=? WHERE id=?'
+        ).run(
+          JSON.stringify(result.status),
+          Number(runId)
+        );
+
+        const blockedError=
+          capacityError instanceof Error
+            ? capacityError
+            : new Error(String(capacityError));
+
+        blockedError.geminiCapacity=true;
+        throw blockedError;
+      }
+
     }
     if(runIsAborted(runId)){
       return abortedResult(runId,result.sessionId);
