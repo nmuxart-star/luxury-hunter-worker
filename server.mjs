@@ -668,10 +668,14 @@ function normalizeMarketplaceQueries(queries, westernProduct, marketplace) {
 
 // GEMINI REQUEST GUARD V1
 const GEMINI_HTTP_TIMEOUT_MS=(()=>{
-  const n=Number(process.env.GEMINI_HTTP_TIMEOUT_MS||45000);
-  return Number.isFinite(n)
-    ? Math.max(5000,Math.min(90000,Math.trunc(n)))
-    : 45000;
+  const raw=String(process.env.GEMINI_HTTP_TIMEOUT_MS||'').trim();
+  if(!raw)return 0;
+
+  const n=Number(raw);
+
+  return Number.isFinite(n) && n>0
+    ? Math.max(5000,Math.trunc(n))
+    : 0;
 })();
 
 function geminiErrorMessage(body,status){
@@ -696,15 +700,20 @@ function geminiHttpError(body,status){
 }
 
 async function geminiFetchJson(url,payload,timeoutMs=GEMINI_HTTP_TIMEOUT_MS){
-  const controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  const controller=timeoutMs>0
+    ? new AbortController()
+    : null;
+
+  const timer=controller
+    ? setTimeout(()=>controller.abort(),timeoutMs)
+    : null;
 
   try{
     const r=await fetch(url,{
       method:'POST',
       headers:{'content-type':'application/json'},
       body:JSON.stringify(payload),
-      signal:controller.signal
+      ...(controller?{signal:controller.signal}:{})
     });
 
     const text=await r.text();
@@ -727,7 +736,7 @@ async function geminiFetchJson(url,payload,timeoutMs=GEMINI_HTTP_TIMEOUT_MS){
     }
     throw e;
   }finally{
-    clearTimeout(timer);
+    if(timer)clearTimeout(timer);
   }
 }
 
