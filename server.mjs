@@ -1914,7 +1914,8 @@ function searchXianyuLive(opts){
   return run;
 }
 async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
-  const maxQueries = clampInt(process.env.XIANYU_MAX_QUERIES || 2, 2, 2, 2);
+  // Xianyu es lento (visita el perfil de cada vendedor): 1 búsqueda por tarea por defecto.
+  const maxQueries = clampInt(process.env.XIANYU_MAX_QUERIES || 1, 1, 1, 2);
   const selectedQueries = (queries || []).slice(0, maxQueries);
   const health = await xianyuFetch('/health', { timeoutMs:7000 });
   if (!health) throw new Error('No se pudo conectar con Xianyu Hunter.');
@@ -1953,7 +1954,7 @@ async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur
       if (taskId === undefined || taskId === null) throw new Error('Xianyu no devolvió el ID de la tarea temporal.');
       await xianyuFetch(`/api/tasks/start/${taskId}`, { method:'POST', timeoutMs:15000 });
       let seenRunning=false;
-      const deadline = Date.now() + 210000;
+      const deadline = Date.now() + clampInt(process.env.XIANYU_QUERY_TIMEOUT_SEC || 180, 180, 60, 600) * 1000;
       while (Date.now() < deadline) {
         await sleep(2000);
         const t = await xianyuFetch(`/api/tasks/${taskId}`, { timeoutMs:10000 });

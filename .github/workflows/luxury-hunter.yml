@@ -46,7 +46,8 @@ jobs:
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       XIANYU_BASE_URL: http://127.0.0.1:8000
-      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '2' }}
+      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '1' }}
+      XIANYU_QUERY_TIMEOUT_SEC: ${{ vars.XIANYU_QUERY_TIMEOUT_SEC || '180' }}
       BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
       PORT: '8200'
@@ -153,6 +154,12 @@ jobs:
             echo "Xianyu session is not valid; skipping the Xianyu connector in this run."
             exit 0
           fi
+          # Base de datos del conector de la ejecución anterior: los anuncios ya
+          # vistos se saltan al instante y solo se procesan los nuevos.
+          if [ -f .state/xianyu-app.sqlite3 ]; then
+            cp .state/xianyu-app.sqlite3 .xianyu/data/app.sqlite3
+            echo "Restored Xianyu connector database"
+          fi
           cd .xianyu
           cp .env.example .env
           # docker --env-file no quita comillas: PROXY_URL="" se convertía en el
@@ -189,6 +196,10 @@ jobs:
         run: |
           mkdir -p lh-upload
           cp data/luxury-hunter.sqlite3 lh-upload/
+          if [ -f .xianyu/data/app.sqlite3 ]; then
+            docker stop luxury-hunter-xianyu >/dev/null 2>&1 || true
+            cp .xianyu/data/app.sqlite3 lh-upload/xianyu-app.sqlite3 || true
+          fi
           # Si esta ejecución no renovó la sesión de Xianyu, conserva la anterior.
           if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
             cp .state/xianyu-state.enc lh-upload/
