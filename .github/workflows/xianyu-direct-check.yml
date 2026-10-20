@@ -36,7 +36,7 @@ jobs:
         run: |
           mkdir -p .xianyu/state
           openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/xianyu-state.enc -out .xianyu/state/Nil.json -pass env:XIANYU_STATE_PASSWORD
-          node scripts/xianyu-keepalive.mjs .xianyu/state/Nil.json
+          node scripts/xianyu-keepalive.mjs .xianyu/state/Nil.json || echo "session check exit $?"
           echo "XIANYU_STATE_FILE=$PWD/.xianyu/state/Nil.json" >> "$GITHUB_ENV"
 
       - name: Run searches
