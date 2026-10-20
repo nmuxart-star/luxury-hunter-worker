@@ -48,7 +48,7 @@ const created=await call('POST','/api/tasks/',{
 });
 console.log('Crear tarea:',created.status,JSON.stringify(created.data).slice(0,500));
 const id=created.data?.task?.id;
-if(!id){
+if(id===undefined||id===null){
   console.log('El conector no devolvió ID de tarea. Fin.');
   process.exit(0);
 }

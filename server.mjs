@@ -1949,7 +1949,8 @@ async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur
     try {
       const created = await xianyuFetch('/api/tasks/', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload), timeoutMs:15000 });
       taskId = created?.task?.id;
-      if (!taskId) throw new Error('Xianyu no devolvió el ID de la tarea temporal.');
+      // La primera tarea del conector tiene id 0: comprobar null, no falsy.
+      if (taskId === undefined || taskId === null) throw new Error('Xianyu no devolvió el ID de la tarea temporal.');
       await xianyuFetch(`/api/tasks/start/${taskId}`, { method:'POST', timeoutMs:15000 });
       let seenRunning=false;
       const deadline = Date.now() + 210000;
@@ -2014,7 +2015,7 @@ async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur
         rejected
       });
     } finally {
-      if (taskId) { try { await xianyuFetch(`/api/tasks/${taskId}`, { method:'DELETE', timeoutMs:10000 }); } catch {} }
+      if (taskId !== null && taskId !== undefined) { try { await xianyuFetch(`/api/tasks/${taskId}`, { method:'DELETE', timeoutMs:10000 }); } catch {} }
     }
     // Keep Xianyu conservative. Do not hammer searches back-to-back.
     await sleep(1200);
