@@ -11,17 +11,22 @@ const params=new URLSearchParams({
   formatVersion:'2',
   format:'json'
 });
-const r=await fetch(`https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701?${params}`,{
-  headers:{referer:process.env.RAKUTEN_REFERER||'https://nmuxart-star.github.io/luxury-hunter-worker/'}
-});
-const body=await r.json().catch(()=>({}));
-console.log('HTTP',r.status);
-if(!r.ok){
-  console.log('Error:',body.error||'',body.error_description||JSON.stringify(body).slice(0,300));
-  process.exit(1);
+const variants=[
+  {name:'referer con ruta',headers:{referer:'https://nmuxart-star.github.io/luxury-hunter-worker/'}},
+  {name:'referer raíz',headers:{referer:'https://nmuxart-star.github.io/'}},
+  {name:'referer + origin',headers:{referer:'https://nmuxart-star.github.io/',origin:'https://nmuxart-star.github.io'}},
+  {name:'solo origin',headers:{origin:'https://nmuxart-star.github.io'}}
+];
+let ok=null;
+for(const v of variants){
+  const r=await fetch(`https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701?${params}`,{headers:v.headers});
+  const body=await r.json().catch(()=>({}));
+  console.log(`[${v.name}] HTTP ${r.status} ${r.ok?'':JSON.stringify(body).slice(0,160)}`);
+  if(r.ok&&!ok)ok={v,body};
 }
-console.log(`Resultados totales: ${body.count}`);
-for(const it of (body.Items||[]).slice(0,10)){
+if(!ok)process.exit(1);
+console.log(`\nFunciona con: ${ok.v.name}. Resultados totales: ${ok.body.count}`);
+for(const it of (ok.body.Items||[]).slice(0,10)){
   const x=it.Item||it;
   console.log(`- ¥${x.itemPrice} · ${x.shopName} · ${String(x.itemName).slice(0,70)}`);
 }
