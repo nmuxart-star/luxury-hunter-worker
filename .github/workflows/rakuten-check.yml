@@ -1,0 +1,27 @@
+name: Rakuten check
+
+# Prueba aislada de la API de Rakuten (sin IA, sin tocar el estado).
+on:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: 'Búsqueda de prueba'
+        default: 'セリーヌ ラゲージ'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: One Rakuten search
+        env:
+          RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
+          RAKUTEN_ACCESS_KEY: ${{ secrets.RAKUTEN_ACCESS_KEY }}
+        run: node scripts/rakuten-check.mjs "${{ inputs.keyword }}"
