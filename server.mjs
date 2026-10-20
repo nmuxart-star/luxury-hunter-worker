@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { load as loadHtml } from 'cheerio';
@@ -312,9 +312,20 @@ const DEFAULT_ECONOMICS = {
   sources: {
     xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
-    buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 }
-  }
+    buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
+    rakuten: { label:'Rakuten / Japón', domesticShippingEur:6, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
+    // Dentro de la UE no hay aduana ni IVA de importación; sí conviene autenticar.
+    ebay_eu: { label:'eBay / UE', euInternal:true, domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:15, customsDutyPercent:0, clearanceFeeEur:0, authenticationFeeEur:30, otherEur:0 },
+    ebay_gb: { label:'eBay / Reino Unido', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:25, customsDutyPercent:3, clearanceFeeEur:15, authenticationFeeEur:30, otherEur:0 },
+    ebay_us: { label:'eBay / EE. UU. y resto', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:45, customsDutyPercent:3, clearanceFeeEur:15, authenticationFeeEur:30, otherEur:0 }
+  },
+  // Arancel UE partida 4202: piel 3 %; exterior textil/plástico (lona, nailon) 3,7 %.
+  textileDutyPercent: 3.7,
+  // 'cost': el IVA de importación se suma al coste (prudente).
+  // 'deductible': empresa en régimen general que lo deduce; se informa pero no se suma.
+  importVatMode: 'cost'
 };
+const TEXTILE_BAG_RE=/canvas|monogram|damier|nylon|tessuto|pvc|coated|キャンバス|モノグラム|ダミエ|ナイロン|テスート|캔버스|나일론|모노그램|帆布|尼龙|老花/i;
 function finiteOr(v, fallback=0){ const n=Number(v); return Number.isFinite(n)?n:fallback; }
 function getSetting(key, fallback){
   const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
@@ -327,7 +338,9 @@ function mergeEconomics(input={}){
   out.vatPercent=finiteOr(input.vatPercent,out.vatPercent);
   out.lowValueThresholdEur=finiteOr(input.lowValueThresholdEur,out.lowValueThresholdEur);
   out.lowValueDutyFlatEur=finiteOr(input.lowValueDutyFlatEur,out.lowValueDutyFlatEur);
-  for(const source of ['xianyu','bunjang','buyee']){
+  out.textileDutyPercent=finiteOr(input.textileDutyPercent,out.textileDutyPercent);
+  out.importVatMode=['cost','deductible'].includes(input.importVatMode)?input.importVatMode:out.importVatMode;
+  for(const source of Object.keys(DEFAULT_ECONOMICS.sources)){
     const src=input.sources?.[source]||{};
     for(const key of ['domesticShippingEur','agentFeePercent','agentFeeFixedEur','internationalShippingEur','customsDutyPercent','clearanceFeeEur','authenticationFeeEur','otherEur']){
       out.sources[source][key]=finiteOr(src[key],out.sources[source][key]);
@@ -358,24 +371,36 @@ function importEconomics(item, settings=getEconomics()){
     '2ndstreet-jp',
     'komehyo-jp'
   ]);
-  const sourceKey=['xianyu','bunjang'].includes(rawSource)
-    ? rawSource
-    : japanEconomicSources.has(rawSource)
-      ? 'buyee'
-      : 'xianyu';
+  let sourceKey='xianyu';
+  if(['xianyu','bunjang'].includes(rawSource))sourceKey=rawSource;
+  else if(japanEconomicSources.has(rawSource))sourceKey='buyee';
+  else if(rawSource==='rakuten-jp')sourceKey='rakuten';
+  else if(rawSource.startsWith('ebay-')){
+    const cc=rawSource.slice(5).toUpperCase();
+    sourceKey=EU_COUNTRIES.has(cc)?'ebay_eu':cc==='GB'?'ebay_gb':'ebay_us';
+  }
   const cfg=settings.sources[sourceKey]||settings.sources.xianyu;
+  const euInternal=cfg.euInternal===true;
+  const textile=TEXTILE_BAG_RE.test(`${item?.title||''} ${item?.description||''}`);
+  const dutyPercent=euInternal
+    ? 0
+    : textile
+      ? Math.max(finiteOr(cfg.customsDutyPercent,0),finiteOr(settings.textileDutyPercent,3.7))
+      : finiteOr(cfg.customsDutyPercent,0);
+  const vatMode=String(process.env.IMPORT_VAT_MODE||settings.importVatMode||'cost').toLowerCase();
   const domestic=finiteOr(cfg.domesticShippingEur,0);
   const agent=product*(finiteOr(cfg.agentFeePercent,0)/100)+finiteOr(cfg.agentFeeFixedEur,0);
   const intl=finiteOr(cfg.internationalShippingEur,0);
   const customsBase=product+domestic+intl;
-  const lowValue=customsBase>0 && customsBase<=finiteOr(settings.lowValueThresholdEur,150);
-  const duty=lowValue?finiteOr(settings.lowValueDutyFlatEur,3):customsBase*(finiteOr(cfg.customsDutyPercent,0)/100);
+  const lowValue=!euInternal && customsBase>0 && customsBase<=finiteOr(settings.lowValueThresholdEur,150);
+  const duty=euInternal?0:lowValue?finiteOr(settings.lowValueDutyFlatEur,3):customsBase*(dutyPercent/100);
   const vatBase=customsBase+duty;
-  const vat=vatBase*(finiteOr(settings.vatPercent,21)/100);
+  const vat=euInternal?0:vatBase*(finiteOr(settings.vatPercent,21)/100);
+  const vatCounted=vatMode==='deductible'?0:vat;
   const clearance=finiteOr(cfg.clearanceFeeEur,0);
   const auth=finiteOr(cfg.authenticationFeeEur,0);
   const other=finiteOr(cfg.otherEur,0);
-  const imported=product+domestic+agent+intl+duty+vat+clearance+auth+other;
+  const imported=product+domestic+agent+intl+duty+vatCounted+clearance+auth+other;
   return {
     source:sourceKey,
     productPriceEur:roundMoney(product),
@@ -385,7 +410,10 @@ function importEconomics(item, settings=getEconomics()){
     agentFeeEur:roundMoney(agent),
     internationalShippingEur:roundMoney(intl),
     customsValueEur:roundMoney(customsBase),
-    customsDutyPercent:finiteOr(cfg.customsDutyPercent,0),
+    customsDutyPercent:dutyPercent,
+    textileDutyApplied:textile&&!euInternal,
+    euInternal,
+    importVatMode:vatMode,
     lowValueDutyApplied:lowValue,
     customsDutyEur:roundMoney(duty),
     vatPercent:finiteOr(settings.vatPercent,21),
@@ -947,10 +975,16 @@ async function buildQueryPlan(product) {
   throw new Error(`No se pudo generar un plan localizado de 2 queries para "${text}".`);
 }
 
+// Asíncrono: la versión con execFileSync bloqueaba el servidor entero
+// mientras Bunjang buscaba, y con tareas en paralelo las demás fallaban.
 function runBunjangCli(args) {
-  if (!fs.existsSync(bunjangCli)) throw new Error('bunjang-cli no está instalado. Ejecuta npm install.');
-  const out = execFileSync(bunjangCli, args, { encoding: 'utf8', maxBuffer: 100 * 1024 * 1024 });
-  return JSON.parse(out.trim());
+  if (!fs.existsSync(bunjangCli)) return Promise.reject(new Error('bunjang-cli no está instalado. Ejecuta npm install.'));
+  return new Promise((resolve, reject) => {
+    execFile(bunjangCli, args, { encoding: 'utf8', maxBuffer: 100 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      try { resolve(JSON.parse(String(stdout).trim())); } catch (e) { reject(e); }
+    });
+  });
 }
 function chunks(arr, n) { const out=[]; for(let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; }
 
@@ -1509,7 +1543,7 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
   const perQuery = [];
   for (const q0 of selectedQueries) {
     const q = String(q0).trim(); if (!q) continue;
-    const s = runBunjangCli(['--json','--preferred-transport','browser','search',q,'--sort','date','--pages',String(pages),'--max-items',String(maxItems)]);
+    const s = await runBunjangCli(['--json','--preferred-transport','browser','search',q,'--sort','date','--pages',String(pages),'--max-items',String(maxItems)]);
     const ids = (s.items || []).map(x => x.id).filter(Boolean);
     ids.forEach(id => { if (!unique.has(String(id))) unique.set(String(id), q); });
     perQuery.push({ query:q, count:ids.length });
@@ -1518,7 +1552,7 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
   let details = [];
   for (const group of chunks([...unique.keys()], 40)) {
     if (!group.length) continue;
-    const d = runBunjangCli(['--json','item','list','--ids',group.join(',')]);
+    const d = await runBunjangCli(['--json','item','list','--ids',group.join(',')]);
     details.push(...(d.items || []));
   }
   let kept=0;
@@ -1582,7 +1616,229 @@ function xianyuImage(raw) {
   if (v && typeof v === 'object') return v.url || v.src || '';
   return typeof v === 'string' ? v : '';
 }
-async function searchXianyuLive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
+// ── RAKUTEN ICHIBA (API oficial) ────────────────────────────────────────
+// Muchas tiendas japonesas de lujo de segunda mano (Brand Off, Komehyo,
+// Daikokuya, 2nd Street, Kindal...) venden también en Rakuten Ichiba.
+// Requiere RAKUTEN_APP_ID y RAKUTEN_ACCESS_KEY (webservice.rakuten.co.jp).
+const RAKUTEN_ENDPOINT='https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701';
+
+function rakutenConfigured(){
+  return !!(process.env.RAKUTEN_APP_ID&&process.env.RAKUTEN_ACCESS_KEY);
+}
+
+function rakutenFullImage(url){
+  // Las miniaturas llevan ?_ex=128x128; sin el parámetro es la imagen original.
+  return String(url||'').replace(/\?_ex=\d+x\d+$/,'');
+}
+
+async function searchRakutenLive({queries,minEur=null,maxEur=null,sessionId}){
+  if(!rakutenConfigured())return {ok:false,state:'not_configured',error:'Faltan RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY'};
+  const maxQueries=clampInt(process.env.RAKUTEN_MAX_QUERIES||2,2,1,5);
+  const perQuery=[];
+  let kept=0;
+  for(const q0 of (queries||[]).slice(0,maxQueries)){
+    const q=String(q0||'').trim();
+    if(!q)continue;
+    const params=new URLSearchParams({
+      applicationId:process.env.RAKUTEN_APP_ID,
+      accessKey:process.env.RAKUTEN_ACCESS_KEY,
+      keyword:q,
+      sort:'-updateTimestamp',
+      hits:'30',
+      availability:'1',
+      formatVersion:'2',
+      format:'json',
+      // Piezas sueltas que no son el bolso.
+      NGKeyword:'保存袋 ストラップのみ チャーム'
+    });
+    const minJpy=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),'JPY')||0):0;
+    const maxJpy=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),'JPY')||0):0;
+    if(minJpy>0)params.set('minPrice',String(minJpy));
+    if(maxJpy>minJpy)params.set('maxPrice',String(maxJpy));
+    let body={};
+    let ok=false;
+    let status=0;
+    try{
+      const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{signal:AbortSignal.timeout(20000)});
+      status=r.status;
+      body=await r.json().catch(()=>({}));
+      ok=r.ok;
+    }catch(e){
+      body={error:e.message};
+    }
+    if(!ok){
+      perQuery.push({query:q,count:0,error:body?.error_description||body?.error||`HTTP ${status}`});
+      await sleep(1200);
+      continue;
+    }
+    const items=Array.isArray(body?.Items)?body.Items:[];
+    let count=0;
+    for(const raw of items){
+      const it=raw?.Item||raw;
+      const price=Number(it.itemPrice);
+      const pe=toEur(price,'JPY');
+      if(!Number.isFinite(price)||pe==null)continue;
+      if(Number.isFinite(Number(minEur))&&pe<Number(minEur))continue;
+      if(Number.isFinite(Number(maxEur))&&pe>Number(maxEur))continue;
+      const images=(it.mediumImageUrls||[]).map(x=>rakutenFullImage(typeof x==='string'?x:x?.imageUrl)).filter(Boolean);
+      upsertListing({
+        source:'rakuten-jp',
+        source_id:it.itemCode,
+        url:it.itemUrl,
+        title:it.itemName,
+        description:String(it.itemCaption||'').slice(0,4000),
+        original_price:price,
+        currency:'JPY',
+        price_eur:pe,
+        seller_name:it.shopName||'',
+        image_url:images[0]||'',
+        status:'available',
+        purchase_via:'Rakuten (proxy/forwarder)',
+        // Sin las miniaturas originales: si no, se analizarían fotos duplicadas.
+        raw:{...it,mediumImageUrls:undefined,smallImageUrls:undefined,images,luxuryHunterSource:'rakuten-api'}
+      },sessionId,q);
+      count++;
+      kept++;
+    }
+    perQuery.push({query:q,count,total:body?.count??null});
+    await sleep(1200);
+  }
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('rakuten','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
+  const failed=perQuery.length>0&&perQuery.every(x=>x.error);
+  return failed
+    ? {ok:false,state:'error',error:perQuery[0].error,perQuery}
+    : {ok:true,perQuery,kept};
+}
+
+// ── EBAY (Browse API oficial) ───────────────────────────────────────────
+// Requiere EBAY_CLIENT_ID y EBAY_CLIENT_SECRET (developer.ebay.com).
+// EBAY_MARKETPLACES: marketplaces a consultar (por defecto UE + UK + US).
+const EU_COUNTRIES=new Set(['AT','BE','BG','HR','CY','CZ','DK','EE','FI','FR','DE','GR','HU','IE','IT','LV','LT','LU','MT','NL','PL','PT','RO','SK','SI','ES','SE']);
+const EBAY_MARKETPLACE_CURRENCY={
+  EBAY_DE:'EUR',EBAY_FR:'EUR',EBAY_IT:'EUR',EBAY_ES:'EUR',EBAY_NL:'EUR',EBAY_BE:'EUR',EBAY_AT:'EUR',EBAY_IE:'EUR',
+  EBAY_GB:'GBP',EBAY_US:'USD'
+};
+let ebayToken=null;
+
+function ebayConfigured(){
+  return !!(process.env.EBAY_CLIENT_ID&&process.env.EBAY_CLIENT_SECRET);
+}
+
+async function getEbayToken(){
+  if(ebayToken&&ebayToken.expiresAt>Date.now()+60000)return ebayToken.value;
+  const basic=Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64');
+  const r=await fetch('https://api.ebay.com/identity/v1/oauth2/token',{
+    method:'POST',
+    headers:{'content-type':'application/x-www-form-urlencoded',authorization:`Basic ${basic}`},
+    body:new URLSearchParams({grant_type:'client_credentials',scope:'https://api.ebay.com/oauth/api_scope'}),
+    signal:AbortSignal.timeout(20000)
+  });
+  const body=await r.json().catch(()=>({}));
+  if(!r.ok||!body.access_token)throw new Error(`eBay token: ${body.error_description||body.error||r.status}`);
+  ebayToken={value:body.access_token,expiresAt:Date.now()+Number(body.expires_in||7200)*1000};
+  return ebayToken.value;
+}
+
+function ebayLargeImage(url){
+  return String(url||'').replace(/s-l\d+\.(jpg|jpeg|png|webp)/i,'s-l1600.$1');
+}
+
+async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
+  if(!ebayConfigured())return {ok:false,state:'not_configured',error:'Faltan EBAY_CLIENT_ID / EBAY_CLIENT_SECRET'};
+  const marketplaces=String(process.env.EBAY_MARKETPLACES||'EBAY_DE,EBAY_FR,EBAY_IT,EBAY_ES,EBAY_GB,EBAY_US')
+    .split(',').map(s=>s.trim().toUpperCase()).filter(m=>EBAY_MARKETPLACE_CURRENCY[m]);
+  const token=await getEbayToken();
+  const perMarketplace=[];
+  let kept=0;
+  for(const mp of marketplaces){
+    const currency=EBAY_MARKETPLACE_CURRENCY[mp];
+    // 2990/3000/3010 = segunda mano (excelente / bueno / aceptable).
+    const filters=['conditionIds:{2990|3000|3010}'];
+    const lo=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),currency)||0):null;
+    const hi=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),currency)||0):null;
+    if(lo!=null||hi!=null)filters.push(`price:[${lo??''}..${hi??''}]`,`priceCurrency:${currency}`);
+    const params=new URLSearchParams({
+      q:String(product||'').slice(0,100),
+      sort:'newlyListed',
+      limit:'40',
+      filter:filters.join(',')
+    });
+    let body={};
+    let ok=false;
+    let status=0;
+    try{
+      const r=await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,{
+        headers:{authorization:`Bearer ${token}`,'X-EBAY-C-MARKETPLACE-ID':mp},
+        signal:AbortSignal.timeout(25000)
+      });
+      status=r.status;
+      body=await r.json().catch(()=>({}));
+      ok=r.ok;
+    }catch(e){
+      body={errors:[{message:e.message}]};
+    }
+    if(!ok){
+      perMarketplace.push({marketplace:mp,count:0,error:body?.errors?.[0]?.message||`HTTP ${status}`});
+      continue;
+    }
+    let count=0;
+    for(const it of body.itemSummaries||[]){
+      const cur=it?.price?.currency||it?.currentBidPrice?.currency||currency;
+      const price=Number(it?.price?.value??it?.currentBidPrice?.value);
+      const pe=toEur(price,cur);
+      if(!Number.isFinite(price)||pe==null)continue;
+      const country=String(it?.itemLocation?.country||'').toUpperCase();
+      // Lo que decide la aduana es desde dónde se envía, no el marketplace.
+      const source=`ebay-${(country||mp.slice(5)).toLowerCase()}`;
+      const images=[it?.image?.imageUrl,...(it?.additionalImages||[]).map(x=>x?.imageUrl)].filter(Boolean).map(ebayLargeImage);
+      upsertListing({
+        source,
+        source_id:it.itemId,
+        url:it.itemWebUrl,
+        title:it.title,
+        description:[it.condition,it.shortDescription].filter(Boolean).join(' · '),
+        original_price:price,
+        currency:cur,
+        price_eur:pe,
+        seller_name:it?.seller?.username||'',
+        seller_sales:it?.seller?.feedbackScore??null,
+        seller_reviews:it?.seller?.feedbackPercentage!=null?Number(it.seller.feedbackPercentage):null,
+        image_url:images[0]||'',
+        status:(it.buyingOptions||[]).join('+'),
+        purchase_via:EU_COUNTRIES.has(country)?'eBay (UE, sin aduana)':`eBay (${country||mp})`,
+        raw:{
+          ...it,
+          image:undefined,
+          additionalImages:undefined,
+          thumbnailImages:undefined,
+          images,
+          publishedAt:it.itemCreationDate||null,
+          marketplace:mp,
+          authenticityGuarantee:(it.qualifiedPrograms||[]).includes('AUTHENTICITY_GUARANTEE')
+        }
+      },sessionId,product);
+      count++;
+      kept++;
+    }
+    perMarketplace.push({marketplace:mp,count,total:body.total??null});
+    await sleep(400);
+  }
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('ebay','live-search',`Marketplaces ${perMarketplace.length}; kept ${kept}`,new Date().toISOString());
+  const failed=perMarketplace.length>0&&perMarketplace.every(x=>x.error);
+  return failed
+    ? {ok:false,state:'error',error:perMarketplace[0].error,perMarketplace}
+    : {ok:true,perMarketplace,kept};
+}
+
+let xianyuQueue=Promise.resolve();
+function searchXianyuLive(opts){
+  // El conector de Xianyu solo gestiona bien una búsqueda a la vez; con tareas
+  // en paralelo se mezclaban (creaba la de Chanel y leía la de Gucci).
+  const run=xianyuQueue.then(()=>searchXianyuLiveExclusive(opts));
+  xianyuQueue=run.catch(()=>{});
+  return run;
+}
+async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
   const maxQueries = clampInt(process.env.XIANYU_MAX_QUERIES || 2, 2, 2, 2);
   const selectedQueries = (queries || []).slice(0, maxQueries);
   const health = await xianyuFetch('/health', { timeoutMs:7000 });
@@ -6209,6 +6465,17 @@ async function globalSearch(body) {
   const jobs=[];
   if(sources.includes('bunjang')) { status.bunjang={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.bunjang=await searchBunjangLive({...opts,queries:plan.bunjang});}catch(e){status.bunjang={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
   if(sources.includes('buyee')) { status.buyee={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.buyee=await searchJapanRadarLive({...opts,queries:plan.japan});}catch(e){status.buyee={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
+  // Fuentes por API oficial: se activan solas cuando hay credenciales
+  // (o si la tarea las pide explícitamente). EXTRA_SOURCES=off las desactiva.
+  const extraOff=['0','off','false','no'].includes(String(process.env.EXTRA_SOURCES||'').toLowerCase());
+  if(!extraOff&&(sources.includes('rakuten')||rakutenConfigured())){
+    status.rakuten={ok:null,state:'running'}; persistStatus();
+    jobs.push((async()=>{try{status.rakuten=await searchRakutenLive({...opts,queries:plan.japan});}catch(e){status.rakuten={ok:false,state:'error',error:e.message};}finally{persistStatus();}})());
+  }
+  if(!extraOff&&(sources.includes('ebay')||ebayConfigured())){
+    status.ebay={ok:null,state:'running'}; persistStatus();
+    jobs.push((async()=>{try{status.ebay=await searchEbayLive({...opts,product});}catch(e){status.ebay={ok:false,state:'error',error:e.message};}finally{persistStatus();}})());
+  }
   await Promise.all(jobs);
   if(sources.includes('xianyu')) { status.xianyu={ok:null,state:'running'}; persistStatus(); try{status.xianyu=await searchXianyuLive({...opts,queries:plan.xianyu});}catch(e){status.xianyu={ok:false,state:'error',error:e.message};} finally{persistStatus();} }
   const finishedAt=new Date().toISOString();
@@ -6355,6 +6622,10 @@ function listingPublishedAtMs(item){
     }
 
     return null;
+  }
+
+  if(source.startsWith('ebay-')){
+    return parseMarketplacePublishedMs(raw?.publishedAt||raw?.itemCreationDate,'+00:00');
   }
 
   return null;

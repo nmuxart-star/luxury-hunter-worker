@@ -63,3 +63,11 @@ Stop Luxury Hunter, copy the update over `~/luxury-hunter`, then run `npm instal
 - **Pre-filtro**: títulos con términos de réplica o "solo accesorio" se descartan sin llamar a Gemini.
 - **Nube más rápida**: `TASK_CONCURRENCY` (por defecto 3) ejecuta varias tareas a la vez. `LOOP_MINUTES` repite ciclos dentro de una misma ejecución (cada `CYCLE_MIN_MINUTES`, por defecto 20) y `SELF_CHAIN=true` encadena la siguiente ejecución al terminar. Se configuran como *variables* del repositorio en GitHub.
 - **Sesión de Xianyu que se renueva sola**: `npm run xianyu:login` abre Chromium para iniciar sesión una vez en Goofish y cifra la sesión en `cloud/xianyu-state.enc`. En cada ejecución en la nube, `scripts/xianyu-keepalive.mjs` visita Goofish con la sesión, guarda las cookies renovadas (cifradas) en el estado persistente y la siguiente ejecución usa la más reciente. Si caduca o Goofish pide verificación anti-bot, llega una alerta "⚠️ Luxury Hunter necesita atención" con el comando para renovarla.
+
+## v1.7 — Más mercados y costes por origen
+
+- **Rakuten Ichiba** (API oficial; secretos `RAKUTEN_APP_ID`, `RAKUTEN_ACCESS_KEY`): tiendas japonesas de lujo de segunda mano (Brand Off, Komehyo, Daikokuya, 2nd Street…). Usa las consultas en japonés de cada tarea.
+- **eBay** (Browse API oficial; secretos `EBAY_CLIENT_ID`, `EBAY_CLIENT_SECRET`): Alemania, Francia, Italia, España, Reino Unido y EE. UU. (`EBAY_MARKETPLACES`). Solo artículos de segunda mano; la aduana se calcula según el país desde el que se envía.
+- **Costes por origen**: eBay UE sin aduana ni IVA de importación (+30 € de autenticación estimada); Reino Unido y EE. UU. como país tercero; arancel 3,7 % automático para lona/nailon (Monogram, Damier, Tessuto…). `IMPORT_VAT_MODE=deductible` deja de sumar el IVA de importación al coste (solo si tu empresa lo deduce; confírmalo con tu gestor).
+- Bunjang ya no bloquea el servidor, Xianyu se ejecuta de una búsqueda en una, el estado persistente vuelve a guardarse (`lh-upload/`) y el workflow muestra los logs del buscador de Xianyu.
+- Vinted, Vestiaire, Wallapop y Catawiki no tienen API pública y prohíben bots: se cubren con sus alertas de búsqueda guardada (ver `private/busquedas-guardadas.md`, que no se sube al repo público).

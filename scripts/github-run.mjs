@@ -7,7 +7,17 @@ const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function api(method,url,body){
-  const r=await fetch(base+url,{method,headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
+  let r;
+  // Reintenta errores de red (servidor ocupado un momento); no los HTTP.
+  for(let attempt=1;;attempt++){
+    try{
+      r=await fetch(base+url,{method,headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
+      break;
+    }catch(e){
+      if(attempt>=8)throw e;
+      await sleep(3000*attempt);
+    }
+  }
   const txt=await r.text(); let data={}; try{data=txt?JSON.parse(txt):{}}catch{data={raw:txt}}
   if(!r.ok) throw new Error(`${method} ${url}: ${r.status} ${data.error||txt}`);
   return data;
@@ -131,7 +141,9 @@ try{
     try{
       const digest=await api('POST','/api/email/global-digest',{
         to:globalEmail.to||null,
-        force:forceManual&&cycle===1,
+        // El informe diario sale a su hora; una ejecución manual no lo fuerza
+        // salvo FORCE_DIGEST=1.
+        force:process.env.FORCE_DIGEST==='1'&&cycle===1,
         config:globalEmail
       });
       if(digest.sent){

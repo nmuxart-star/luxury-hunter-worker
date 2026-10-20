@@ -12,3 +12,5 @@ cloud/*.tmp
 .xianyu-profile/
 .xianyu-tmp/
 .upload/
+lh-upload/
+private/

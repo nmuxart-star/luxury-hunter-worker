@@ -24,6 +24,14 @@ jobs:
       OPENAI_TRIAGE_MODEL: ${{ vars.OPENAI_TRIAGE_MODEL || 'gpt-6-luna' }}
       AI_TRIAGE_MIN_SCORE: ${{ vars.AI_TRIAGE_MIN_SCORE || '60' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # Fuentes por API oficial (se activan solas si existen los secretos).
+      RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
+      RAKUTEN_ACCESS_KEY: ${{ secrets.RAKUTEN_ACCESS_KEY }}
+      EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+      EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+      EBAY_MARKETPLACES: ${{ vars.EBAY_MARKETPLACES || 'EBAY_DE,EBAY_FR,EBAY_IT,EBAY_ES,EBAY_GB,EBAY_US' }}
+      # 'cost' (prudente) o 'deductible' si la empresa deduce el IVA de importación.
+      IMPORT_VAT_MODE: ${{ vars.IMPORT_VAT_MODE || 'cost' }}
       GOOGLE_CLOUD_VISION_API_KEY: ${{ secrets.GOOGLE_CLOUD_VISION_API_KEY }}
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
@@ -134,8 +142,8 @@ jobs:
           XS=0
           node scripts/xianyu-keepalive.mjs .xianyu/state/Nil.json || XS=$?
           if [ -f .xianyu/state/Nil.json ]; then
-            mkdir -p .upload
-            openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out .upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
+            mkdir -p lh-upload
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out lh-upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
           fi
           if [ "$XS" != "0" ]; then
             echo "Xianyu session is not valid; skipping the Xianyu connector in this run."
@@ -172,11 +180,11 @@ jobs:
         if: always()
         shell: bash
         run: |
-          mkdir -p .upload
-          cp data/luxury-hunter.sqlite3 .upload/
+          mkdir -p lh-upload
+          cp data/luxury-hunter.sqlite3 lh-upload/
           # Si esta ejecución no renovó la sesión de Xianyu, conserva la anterior.
-          if [ ! -f .upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
-            cp .state/xianyu-state.enc .upload/
+          if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
+            cp .state/xianyu-state.enc lh-upload/
           fi
 
       - name: Save persistent state
@@ -184,7 +192,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: luxury-hunter-state
-          path: .upload/
+          path: lh-upload/
           if-no-files-found: error
           retention-days: 90
           compression-level: 9
@@ -199,4 +207,11 @@ jobs:
 
       - name: Xianyu logs
         if: always()
-        run: docker logs luxury-hunter-xianyu --tail 120 2>/dev/null || echo "Xianyu connector was not started"
+        shell: bash
+        run: |
+          docker logs luxury-hunter-xianyu --tail 60 2>/dev/null | grep -v "GET /health" || echo "Xianyu connector was not started"
+          # Logs del buscador interno de Xianyu (una búsqueda por fichero).
+          for f in $(ls -t .xianyu/logs/*.log 2>/dev/null | head -3); do
+            echo "===== $f ====="
+            tail -60 "$f"
+          done
