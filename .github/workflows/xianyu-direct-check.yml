@@ -1,0 +1,48 @@
+name: Xianyu direct check
+
+# Prueba el modo directo de Xianyu con el código real del bot: varias
+# búsquedas seguidas, sin IA, sin emails ni Telegram.
+on:
+  workflow_dispatch:
+    inputs:
+      queries:
+        description: 'Búsquedas separadas por |'
+        default: '思琳 Luggage 笑脸包|芬迪 Baguette 法棍包|迪奥 Gaucho 高卓包|普拉达 复古 包|路易威登 复古 包|古驰 复古 包'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Prepare Xianyu session
+        env:
+          XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
+        shell: bash
+        run: |
+          mkdir -p .xianyu/state
+          openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/xianyu-state.enc -out .xianyu/state/Nil.json -pass env:XIANYU_STATE_PASSWORD
+          node scripts/xianyu-keepalive.mjs .xianyu/state/Nil.json
+          echo "XIANYU_STATE_FILE=$PWD/.xianyu/state/Nil.json" >> "$GITHUB_ENV"
+
+      - name: Run searches
+        shell: bash
+        env:
+          QUERIES: ${{ inputs.queries }}
+        run: |
+          IFS='|' read -ra Q <<< "$QUERIES"
+          node scripts/xianyu-direct-check.mjs "${Q[@]}"

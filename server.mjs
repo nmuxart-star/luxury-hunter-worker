@@ -1924,11 +1924,174 @@ async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
     : {ok:true,perMarketplace,kept};
 }
 
+// ── XIANYU DIRECT V1 ────────────────────────────────────────────────────
+// Lee solo la página de resultados de búsqueda (como un usuario que busca),
+// sin abrir la ficha de cada anuncio. Abrir 30 fichas seguidas desde un
+// servidor es lo que hacía saltar la verificación anti-bot de Xianyu
+// (FAIL_SYS_USER_VALIDATE). Si aun así Xianyu pide verificación, se pausa
+// Xianyu el resto de la ejecución: nunca se intenta resolver ni esquivar.
+const XIANYU_SEARCH_API='h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search';
+const XIANYU_RISK_RE=/FAIL_SYS_USER_VALIDATE|RGV587|FAIL_SYS_ILLEGAL_ACCESS|FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED|punish|baxia|_____tmd_____/i;
+let xianyuDirectPromise=null;
+let xianyuPausedReason=null;
+
+function xianyuStateFile(){
+  const f=String(process.env.XIANYU_STATE_FILE||'').trim();
+  return f&&fs.existsSync(f)?f:null;
+}
+function xianyuDirectMode(){
+  return String(process.env.XIANYU_MODE||'direct').toLowerCase()!=='connector'&&!!xianyuStateFile();
+}
+
+async function getXianyuDirect(){
+  if(!xianyuDirectPromise){
+    xianyuDirectPromise=(async()=>{
+      const state=JSON.parse(fs.readFileSync(xianyuStateFile(),'utf8'));
+      const browser=await getBunjangPublicationBrowser();
+      const context=await browser.newContext({
+        storageState:{cookies:state.cookies||[],origins:state.origins||[]},
+        userAgent:state?.env?.userAgent||state?.environment?.userAgent||undefined,
+        locale:'zh-CN',
+        timezoneId:'Asia/Shanghai',
+        viewport:{width:1366,height:850}
+      });
+      return {context,warmed:false};
+    })().catch(e=>{xianyuDirectPromise=null;throw e;});
+  }
+  return xianyuDirectPromise;
+}
+
+function xianyuRiskIn(json){
+  return XIANYU_RISK_RE.test(JSON.stringify(json?.ret||''));
+}
+
+function parseXianyuSearchJson(json){
+  const out=[];
+  for(const item of json?.data?.resultList||[]){
+    const main=item?.data?.item?.main||{};
+    const ex=main.exContent||{};
+    const click=main.clickParam?.args||{};
+    const priceText=Array.isArray(ex.price)
+      ? ex.price.map(p=>String(p?.text??'')).join('').replace('当前价','').trim()
+      : '';
+    let price=parseMoney(priceText);
+    if(/万/.test(priceText)){
+      const n=Number(priceText.replace(/[^\d.]/g,''));
+      if(Number.isFinite(n))price=Math.round(n*10000);
+    }
+    const id=String(ex.itemId||click.item_id||click.id||'').trim();
+    const link=String(main.targetUrl||'').replace('fleamarket://','https://www.goofish.com/');
+    const pub=Number(click.publishTime);
+    const tags=[];
+    if(click.tag==='freeship')tags.push('包邮');
+    for(const t of ex?.fishTags?.r1?.tagList||[]){
+      if(String(t?.data?.content||'').includes('验货宝'))tags.push('验货宝');
+    }
+    out.push({
+      tags,
+      // Mismo formato que el conector: hora de China "YYYY-MM-DD HH:mm".
+      publishedLocal:Number.isFinite(pub)&&pub>0?new Date(pub+8*3600e3).toISOString().slice(0,16).replace('T',' '):null,
+      id,
+      title:String(ex.title||'').trim(),
+      price,
+      url:link||(id?`https://www.goofish.com/item?id=${id}`:''),
+      image:ex.picUrl?String(ex.picUrl).replace(/^\/\//,'https://'):'',
+      area:ex.area||'',
+      seller:ex.userNickName||'',
+      wants:click.wantNum??null,
+      publishedAt:Number.isFinite(pub)&&pub>0?new Date(pub).toISOString():null
+    });
+  }
+  return out;
+}
+
+async function xianyuDirectSearchOnce(keyword){
+  const x=await getXianyuDirect();
+  const page=await x.context.newPage();
+  try{
+    if(!x.warmed){
+      await page.goto('https://www.goofish.com/',{waitUntil:'domcontentloaded',timeout:40000});
+      await sleep(1500+Math.random()*1500);
+      x.warmed=true;
+    }
+    const first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API),{timeout:40000});
+    await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
+    let json=await (await first).json().catch(()=>null);
+    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
+    // Ordenar por "más nuevos" para enterarse antes. Si la web cambia y no
+    // se puede, se usan los resultados por relevancia.
+    let sorted=false;
+    if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
+      try{
+        await sleep(1000+Math.random()*1000);
+        await page.getByText('新发布',{exact:true}).first().click({timeout:6000});
+        await sleep(800+Math.random()*700);
+        const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API),{timeout:15000});
+        await page.getByText('最新',{exact:true}).first().click({timeout:6000});
+        const j2=await (await next).json().catch(()=>null);
+        if(xianyuRiskIn(j2))return {risk:true};
+        if(j2?.data?.resultList?.length){json=j2;sorted=true;}
+      }catch{}
+    }
+    return {risk:false,sorted,items:parseXianyuSearchJson(json),ret:json?.ret||null};
+  }finally{
+    await page.close().catch(()=>{});
+  }
+}
+
+async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
+  if(xianyuPausedReason){
+    return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
+  }
+  const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
+  const perQuery=[];
+  let kept=0;
+  for(const keyword0 of (queries||[]).slice(0,maxQueries)){
+    const keyword=String(keyword0||'').trim();
+    if(!keyword)continue;
+    const res=await xianyuDirectSearchOnce(keyword);
+    if(res.risk){
+      xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa el resto de esta ejecución para proteger tu cuenta.';
+      await reportHealthIssue('xianyu-risk',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad. Se reintentará en la próxima ejecución.').catch(()=>{});
+      perQuery.push({query:keyword,risk:true});
+      break;
+    }
+    const rejected={missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
+    let localKept=0;
+    for(const it of res.items.slice(0,Math.max(1,Number(maxItems)))){
+      if(!it.id||!it.title){rejected.missingCoreFields++;continue;}
+      if(!Number.isFinite(Number(it.price))){rejected.invalidPrice++;continue;}
+      const pe=toEur(it.price,'CNY');
+      if(Number.isFinite(Number(minEur))&&pe!=null&&pe<Number(minEur)){rejected.belowMin++;continue;}
+      if(Number.isFinite(Number(maxEur))&&pe!=null&&pe>Number(maxEur)){rejected.aboveMax++;continue;}
+      upsertListing({
+        source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:'',
+        original_price:it.price,currency:'CNY',price_eur:pe,seller_name:it.seller,image_url:it.image,
+        status:'',purchase_via:'China agent',
+        raw:{'商品信息':{'商品ID':it.id,'商品标题':it.title,'当前售价':it.price,'商品链接':it.url,'商品主图链接':it.image,'发货地区':it.area,'“想要”人数':it.wants,'商品标签':it.tags,'发布时间':it.publishedLocal},publishedAt:it.publishedAt,searchOnly:true}
+      },sessionId,keyword);
+      localKept++;kept++;
+    }
+    perQuery.push({query:keyword,sortedNewest:res.sorted,found:res.items.length,kept:localKept,rejected});
+    await sleep(2500+Math.random()*2500);
+  }
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
+  if(xianyuPausedReason&&!kept)return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery,kept};
+  clearHealthIssue('xianyu-risk');
+  return {ok:true,mode:'direct',perQuery,kept};
+}
+
 let xianyuQueue=Promise.resolve();
 function searchXianyuLive(opts){
-  // El conector de Xianyu solo gestiona bien una búsqueda a la vez; con tareas
-  // en paralelo se mezclaban (creaba la de Chanel y leía la de Gucci).
-  const run=xianyuQueue.then(()=>searchXianyuLiveExclusive(opts));
+  // Una búsqueda de Xianyu a la vez (misma sesión, ritmo humano).
+  // Si la sesión no es válida ya se avisa una vez (xianyu-login); no repetir
+  // un error por cada tarea.
+  const ss=String(process.env.XIANYU_SESSION_STATUS||'').trim();
+  if(ss&&ss!=='ok'&&!xianyuDirectMode()){
+    return Promise.resolve({ok:true,state:'paused',warning:`Sesión de Xianyu no disponible (${ss}).`,perQuery:[],kept:0});
+  }
+  const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
+  const run=xianyuQueue.then(()=>fn(opts));
   xianyuQueue=run.catch(()=>{});
   return run;
 }

@@ -127,6 +127,7 @@ jobs:
       - name: Start Xianyu connector when encrypted state is configured
         env:
           XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
+          XIANYU_MODE: ${{ vars.XIANYU_MODE }}
         shell: bash
         run: |
           if [ ! -f cloud/xianyu-state.enc ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
@@ -134,7 +135,7 @@ jobs:
             echo "XIANYU_SESSION_STATUS=missing" >> "$GITHUB_ENV"
             exit 0
           fi
-          git clone --depth 1 https://github.com/wangdaguo/ai-goofish-monitor.git .xianyu
+          git clone --depth 1 https://github.com/wangdaguo/ai-goofish-monitor.git .xianyu || mkdir -p .xianyu
           mkdir -p .xianyu/state .xianyu/data .xianyu/logs .xianyu/images .xianyu/jsonl .xianyu/price_history .xianyu-tmp
           # Candidatas: la del repo (último login manual) y la renovada en la ejecución anterior.
           openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/xianyu-state.enc -out .xianyu-tmp/repo.json -pass env:XIANYU_STATE_PASSWORD || true
@@ -151,7 +152,15 @@ jobs:
             openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out lh-upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
           fi
           if [ "$XS" != "0" ]; then
-            echo "Xianyu session is not valid; skipping the Xianyu connector in this run."
+            echo "Xianyu session is not valid; skipping Xianyu in this run."
+            exit 0
+          fi
+          # Modo directo (por defecto): Luxury Hunter lee solo la página de
+          # resultados con la sesión guardada; no hace falta el conector Docker,
+          # que abría cada ficha y provocaba la verificación anti-bot.
+          if [ "${XIANYU_MODE:-direct}" != "connector" ]; then
+            echo "XIANYU_STATE_FILE=$PWD/.xianyu/state/Nil.json" >> "$GITHUB_ENV"
+            echo "Xianyu direct mode ready"
             exit 0
           fi
           # Base de datos del conector de la ejecución anterior: los anuncios ya
