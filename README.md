@@ -77,3 +77,8 @@ Stop Luxury Hunter, copy the update over `~/luxury-hunter`, then run `npm instal
 - Triaje y análisis previo con `gpt-6-luna` (razonamiento `none`/`low`, fotos en baja resolución); solo la verificación de candidatos serios (BUY/STRONG BUY o WATCH ≥ `VERIFY_WATCH_MIN_SCORE`) usa `gpt-6.1-sol` con razonamiento `low`.
 - `AI_DAILY_BUDGET_USD` (por defecto 1 $/día, hora de Madrid): al alcanzarlo se deja de analizar hasta el día siguiente y llega un aviso. El gasto del día aparece en el informe diario.
 - Ajustes finos: `OPENAI_SCREEN_MODEL`, `OPENAI_SCREEN_EFFORT`, `OPENAI_VERIFY_EFFORT`, `OPENAI_TRIAGE_EFFORT`, `OPENAI_IMAGE_DETAIL`.
+
+## Modelos y avisos estrictos (2026-10)
+
+- 21 modelos: los 11 originales + Louis Vuitton Pochette Accessoires, LV × Murakami Multicolore, Fendi Spy, Miu Miu Wander/Arcadie, Balenciaga Rodeo, Alaïa Le Teckel, Lady Dior, Loewe Puzzle, Hermès Evelyne y Gucci Horsebit.
+- El aviso inmediato solo salta si el anuncio supera la puntuación y el beneficio mínimos de su modelo (`notify_min_score`, `notify_min_profit_eur`), deja al menos `INSTANT_ALERT_MIN_MARGIN_PCT` (30 %) de margen sobre el coste puesto en España y su reventa está contrastada con anuncios reales del mercado (`INSTANT_ALERT_REQUIRE_MARKET`). El resto aparece solo en el informe diario.

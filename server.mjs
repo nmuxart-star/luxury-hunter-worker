@@ -7285,10 +7285,25 @@ async function sendInstantAlerts(task,runId,items){
   const minProfit=process.env.INSTANT_ALERT_MIN_PROFIT_EUR!=null&&process.env.INSTANT_ALERT_MIN_PROFIT_EUR!==''
     ? Number(process.env.INSTANT_ALERT_MIN_PROFIT_EUR)
     : null;
+  // Solo ofertas realmente buenas: umbrales del modelo (puntuación y
+  // beneficio mínimo), margen mínimo sobre el coste puesto en España y
+  // reventa contrastada con anuncios reales (no solo estimada por la IA).
+  const minMarginPct=Number(process.env.INSTANT_ALERT_MIN_MARGIN_PCT??30);
+  const requireMarket=!['0','false','no','off'].includes(String(process.env.INSTANT_ALERT_REQUIRE_MARKET||'').toLowerCase());
   const alreadyAlerted=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind='instant' LIMIT 1`);
   const fresh=(items||[]).filter(x=>{
     if(!decisions.includes(String(x.decision||'').toUpperCase()))return false;
-    if(minProfit!=null&&Number.isFinite(minProfit)&&!(Number(x.net_profit_low_eur)>=minProfit))return false;
+    const profitLow=Number(x.net_profit_low_eur);
+    if(minProfit!=null&&Number.isFinite(minProfit)&&!(profitLow>=minProfit))return false;
+    if(task.notify_min_score!=null&&!(Number(x.opportunity_score)>=Number(task.notify_min_score)))return false;
+    if(task.notify_min_profit_eur!=null&&!(profitLow>=Number(task.notify_min_profit_eur)))return false;
+    const landed=Number(x.landed_cost_eur);
+    if(Number.isFinite(minMarginPct)&&minMarginPct>0&&landed>0&&!(profitLow/landed*100>=minMarginPct))return false;
+    if(requireMarket){
+      let final={};
+      try{final=JSON.parse(x.verification_json||'{}')?.final||{};}catch{}
+      if(final.resale_estimate_market_verified!==true)return false;
+    }
     return !alreadyAlerted.get(Number(x.id));
   }).map(x=>({...x,_task_name:task.task_name,_task_id:task.id,_run_id:runId}));
   if(!fresh.length)return {sent:0};
