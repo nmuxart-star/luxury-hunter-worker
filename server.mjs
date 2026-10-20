@@ -1891,7 +1891,9 @@ async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
         original_price:price,
         currency:cur,
         price_eur:pe,
-        seller_name:it?.seller?.username||'',
+        // Sin nombre de usuario del vendedor: no guardamos datos personales
+        // de usuarios de eBay (exención de Marketplace Account Deletion).
+        seller_name:'',
         seller_sales:it?.seller?.feedbackScore??null,
         seller_reviews:it?.seller?.feedbackPercentage!=null?Number(it.seller.feedbackPercentage):null,
         image_url:images[0]||'',
@@ -1901,6 +1903,7 @@ async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
           ...it,
           image:undefined,
           additionalImages:undefined,
+          seller:it?.seller?{feedbackScore:it.seller.feedbackScore,feedbackPercentage:it.seller.feedbackPercentage,sellerAccountType:it.seller.sellerAccountType}:undefined,
           thumbnailImages:undefined,
           images,
           publishedAt:it.itemCreationDate||null,

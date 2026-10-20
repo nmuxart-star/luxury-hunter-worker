@@ -1,0 +1,27 @@
+name: eBay check
+
+# Prueba aislada de la API de eBay (sin IA, sin tocar el estado).
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'Búsqueda de prueba'
+        default: 'Celine Luggage'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: eBay search per marketplace
+        env:
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+        run: node scripts/ebay-check.mjs "${{ inputs.query }}"
