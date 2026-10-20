@@ -807,7 +807,78 @@ const OPENAI_BASE_URL=String(process.env.OPENAI_BASE_URL||'https://api.openai.co
 // OpenAI acepta jpeg/png/webp/gif; HEIC se descarta.
 const OPENAI_IMAGE_TYPES=new Set(['image/jpeg','image/png','image/webp','image/gif']);
 
-function openaiInputFromParts(parts){
+// Coste: cada propósito usa el modelo y el nivel de razonamiento mínimo
+// suficiente. Solo la verificación de candidatos serios usa el modelo caro.
+function openaiPurposeConfig(purpose,requestedModel){
+  const cheap=process.env.OPENAI_TRIAGE_MODEL||'gpt-6-luna';
+  const strong=process.env.OPENAI_MODEL||'gpt-6.1-sol';
+  const cfg={
+    triage:{model:cheap,effort:process.env.OPENAI_TRIAGE_EFFORT||'none',detail:'low'},
+    repair:{model:cheap,effort:'none',detail:'low'},
+    screen:{model:process.env.OPENAI_SCREEN_MODEL||cheap,effort:process.env.OPENAI_SCREEN_EFFORT||'low',detail:'low'},
+    verify:{model:strong,effort:process.env.OPENAI_VERIFY_EFFORT||'low',detail:process.env.OPENAI_IMAGE_DETAIL||'auto'}
+  }[purpose]||{model:requestedModel||strong,effort:'low',detail:'auto'};
+  // Los modelos sol/astra no admiten 'none'.
+  if(cfg.effort==='none'&&!/luna/i.test(cfg.model))cfg.effort='low';
+  return cfg;
+}
+
+// Precios por millón de tokens (entrada, salida, entrada en caché), según
+// la página oficial de precios de OpenAI. El razonamiento cuenta como salida.
+const OPENAI_PRICES={
+  'gpt-6-astra':[10,50,1],
+  'gpt-6.1-sol':[2,10,0.10],
+  'gpt-6-sol':[2,10,0.20],
+  'gpt-6-luna':[0.10,0.50,0.01],
+  'gpt-5.6-luna':[0.20,1.20,0.02]
+};
+const OPENAI_WEB_SEARCH_USD=0.01;
+
+function aiSpendDay(){
+  return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Madrid',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+}
+function aiDailyBudgetUsd(){
+  const n=Number(process.env.AI_DAILY_BUDGET_USD??1);
+  return Number.isFinite(n)&&n>0?n:Infinity;
+}
+function getAiSpend(){
+  const state=getSetting('ai_spend',{})||{};
+  return state.day===aiSpendDay()?state:{day:aiSpendDay(),usd:0,calls:0,webSearches:0,byPurpose:{}};
+}
+function recordAiSpend(model,purpose,body){
+  const u=body?.usage||{};
+  const [pin,pout,pcached]=OPENAI_PRICES[model]||OPENAI_PRICES['gpt-6.1-sol'];
+  const input=Number(u.input_tokens)||0;
+  const cached=Number(u.input_tokens_details?.cached_tokens)||0;
+  const output=Number(u.output_tokens)||0;
+  const searches=(body?.output||[]).filter(x=>x?.type==='web_search_call').length;
+  const usd=((input-cached)*pin+cached*pcached+output*pout)/1e6+searches*OPENAI_WEB_SEARCH_USD;
+  const state=getAiSpend();
+  state.usd=Number((state.usd+usd).toFixed(6));
+  state.calls=(state.calls||0)+1;
+  state.webSearches=(state.webSearches||0)+searches;
+  state.byPurpose=state.byPurpose||{};
+  const bp=state.byPurpose[purpose]||{usd:0,calls:0};
+  bp.usd=Number((bp.usd+usd).toFixed(6));
+  bp.calls++;
+  state.byPurpose[purpose]=bp;
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_spend',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+    .run(JSON.stringify(state),new Date().toISOString());
+  return usd;
+}
+function assertAiBudget(){
+  const budget=aiDailyBudgetUsd();
+  const spend=getAiSpend();
+  if(spend.usd>=budget){
+    const err=new Error(`Presupuesto diario de IA alcanzado (${spend.usd.toFixed(2)} $ de ${budget.toFixed(2)} $). Se reanuda mañana.`);
+    err.geminiCapacity=true;
+    err.aiBudget=true;
+    throw err;
+  }
+}
+
+function openaiInputFromParts(parts,detail='auto'){
   const content=[];
   for(const p of parts||[]){
     if(typeof p?.text==='string'){
@@ -818,7 +889,7 @@ function openaiInputFromParts(parts){
       content.push({
         type:'input_image',
         image_url:`data:${type};base64,${p.inline_data.data}`,
-        detail:process.env.OPENAI_IMAGE_DETAIL||'auto'
+        detail
       });
     }
   }
@@ -870,10 +941,13 @@ function openaiMarketSearchDomains(){
   ])].slice(0,100);
 }
 
-async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true}){
+async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true,purpose='verify'}){
+  assertAiBudget();
+  const pc=openaiPurposeConfig(purpose,model);
   const payload={
-    model,
-    input:openaiInputFromParts(parts)
+    model:pc.model,
+    reasoning:{effort:pc.effort},
+    input:openaiInputFromParts(parts,pc.detail)
   };
   if(webSearch){
     // Mismo papel que el Google Search de Gemini, pero limitado desde el
@@ -911,6 +985,7 @@ async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true
       if(/insufficient_quota|billing|rate_limit/i.test(code))err.geminiCapacity=true;
       throw err;
     }
+    recordAiSpend(pc.model,purpose,body);
     return body;
   }catch(e){
     if(e?.name==='AbortError'){
@@ -931,7 +1006,7 @@ async function generateQueryPlanWithGemini(product) {
   if(aiProvider()==='openai'){
     const prompt=`You generate marketplace search queries for second-hand luxury goods. Return ONLY JSON with keys xianyu, bunjang, japan. Each value MUST contain exactly 2 concise search strings. Query 1 MUST be the natural local-language marketplace query: Simplified Chinese for Xianyu, Korean for Bunjang, Japanese for Japan. Query 2 MUST be the Western/original product name. Keep the exact product family; do not broaden to unrelated models. Product: ${product}`;
     try{
-      const body=await openaiResponsesRequest({key,model:aiTriageModel(),parts:[{text:prompt}]});
+      const body=await openaiResponsesRequest({key,model:aiTriageModel(),parts:[{text:prompt}],purpose:'triage'});
       return JSON.parse(openaiOutputText(body));
     }catch{return null;}
   }
@@ -3184,6 +3259,7 @@ async function repairGeminiJson({key,model,rawText,parseError}){
     const body=await openaiResponsesRequest({
       key,
       model:aiTriageModel(),
+      purpose:'repair',
       parts:[{text:`Convert the model response below into ONE valid JSON object. Return JSON only. Preserve the meaning and values already present. Do not invent new facts, prices, URLs, model details or market evidence. Repair JSON syntax only.\n\nORIGINAL PARSE ERROR:\n${parseError||'invalid JSON'}\n\nMODEL RESPONSE:\n${String(rawText||'').slice(0,60000)}`}]
     });
     return parseJsonLoose(openaiOutputText(body));
@@ -3230,12 +3306,12 @@ ${String(rawText||'').slice(0,60000)}`;
   return parseJsonLoose(repairedText);
 }
 
-async function geminiJsonRequest({key,model,parts,googleSearch=false}){
+async function geminiJsonRequest({key,model,parts,googleSearch=false,purpose='verify'}){
   if(aiProvider()==='openai'){
-    let body=await openaiResponsesRequest({key,model,parts,webSearch:googleSearch});
+    let body=await openaiResponsesRequest({key,model,parts,webSearch:googleSearch,purpose});
     let rawText=openaiOutputText(body);
     if(googleSearch&&!rawText.trim()){
-      body=await openaiResponsesRequest({key,model,parts,webSearch:true});
+      body=await openaiResponsesRequest({key,model,parts,webSearch:true,purpose});
       rawText=openaiOutputText(body);
     }
     if(googleSearch&&!rawText.trim())throw new Error('OpenAI web search devolvió una respuesta vacía');
@@ -6081,7 +6157,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
     'Gemini está evaluando modelo, riesgo y oportunidad'
   );
 
-  const first=await geminiJsonRequest({key,model,parts:[{text:prompt},...initialImageParts],googleSearch:false});
+  const first=await geminiJsonRequest({key,model,parts:[{text:prompt},...initialImageParts],googleSearch:false,purpose:'screen'});
   const a=first.data||{};
 
   reportProgress(
@@ -6111,7 +6187,23 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
     ai_preliminary_decision:aiPreliminaryDecision,
     marketplace_verification:marketplaceVerification
   };
-  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)){
+  // Ahorro: la verificación cara (fotos + búsqueda web) solo para candidatos
+  // serios. Un WATCH flojo se guarda sin verificar y no se vuelve a pagar.
+  const verifyWatchMin=Number(process.env.VERIFY_WATCH_MIN_SCORE||70);
+  const worthVerifying=['BUY','STRONG BUY'].includes(preliminaryDecision)||
+    (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin);
+  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&!worthVerifying){
+    verification={
+      status:'skipped_cost',
+      preliminary_decision:preliminaryDecision,
+      ai_preliminary_decision:aiPreliminaryDecision,
+      marketplace_verification:marketplaceVerification
+    };
+    a.decision_reasons_es=[
+      ...reasonsForStorage(a),
+      `Sin verificación de mercado (puntuación ${a.opportunity_score??'—'} < ${verifyWatchMin}) para ahorrar coste.`
+    ].slice(0,4);
+  }else if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)){
     try{
       reportProgress(
         38,
@@ -7068,7 +7160,7 @@ LISTINGS (JSON):
 ${JSON.stringify(lines)}
 
 Return ONLY JSON: {"items":[{"i":0,"score":0,"reason_es":"motivo breve en español"}]} with one entry per listing.`;
-    const {data,usage:u}=await geminiJsonRequest({key,model,parts:[{text:prompt}],googleSearch:false});
+    const {data,usage:u}=await geminiJsonRequest({key,model,parts:[{text:prompt}],googleSearch:false,purpose:'triage'});
     calls++;
     usage=u||usage;
     for(const row of Array.isArray(data?.items)?data.items:[]){
@@ -7248,6 +7340,7 @@ async function sendInstantAlerts(task,runId,items){
 
 const HEALTH_ALERT_COOLDOWN_HOURS={
   'gemini-capacity':6,
+  'ai-budget':20,
   default:24
 };
 
@@ -7443,6 +7536,7 @@ async function executeTask(taskId, runId=null) {
               decision='REJECT'
               OR verification_json LIKE '%"status":"verified"%'
               OR verification_json LIKE '%"status":"not_required"%'
+              OR verification_json LIKE '%"status":"skipped_cost"%'
             )
         )
     `).run(result.sessionId, taskId);
@@ -7494,7 +7588,7 @@ async function executeTask(taskId, runId=null) {
               POSITIVE_DECISIONS.has(
                 String(existingAnalysis.decision||'').toUpperCase()
               ) &&
-              verificationStatus!=='verified'
+              !['verified','skipped_cost'].includes(verificationStatus)
             );
 
           if(!needsVerification)continue;
@@ -7741,7 +7835,11 @@ async function executeTask(taskId, runId=null) {
           : null
       };
 
-      if(capacityError){
+      if(capacityError?.aiBudget){
+        console.log(`Task ${taskId}: ${capacityError.message}`);
+        await reportHealthIssue('ai-budget',`${capacityError.message} Los anuncios nuevos se siguen descargando pero no se analizan. Puedes subir el límite con la variable AI_DAILY_BUDGET_USD.`)
+          .catch(e=>console.error('Health alert failed:',e.message));
+      }else if(capacityError){
         console.error(
           `AI task ${taskId}: ${aiProviderLabel()} bloqueado por cuota/capacidad; `+
           `se detiene el análisis restante de esta tarea.`
@@ -9218,7 +9316,8 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
         BUY: <b>${counts.BUY}</b><br>
         WATCH: <b>${counts.WATCH}</b><br>
         Tareas con ejecuciones: <b>${summaries.length}</b><br>
-        Productos analizados: <b>${totalAnalyzed}</b>
+        Productos analizados: <b>${totalAnalyzed}</b><br>
+        ${aiProvider()==='openai'?`Gasto IA hoy: <b>${getAiSpend().usd.toFixed(2)} $</b> de ${Number.isFinite(aiDailyBudgetUsd())?aiDailyBudgetUsd().toFixed(2)+' $':'sin límite'} (${getAiSpend().calls||0} llamadas)`:''}
       </div>
       <h3>Resumen por modelo / tarea</h3>
       <table style="width:100%;border-collapse:collapse;margin-bottom:24px">

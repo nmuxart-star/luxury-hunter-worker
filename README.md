@@ -71,3 +71,9 @@ Stop Luxury Hunter, copy the update over `~/luxury-hunter`, then run `npm instal
 - **Costes por origen**: eBay UE sin aduana ni IVA de importación (+30 € de autenticación estimada); Reino Unido y EE. UU. como país tercero; arancel 3,7 % automático para lona/nailon (Monogram, Damier, Tessuto…). `IMPORT_VAT_MODE=deductible` deja de sumar el IVA de importación al coste (solo si tu empresa lo deduce; confírmalo con tu gestor).
 - Bunjang ya no bloquea el servidor, Xianyu se ejecuta de una búsqueda en una, el estado persistente vuelve a guardarse (`lh-upload/`) y el workflow muestra los logs del buscador de Xianyu.
 - Vinted, Vestiaire, Wallapop y Catawiki no tienen API pública y prohíben bots: se cubren con sus alertas de búsqueda guardada (ver `private/busquedas-guardadas.md`, que no se sube al repo público).
+
+## Control de gasto de IA
+
+- Triaje y análisis previo con `gpt-6-luna` (razonamiento `none`/`low`, fotos en baja resolución); solo la verificación de candidatos serios (BUY/STRONG BUY o WATCH ≥ `VERIFY_WATCH_MIN_SCORE`) usa `gpt-6.1-sol` con razonamiento `low`.
+- `AI_DAILY_BUDGET_USD` (por defecto 1 $/día, hora de Madrid): al alcanzarlo se deja de analizar hasta el día siguiente y llega un aviso. El gasto del día aparece en el informe diario.
+- Ajustes finos: `OPENAI_SCREEN_MODEL`, `OPENAI_SCREEN_EFFORT`, `OPENAI_VERIFY_EFFORT`, `OPENAI_TRIAGE_EFFORT`, `OPENAI_IMAGE_DETAIL`.
