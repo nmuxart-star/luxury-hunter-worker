@@ -1,0 +1,71 @@
+name: Xianyu diagnose
+
+# Prueba aislada del conector de Xianyu: una sola búsqueda y todos los logs.
+# No usa IA ni modifica el estado persistente de Luxury Hunter.
+on:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: 'Búsqueda de prueba'
+        default: 'celine luggage'
+      image:
+        description: 'Imagen Docker del conector'
+        default: 'ghcr.io/usagi-org/ai-goofish:latest'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Prepare Xianyu session
+        env:
+          XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/wangdaguo/ai-goofish-monitor.git .xianyu
+          mkdir -p .xianyu/state .xianyu/data .xianyu/logs .xianyu/images .xianyu/jsonl .xianyu/price_history
+          openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/xianyu-state.enc -out .xianyu/state/Nil.json -pass env:XIANYU_STATE_PASSWORD
+          node scripts/xianyu-keepalive.mjs .xianyu/state/Nil.json || echo "keepalive exit $?"
+          echo "Public IP / country of this runner:"
+          curl -s https://ipinfo.io/json | grep -E '"(ip|country|org)"' || true
+
+      - name: Start connector
+        shell: bash
+        run: |
+          cd .xianyu
+          cp .env.example .env
+          docker run -d --name xianyu --init -p 8000:8000 \
+            --env-file .env \
+            -e APP_DATABASE_FILE=/app/data/app.sqlite3 \
+            -v "$PWD/.env:/app/.env" -v "$PWD/data:/app/data" -v "$PWD/state:/app/state" \
+            -v "$PWD/config.json:/app/config.json" -v "$PWD/prompts:/app/prompts" \
+            -v "$PWD/jsonl:/app/jsonl" -v "$PWD/logs:/app/logs" -v "$PWD/images:/app/images" \
+            -v "$PWD/price_history:/app/price_history" \
+            "${{ inputs.image }}"
+          for i in $(seq 1 45); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && { echo ready; exit 0; }
+            sleep 2
+          done
+          docker logs xianyu --tail 80
+
+      - name: Diagnose one search
+        run: node scripts/xianyu-diagnose.mjs "${{ inputs.keyword }}" .xianyu/logs
+
+      - name: Connector logs
+        if: always()
+        run: docker logs xianyu --tail 150 2>&1 | grep -v "GET /health" || true
