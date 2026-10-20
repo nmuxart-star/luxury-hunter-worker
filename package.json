@@ -15,7 +15,8 @@
     "cloud:encrypt-xianyu": "bash scripts/encrypt-xianyu-state.sh",
     "cloud:encrypt-config": "bash scripts/encrypt-cloud-config.sh",
     "xianyu:login": "node scripts/xianyu-login.mjs",
-    "xianyu:keepalive": "node scripts/xianyu-keepalive.mjs $HOME/ai-goofish-monitor-wangdaguo/state/Nil.json"
+    "xianyu:keepalive": "node scripts/xianyu-keepalive.mjs $HOME/ai-goofish-monitor-wangdaguo/state/Nil.json",
+    "telegram:setup": "node scripts/telegram-setup.mjs"
   },
   "dependencies": {
     "bunjang-cli": "0.2.1",
