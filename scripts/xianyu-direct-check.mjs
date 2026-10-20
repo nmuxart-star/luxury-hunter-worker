@@ -42,10 +42,12 @@ try{
     for(const it of (body.items||[]).slice(0,3)){
       console.log(` - ${String(it.title||'').slice(0,50)} | ${it.original_price} CNY ≈ ${it.price_eur} € | img=${it.image_url?'sí':'no'} | ${it.url}`);
     }
-    if(!(st.ok===true&&st.mode==='direct'&&Number(st.kept)>0))failures++;
+    // Correcta = Xianyu respondió con normalidad (aunque no haya anuncios).
+    const answered=(st.perQuery||[]).some(p=>Number(p.found)>0||JSON.stringify(p.ret||'').includes('SUCCESS'));
+    if(!(st.ok===true&&st.mode==='direct'&&answered))failures++;
   }
 }finally{
-  child.kill();
+  child.kill('SIGKILL');
 }
 console.log(`\nResultado: ${queries.length-failures}/${queries.length} búsquedas correctas`);
 process.exit(failures?1:0);

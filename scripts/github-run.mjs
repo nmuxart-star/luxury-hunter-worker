@@ -82,7 +82,13 @@ try{
   console.log('Luxury Hunter cloud worker ready.');
   if(cfg.economics) await api('PUT','/api/economics',cfg.economics);
   const xianyuSession=String(process.env.XIANYU_SESSION_STATUS||'').trim();
-  if(['expired','missing','error'].includes(xianyuSession)){
+  // En modo directo (por defecto) solo se avisa si la búsqueda falla de
+  // verdad (lo hace server.mjs); una sesión caducada que sigue buscando
+  // bien no es un problema para Nil.
+  const xianyuDirect=String(process.env.XIANYU_MODE||'direct').toLowerCase()!=='connector';
+  if(xianyuDirect){
+    console.log(`Xianyu session status: ${xianyuSession||'desconocido'} (modo directo)`);
+  }else if(['expired','missing','error'].includes(xianyuSession)){
     await api('POST','/api/health/report',{
       key:'xianyu-login',
       message:`La sesión de Xianyu no es válida (${xianyuSession}). China no se está buscando. `+

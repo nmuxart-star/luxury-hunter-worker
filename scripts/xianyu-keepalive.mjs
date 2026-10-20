@@ -31,11 +31,19 @@ try{
     locale:'zh-CN',
     timezoneId:'Asia/Shanghai'
   });
-  const {riskControl}=await visitGoofish(context);
+  const {riskControl,sessionValid}=await visitGoofish(context);
   const fresh=await context.storageState();
   console.log('Después:',JSON.stringify(cookieSummary(fresh.cookies)));
+  console.log('Goofish reconoce la sesión:',sessionValid===null?'no se sabe':sessionValid?'sí':'NO (Session过期)');
   if(isLoggedIn(fresh.cookies)){
+    // Se guardan siempre las cookies renovadas: aunque la sesión haya
+    // caducado en el servidor, siguen sirviendo para buscar.
     fs.writeFileSync(file,JSON.stringify(mergeState(previous,fresh),null,2));
+  }
+  if(sessionValid===false){
+    report('expired','Goofish dice que la sesión ha caducado (npm run xianyu:login para renovarla)');
+    process.exitCode=3;
+  }else if(isLoggedIn(fresh.cookies)){
     report(riskControl?'risk_control':'ok',riskControl?'sesión válida pero Goofish pidió verificación anti-bot':'cookies renovadas');
   }else{
     report('expired','hay que volver a iniciar sesión: npm run xianyu:login');
