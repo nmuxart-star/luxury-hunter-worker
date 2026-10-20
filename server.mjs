@@ -1734,7 +1734,11 @@ async function searchRakutenLive({queries,minEur=null,maxEur=null,sessionId}){
     let ok=false;
     let status=0;
     try{
-      const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{signal:AbortSignal.timeout(20000)});
+      // La API nueva exige un Referer que coincida con la "Webサイト URL" de la app.
+      const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{
+        headers:{referer:process.env.RAKUTEN_REFERER||'https://nmuxart-star.github.io/luxury-hunter-worker/'},
+        signal:AbortSignal.timeout(20000)
+      });
       status=r.status;
       body=await r.json().catch(()=>({}));
       ok=r.ok;
