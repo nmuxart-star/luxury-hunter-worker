@@ -983,6 +983,12 @@ async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true
       const err=geminiHttpError(body,r.status);
       const code=String(body?.error?.code||body?.error?.type||'');
       if(/insufficient_quota|billing|rate_limit/i.test(code))err.geminiCapacity=true;
+      // Filtro de seguridad de OpenAI: el problema es el contenido de un
+      // anuncio concreto, no la cuenta ni el presupuesto.
+      if(isAiPolicyFlag(err)||/invalid_prompt|content_policy|content_filter/i.test(code)){
+        err.policyFlag=true;
+        err.geminiCapacity=false;
+      }
       throw err;
     }
     recordAiSpend(pc.model,purpose,body);
@@ -7367,6 +7373,25 @@ function prioritizeForAnalysis(taskId,items){
 // Triaje barato: UNA llamada de solo texto con el modelo económico revisa
 // todos los anuncios nuevos de la ejecución y elige cuáles merecen el
 // análisis completo (fotos + modelo exacto + mercado), que es lo caro.
+function isAiPolicyFlag(e){
+  return e?.policyFlag===true||/flagged as potentially violating|usage polic|invalid_prompt|content[_ ]policy|content[_ ]filter/i.test(String(e?.message||e||''));
+}
+
+function storePolicyReject(taskId,item,stage){
+  const now=new Date().toISOString();
+  const economics=importEconomics(item);
+  const reason='OpenAI no permite analizar el contenido de este anuncio (filtro de seguridad). Se descarta automáticamente.';
+  const a={
+    brand:'',model:'',authenticity_risk:'',liquidity:'',
+    decision:'REJECT',opportunity_score:0,
+    landed_cost_eur:economics.importedTotalEur,
+    decision_reasons_es:[reason],
+    notes:`Descartado: contenido bloqueado por el filtro de seguridad de la IA (${stage}).`,
+    policyFlag:true
+  };
+  storeTaskAnalysis(taskId,item,a,'REJECT',{status:'not_required',policyFlag:true},now);
+}
+
 async function triageWithAi(task,items){
   const key=aiApiKey();
   const model=aiTriageModel();
@@ -7374,7 +7399,24 @@ async function triageWithAi(task,items){
   const scores=new Map();
   let calls=0;
   let usage=null;
-  for(const batch of chunks(items,40)){
+  let flagged=0;
+  const runBatch=async batch=>{
+    try{
+      await triageBatch(batch);
+    }catch(e){
+      if(!isAiPolicyFlag(e))throw e;
+      // Un título bloquea el lote entero: se parte en dos hasta aislarlo.
+      if(batch.length===1){
+        flagged++;
+        scores.set(batch[0].id,{score:0,reason:'Contenido bloqueado por el filtro de seguridad de la IA.',policyFlag:true});
+        return;
+      }
+      const mid=Math.ceil(batch.length/2);
+      await runBatch(batch.slice(0,mid));
+      await runBatch(batch.slice(mid));
+    }
+  };
+  const triageBatch=async batch=>{
     const lines=batch.map((x,i)=>({
       i,
       source:x.source,
@@ -7412,8 +7454,9 @@ Return ONLY JSON: {"items":[{"i":0,"score":0,"reason_es":"motivo breve en españ
         reason:String(row.reason_es||'').slice(0,300)
       });
     }
-  }
-  return {scores,minScore,calls,model,usage};
+  };
+  for(const batch of chunks(items,40))await runBatch(batch);
+  return {scores,minScore,calls,model,usage,flagged};
 }
 
 function storeTriageReject(taskId,item,t){
@@ -7652,7 +7695,9 @@ function clearHealthIssue(key){
 
 async function reportRunHealth(status){
   for(const [src,s] of Object.entries(status||{})){
-    if(['freshness','aiAnalysis','email','instantAlerts','prescreen'].includes(src))continue;
+    // triage no es una fuente: si falla se usa la prioridad por precio y los
+    // fallos reales de IA ya se avisan aparte (gemini-errors / ai-budget).
+    if(['freshness','aiAnalysis','email','instantAlerts','prescreen','triage'].includes(src))continue;
     if(s&&s.ok===false){
       await reportHealthIssue(`source-${src}`,`La fuente ${src} falla: ${s.error||s.warning||'sin detalle'}`);
     }else if(s&&s.ok===true){
@@ -7891,7 +7936,7 @@ async function executeTask(taskId, runId=null) {
             (b._triageScore??-1)-(a._triageScore??-1) ||
             (a._priceVsTaskMedian??9)-(b._priceVsTaskMedian??9)
           );
-          result.status.triage={ok:true,model:triage.model,calls:triage.calls,minScore:triage.minScore,kept,rejected,unscored,usage:triage.usage};
+          result.status.triage={ok:true,model:triage.model,calls:triage.calls,minScore:triage.minScore,kept,rejected,unscored,flagged:triage.flagged,usage:triage.usage};
           console.log(`Task ${taskId}: triaje ${triage.model} -> ${kept} pasan, ${rejected} descartados, ${unscored} sin puntuar.`);
         }catch(e){
           if(e?.geminiCapacity===true){
@@ -8007,6 +8052,13 @@ async function executeTask(taskId, runId=null) {
             succeeded++;
             await sleep(250);
           }catch(e){
+            if(isAiPolicyFlag(e)){
+              // No es un fallo del bot: se descarta ese anuncio y se sigue.
+              storePolicyReject(taskId,item,'análisis');
+              console.log(`Task ${taskId}: anuncio ${item.id} descartado (filtro de seguridad de la IA).`);
+              processed++;
+              continue;
+            }
             failed++;
             lastAiError=String(e?.message||e).slice(0,300);
 
