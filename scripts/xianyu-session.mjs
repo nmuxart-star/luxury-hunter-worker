@@ -49,6 +49,17 @@ export function mergeState(previous,fresh){
 export async function visitGoofish(context,{waitMs=6000}={}){
   const page=await context.newPage();
   let riskControl=false;
+  // Lo que dice el servidor de Goofish sobre la sesión (no solo las cookies):
+  // true = sesión reconocida, false = Session过期, null = no se supo.
+  let sessionValid=null;
+  page.on('response',async r=>{
+    const u=r.url();
+    if(!/mtop\.taobao\.idlemessage\.pc\.loginuser\.get|mtop\.idle\.web\.user\.page\.nav/.test(u))return;
+    const t=await r.text().catch(()=>'');
+    if(/SUCCESS::/.test(t))sessionValid=sessionValid??true;
+    if(/SESSION_EXPIRED|FAIL_SYS_TOKEN_EMPTY|未登录|FAIL_SYS_ILLEGAL_ACCESS/.test(t))sessionValid=false;
+    if(/RGV587|USER_VALIDATE/.test(t))riskControl=true;
+  });
   try{
     for(const url of ['https://www.goofish.com/','https://www.goofish.com/personal']){
       await page.goto(url,{waitUntil:'domcontentloaded',timeout:45000}).catch(()=>{});
@@ -60,5 +71,5 @@ export async function visitGoofish(context,{waitMs=6000}={}){
   }finally{
     await page.close().catch(()=>{});
   }
-  return {riskControl};
+  return {riskControl,sessionValid};
 }
