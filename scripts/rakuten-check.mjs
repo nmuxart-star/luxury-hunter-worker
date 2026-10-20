@@ -19,6 +19,7 @@ const variants=[
 ];
 let ok=null;
 for(const v of variants){
+  await new Promise(r=>setTimeout(r,2500));
   const r=await fetch(`https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701?${params}`,{headers:v.headers});
   const body=await r.json().catch(()=>({}));
   console.log(`[${v.name}] HTTP ${r.status} ${r.ok?'':JSON.stringify(body).slice(0,160)}`);
