@@ -1701,6 +1701,15 @@ function rakutenConfigured(){
   return !!(process.env.RAKUTEN_APP_ID&&process.env.RAKUTEN_ACCESS_KEY);
 }
 
+// Turno global: varias tareas en paralelo no deben superar 1 petición/s.
+let rakutenNextSlot=0;
+async function rakutenThrottle(){
+  const now=Date.now();
+  const wait=Math.max(0,rakutenNextSlot-now);
+  rakutenNextSlot=Math.max(now,rakutenNextSlot)+1200;
+  if(wait)await sleep(wait);
+}
+
 function rakutenFullImage(url){
   // Las miniaturas llevan ?_ex=128x128; sin el parámetro es la imagen original.
   return String(url||'').replace(/\?_ex=\d+x\d+$/,'');
@@ -1734,9 +1743,12 @@ async function searchRakutenLive({queries,minEur=null,maxEur=null,sessionId}){
     let ok=false;
     let status=0;
     try{
-      // La API nueva exige un Referer que coincida con la "Webサイト URL" de la app.
+      // La API nueva valida el Origin contra los "Allowed websites" de la app
+      // (el Referer solo no basta) y admite ~1 petición por segundo.
+      const site=process.env.RAKUTEN_ORIGIN||'https://nmuxart-star.github.io';
+      await rakutenThrottle();
       const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{
-        headers:{referer:process.env.RAKUTEN_REFERER||'https://nmuxart-star.github.io/luxury-hunter-worker/'},
+        headers:{origin:site,referer:`${site}/`},
         signal:AbortSignal.timeout(20000)
       });
       status=r.status;
