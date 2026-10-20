@@ -49,6 +49,9 @@ jobs:
         run: |
           cd .xianyu
           cp .env.example .env
+          # docker --env-file no quita comillas: PROXY_URL="" se convertía en el
+          # proxy literal "" y el navegador fallaba con ERR_PROXY_CONNECTION_FAILED.
+          sed -i -E 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' .env
           docker run -d --name xianyu --init -p 8000:8000 \
             --env-file .env \
             -e APP_DATABASE_FILE=/app/data/app.sqlite3 \

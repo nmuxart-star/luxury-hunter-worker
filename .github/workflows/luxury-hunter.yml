@@ -155,6 +155,9 @@ jobs:
           fi
           cd .xianyu
           cp .env.example .env
+          # docker --env-file no quita comillas: PROXY_URL="" se convertía en el
+          # proxy literal "" y el navegador fallaba con ERR_PROXY_CONNECTION_FAILED.
+          sed -i -E 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' .env
           # Luxury Hunter uses Xianyu only as a crawler here; central AI remains in Luxury Hunter.
           docker pull ghcr.io/usagi-org/ai-goofish:latest
           docker run -d --name luxury-hunter-xianyu --init -p 8000:8000 \
