@@ -9,3 +9,6 @@ cloud/*.tmp
 .DS_Store
 
 *.bak
+.xianyu-profile/
+.xianyu-tmp/
+.upload/

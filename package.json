@@ -1,6 +1,6 @@
 {
   "name": "luxury-hunter-v1",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,7 +13,9 @@
     "cloud:export": "node scripts/export-cloud-config.mjs",
     "cloud:run": "node scripts/github-run.mjs",
     "cloud:encrypt-xianyu": "bash scripts/encrypt-xianyu-state.sh",
-    "cloud:encrypt-config": "bash scripts/encrypt-cloud-config.sh"
+    "cloud:encrypt-config": "bash scripts/encrypt-cloud-config.sh",
+    "xianyu:login": "node scripts/xianyu-login.mjs",
+    "xianyu:keepalive": "node scripts/xianyu-keepalive.mjs $HOME/ai-goofish-monitor-wangdaguo/state/Nil.json"
   },
   "dependencies": {
     "bunjang-cli": "0.2.1",

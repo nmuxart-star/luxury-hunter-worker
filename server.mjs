@@ -740,10 +740,173 @@ async function geminiFetchJson(url,payload,timeoutMs=GEMINI_HTTP_TIMEOUT_MS){
   }
 }
 
+// ── AI PROVIDER V2 (OpenAI / Gemini) ─────────────────────────────────────
+// Toda la IA pasa por geminiJsonRequest()/repairGeminiJson(); aquí se decide
+// si la petición va a OpenAI (Responses API) o a Gemini. Google Lens (SerpApi)
+// y Google Cloud Vision son independientes del proveedor y no cambian.
+function aiProvider(){
+  const forced=String(process.env.AI_PROVIDER||'').trim().toLowerCase();
+  if(forced==='openai'||forced==='gemini')return forced;
+  if(process.env.OPENAI_API_KEY)return 'openai';
+  return 'gemini';
+}
+function aiApiKey(){
+  return aiProvider()==='openai'
+    ? process.env.OPENAI_API_KEY||''
+    : process.env.GEMINI_API_KEY||'';
+}
+function aiConfigured(){ return !!aiApiKey(); }
+function aiModel(){
+  return aiProvider()==='openai'
+    ? process.env.OPENAI_MODEL||'gpt-6.1-sol'
+    : process.env.GEMINI_MODEL||'gemini-3.8-flash';
+}
+function aiTriageModel(){
+  return aiProvider()==='openai'
+    ? process.env.OPENAI_TRIAGE_MODEL||'gpt-6-luna'
+    : process.env.GEMINI_TRIAGE_MODEL||process.env.GEMINI_MODEL||'gemini-3.8-flash';
+}
+function aiProviderLabel(){
+  return aiProvider()==='openai'?'OpenAI':'Gemini';
+}
+function aiBillingHint(){
+  return aiProvider()==='openai'
+    ? 'saldo, límites o facturación en platform.openai.com'
+    : 'créditos, cuota o facturación en Google AI Studio';
+}
+
+const OPENAI_BASE_URL=String(process.env.OPENAI_BASE_URL||'https://api.openai.com/v1').replace(/\/$/,'');
+// OpenAI acepta jpeg/png/webp/gif; HEIC se descarta.
+const OPENAI_IMAGE_TYPES=new Set(['image/jpeg','image/png','image/webp','image/gif']);
+
+function openaiInputFromParts(parts){
+  const content=[];
+  for(const p of parts||[]){
+    if(typeof p?.text==='string'){
+      content.push({type:'input_text',text:p.text});
+    }else if(p?.inline_data?.data){
+      const type=String(p.inline_data.mime_type||'image/jpeg').toLowerCase();
+      if(!OPENAI_IMAGE_TYPES.has(type))continue;
+      content.push({
+        type:'input_image',
+        image_url:`data:${type};base64,${p.inline_data.data}`,
+        detail:process.env.OPENAI_IMAGE_DETAIL||'auto'
+      });
+    }
+  }
+  return [{role:'user',content}];
+}
+
+function openaiOutputText(body){
+  if(typeof body?.output_text==='string')return body.output_text;
+  return (body?.output||[])
+    .filter(x=>x?.type==='message')
+    .flatMap(x=>x.content||[])
+    .filter(c=>c?.type==='output_text')
+    .map(c=>c.text||'')
+    .join('');
+}
+
+function openaiWebEvidence(body){
+  const sources=[];
+  const queries=[];
+  for(const item of body?.output||[]){
+    if(item?.type==='web_search_call'){
+      const action=item.action||{};
+      if(action.query)queries.push(action.query);
+      if(Array.isArray(action.queries))queries.push(...action.queries);
+      for(const s of action.sources||[]){
+        if(s?.url)sources.push({title:s.title||'',url:s.url});
+      }
+    }
+    if(item?.type==='message'){
+      for(const c of item.content||[]){
+        for(const a of c?.annotations||[]){
+          if(a?.type==='url_citation'&&a.url)sources.push({title:a.title||'',url:a.url});
+        }
+      }
+    }
+  }
+  const seen=new Set();
+  return {
+    groundingSources:sources.filter(s=>!seen.has(s.url)&&seen.add(s.url)),
+    webSearchQueries:[...new Set(queries.filter(Boolean))]
+  };
+}
+
+function openaiMarketSearchDomains(){
+  return [...new Set([
+    ...TRUSTED_LUXURY_MARKET_DOMAINS,
+    ...SECONDARY_LUXURY_MARKET_DOMAINS,
+    ...EUROPE_PRIORITY_LUXURY_MARKET_DOMAINS
+  ])].slice(0,100);
+}
+
+async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true}){
+  const payload={
+    model,
+    input:openaiInputFromParts(parts)
+  };
+  if(webSearch){
+    // Mismo papel que el Google Search de Gemini, pero limitado desde el
+    // origen a las webs de reventa de lujo de confianza.
+    payload.tools=[{
+      type:'web_search',
+      filters:{allowed_domains:openaiMarketSearchDomains()}
+    }];
+    payload.tool_choice='required';
+    payload.include=['web_search_call.action.sources'];
+  }else if(json){
+    payload.text={format:{type:'json_object'}};
+  }
+  const timeoutMs=GEMINI_HTTP_TIMEOUT_MS;
+  const controller=timeoutMs>0?new AbortController():null;
+  const timer=controller?setTimeout(()=>controller.abort(),timeoutMs):null;
+  try{
+    const r=await fetch(`${OPENAI_BASE_URL}/responses`,{
+      method:'POST',
+      headers:{
+        'content-type':'application/json',
+        authorization:`Bearer ${key}`
+      },
+      body:JSON.stringify(payload),
+      ...(controller?{signal:controller.signal}:{})
+    });
+    const text=await r.text();
+    let body={};
+    if(text){
+      try{body=JSON.parse(text);}catch{body={message:text.slice(0,2000)};}
+    }
+    if(!r.ok){
+      const err=geminiHttpError(body,r.status);
+      const code=String(body?.error?.code||body?.error?.type||'');
+      if(/insufficient_quota|billing|rate_limit/i.test(code))err.geminiCapacity=true;
+      throw err;
+    }
+    return body;
+  }catch(e){
+    if(e?.name==='AbortError'){
+      const err=new Error(`OpenAI timeout after ${timeoutMs}ms`);
+      err.code='AI_TIMEOUT';
+      throw err;
+    }
+    throw e;
+  }finally{
+    if(timer)clearTimeout(timer);
+  }
+}
+
 async function generateQueryPlanWithGemini(product) {
-  const key = process.env.GEMINI_API_KEY;
+  const key = aiApiKey();
   if (!key) return null;
-  const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  const model = aiModel();
+  if(aiProvider()==='openai'){
+    const prompt=`You generate marketplace search queries for second-hand luxury goods. Return ONLY JSON with keys xianyu, bunjang, japan. Each value MUST contain exactly 2 concise search strings. Query 1 MUST be the natural local-language marketplace query: Simplified Chinese for Xianyu, Korean for Bunjang, Japanese for Japan. Query 2 MUST be the Western/original product name. Keep the exact product family; do not broaden to unrelated models. Product: ${product}`;
+    try{
+      const body=await openaiResponsesRequest({key,model:aiTriageModel(),parts:[{text:prompt}]});
+      return JSON.parse(openaiOutputText(body));
+    }catch{return null;}
+  }
   const prompt = `You generate marketplace search queries for second-hand luxury goods. Return ONLY JSON with keys xianyu, bunjang, japan. Each value MUST contain exactly 2 concise search strings. Query 1 MUST be the natural local-language marketplace query: Simplified Chinese for Xianyu, Korean for Bunjang, Japanese for Japan. Query 2 MUST be the Western/original product name. Keep the exact product family; do not broaden to unrelated models. Product: ${product}`;
   const u = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
   const {r,body}=await geminiFetchJson(
@@ -2761,6 +2924,14 @@ async function fetchGeminiImageParts(item,max=4){
   return parts;
 }
 async function repairGeminiJson({key,model,rawText,parseError}){
+  if(aiProvider()==='openai'){
+    const body=await openaiResponsesRequest({
+      key,
+      model:aiTriageModel(),
+      parts:[{text:`Convert the model response below into ONE valid JSON object. Return JSON only. Preserve the meaning and values already present. Do not invent new facts, prices, URLs, model details or market evidence. Repair JSON syntax only.\n\nORIGINAL PARSE ERROR:\n${parseError||'invalid JSON'}\n\nMODEL RESPONSE:\n${String(rawText||'').slice(0,60000)}`}]
+    });
+    return parseJsonLoose(openaiOutputText(body));
+  }
   const u=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
   const repairPrompt=`Convert the model response below into ONE valid JSON object.
 
@@ -2804,6 +2975,25 @@ ${String(rawText||'').slice(0,60000)}`;
 }
 
 async function geminiJsonRequest({key,model,parts,googleSearch=false}){
+  if(aiProvider()==='openai'){
+    let body=await openaiResponsesRequest({key,model,parts,webSearch:googleSearch});
+    let rawText=openaiOutputText(body);
+    if(googleSearch&&!rawText.trim()){
+      body=await openaiResponsesRequest({key,model,parts,webSearch:true});
+      rawText=openaiOutputText(body);
+    }
+    if(googleSearch&&!rawText.trim())throw new Error('OpenAI web search devolvió una respuesta vacía');
+    const {groundingSources,webSearchQueries}=openaiWebEvidence(body);
+    let data;
+    let jsonRepairUsed=false;
+    try{
+      data=parseJsonLoose(rawText);
+    }catch(e){
+      data=await repairGeminiJson({key,model,rawText,parseError:e?.message||String(e)});
+      jsonRepairUsed=true;
+    }
+    return {data,groundingSources,webSearchQueries,jsonRepairUsed,usage:body?.usage||null};
+  }
   const u=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
   const payload={contents:[{role:'user',parts}]};
 
@@ -4060,7 +4250,7 @@ async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
   const prompt=`You are the LIVE MARKET COMPARABLES researcher for Luxury Hunter.
 Current date: ${new Date().toISOString().slice(0,10)}.
 
-You MUST use Google Search grounding. Research the exact visually identified handbag variant below, not merely the broad model family.
+You MUST use live web search grounding. Research the exact visually identified handbag variant below, not merely the broad model family.
 
 EXACT VISUAL IDENTIFICATION:
 ${JSON.stringify(exact)}
@@ -5612,9 +5802,9 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
     'Cargando datos del anuncio'
   );
 
-  const key=process.env.GEMINI_API_KEY;
-  if(!key)throw new Error('GEMINI_API_KEY is empty in .env');
-  const model=process.env.GEMINI_MODEL||'gemini-3.8-flash';
+  const key=aiApiKey();
+  if(!key)throw new Error(`${aiProvider()==='openai'?'OPENAI_API_KEY':'GEMINI_API_KEY'} is empty in .env`);
+  const model=aiModel();
   const item=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
   if(!item)throw new Error('Listing not found');
   const task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
@@ -5951,7 +6141,7 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
       bunjang:{enabled:sources.includes('bunjang'),binary:bunjangCli,queriesExecuted:bQueries,calls:bunjangCalls},
       japan:{enabled:sources.includes('buyee'),provider:'Japan multi-source radar v2',queriesExecuted:jQueries,calls:japanCalls}
     },
-    ai:{enabled:task.decision_mode==='ai',configured:!!process.env.GEMINI_API_KEY,model:process.env.GEMINI_MODEL||'gemini-3.8-flash',analyzeImages:!!task.analyze_images,centralInstruction:CENTRAL_AI_INSTRUCTION,userCriteria:task.description||'',keywordRules:task.keyword_rules||[],positiveVerification:{mandatory:true,stages:['preliminary-screen','exact-visual-model-check','live-google-market-comparables','deterministic-final-decision'],prioritySources:['Vestiaire Collective','Collector Square','EU specialist resellers','The RealReal','Fashionphile','Rebag'],strongBuyMinimum:{modelConfidence:0.85,relevantComparables:3,independentSources:2,marketConfidence:'HIGH'},marketplaceAuthenticitySignal:{enabled:true,xianyu:'Xianyu Verification / 验货宝',bunjang:'Bunjang Care / 번개케어',scores:{AVAILABLE:4,PASSED:8,UNKNOWN:0,UNAVAILABLE:0},failed:'REJECT',sellerAuthenticityClaimIsNotPassed:true}}},
+    ai:{enabled:task.decision_mode==='ai',provider:aiProvider(),configured:aiConfigured(),model:aiModel(),triageModel:aiTriageModel(),analyzeImages:!!task.analyze_images,centralInstruction:CENTRAL_AI_INSTRUCTION,userCriteria:task.description||'',keywordRules:task.keyword_rules||[],positiveVerification:{mandatory:true,stages:['preliminary-screen','exact-visual-model-check','live-google-market-comparables','deterministic-final-decision'],prioritySources:['Vestiaire Collective','Collector Square','EU specialist resellers','The RealReal','Fashionphile','Rebag'],strongBuyMinimum:{modelConfidence:0.85,relevantComparables:3,independentSources:2,marketConfidence:'HIGH'},marketplaceAuthenticitySignal:{enabled:true,xianyu:'Xianyu Verification / 验货宝',bunjang:'Bunjang Care / 번개케어',scores:{AVAILABLE:4,PASSED:8,UNKNOWN:0,UNAVAILABLE:0},failed:'REJECT',sellerAuthenticityClaimIsNotPassed:true}}},
     economics:getEconomics(),
     schedule:{mode:task.interval_minutes?'interval':task.cron?'cron':'manual',intervalMinutes:task.interval_minutes||null,cron:task.cron||null,runIfMissed:task.run_if_missed!==false},
     email:{enabled:!!task.email_enabled,to:task.email_to||null,decisions:task.notify_decisions||[],minScore:task.notify_min_score??null,minProfitEur:task.notify_min_profit_eur??null,maxItems:task.notify_max_items??8,onlyNew:task.notify_only_new!==false},
@@ -6255,7 +6445,8 @@ function enforceFreshPublicationWindow(sessionId,hours=24){
     SELECT
       l.id,
       l.source,
-      l.raw_json
+      l.raw_json,
+      l.first_seen
     FROM search_session_items ssi
     JOIN listings l
       ON l.id=ssi.listing_id
@@ -6276,6 +6467,7 @@ function enforceFreshPublicationWindow(sessionId,hours=24){
     kept:0,
     stale:0,
     unknown:0,
+    unknownKeptNew:0,
     future:0,
     removed:0,
     bySource:{}
@@ -6289,6 +6481,7 @@ function enforceFreshPublicationWindow(sessionId,hours=24){
         kept:0,
         stale:0,
         unknown:0,
+        unknownKeptNew:0,
         future:0
       };
     }
@@ -6297,7 +6490,15 @@ function enforceFreshPublicationWindow(sessionId,hours=24){
     let reason=null;
 
     if(publishedMs===null){
-      reason='unknown';
+      // Sin fecha de publicación (Komehyo, Rakuma...): si Luxury Hunter
+      // lo vio por primera vez dentro de la ventana, es nuevo para nosotros.
+      const firstSeenMs=Date.parse(row.first_seen||'');
+      if(Number.isFinite(firstSeenMs)&&now-firstSeenMs<=maxAge){
+        stats.unknownKeptNew++;
+        stats.bySource[source].unknownKeptNew++;
+      }else{
+        reason='unknown';
+      }
     }else if(publishedMs>now+futureSlack){
       reason='future';
     }else if(now-publishedMs>maxAge){
@@ -6472,6 +6673,374 @@ function abortedResult(runId,sessionId=null){
   }
   return {runId:Number(runId),sessionId,status:'aborted'};
 }
+// ── OPPORTUNITY SPEED V1 ────────────────────────────────────────────────
+// Pre-filtro determinista, prioridad por precio relativo, avisos
+// instantáneos (email + Telegram) y alertas de salud del sistema.
+
+// Solo se mira el TÍTULO: en las descripciones son habituales garantías
+// como "가품시 환불" o "假一赔十" que no indican réplica.
+const PRESCREEN_COUNTERFEIT_TERMS=[
+  'replica','réplica','super copy','supercopy','mirror quality','fake bag',
+  '레플','레플리카','미러급','이미테이션','짝퉁',
+  '高仿','复刻','精仿','超a','a货','莆田',
+  'レプリカ','スーパーコピー','ノベルティ','novelty'
+];
+const PRESCREEN_ACCESSORY_ONLY_TERMS=[
+  'dust bag only','box only','strap only',
+  '더스트백만','보증서만','박스만',
+  '保存袋のみ','箱のみ','ストラップのみ','空箱',
+  '只有防尘袋','仅防尘袋','空盒'
+];
+
+function deterministicPrescreen(item){
+  const title=String(item?.title||'').toLowerCase();
+  const counterfeit=PRESCREEN_COUNTERFEIT_TERMS.find(t=>title.includes(t));
+  if(counterfeit){
+    return {
+      code:'counterfeit_title',
+      term:counterfeit,
+      reasons:[`El título contiene "${counterfeit}", término asociado a réplica o artículo no original.`]
+    };
+  }
+  const accessory=PRESCREEN_ACCESSORY_ONLY_TERMS.find(t=>title.includes(t));
+  if(accessory){
+    return {
+      code:'accessory_only',
+      term:accessory,
+      reasons:[`El título indica que solo se vende un accesorio ("${accessory}"), no el bolso.`]
+    };
+  }
+  return null;
+}
+
+function storePrescreenReject(taskId,item,pre){
+  const now=new Date().toISOString();
+  const economics=importEconomics(item);
+  const a={
+    brand:'',model:'',authenticity_risk:pre.code==='counterfeit_title'?'HIGH':'',liquidity:'',
+    decision:'REJECT',opportunity_score:0,
+    landed_cost_eur:economics.importedTotalEur,
+    decision_reasons_es:pre.reasons,
+    notes:`Descartado por pre-filtro determinista (${pre.code}: ${pre.term}) sin llamar a Gemini.`,
+    prescreen:pre
+  };
+  storeTaskAnalysis(taskId,item,a,'REJECT',{status:'not_required',prescreen:pre},now);
+}
+
+// Mediana del precio pedido en los anuncios que esta tarea ha visto en los
+// últimos 30 días. Sirve para analizar primero lo que está más barato.
+function taskMedianAskingEur(taskId){
+  const since=new Date(Date.now()-30*24*3600*1000).toISOString();
+  const rows=db.prepare(`
+    SELECT DISTINCT l.id,l.price_eur
+    FROM search_sessions s
+    JOIN search_session_items ssi ON ssi.session_id=s.id
+    JOIN listings l ON l.id=ssi.listing_id
+    WHERE s.task_id=? AND s.started_at>=? AND l.price_eur>0
+  `).all(Number(taskId),since);
+  if(rows.length<8)return null;
+  const values=rows.map(r=>Number(r.price_eur)).sort((a,b)=>a-b);
+  return percentile(values,0.5);
+}
+
+function prioritizeForAnalysis(taskId,items){
+  const median=taskMedianAskingEur(taskId);
+  const ranked=items.map(item=>{
+    const price=Number(item.price_eur);
+    const ratio=median&&price>0?price/median:null;
+    return {item,ratio};
+  });
+  ranked.sort((a,b)=>
+    Number(!!b.item._needsVerification)-Number(!!a.item._needsVerification) ||
+    (a.ratio??9)-(b.ratio??9)
+  );
+  return {median,items:ranked.map(r=>{
+    r.item._priceVsTaskMedian=r.ratio;
+    return r.item;
+  })};
+}
+
+// Triaje barato: UNA llamada de solo texto con el modelo económico revisa
+// todos los anuncios nuevos de la ejecución y elige cuáles merecen el
+// análisis completo (fotos + modelo exacto + mercado), que es lo caro.
+async function triageWithAi(task,items){
+  const key=aiApiKey();
+  const model=aiTriageModel();
+  const minScore=Number(process.env.AI_TRIAGE_MIN_SCORE||60);
+  const scores=new Map();
+  let calls=0;
+  let usage=null;
+  for(const batch of chunks(items,40)){
+    const lines=batch.map((x,i)=>({
+      i,
+      source:x.source,
+      title:String(x.title||'').slice(0,180),
+      description:String(x.description||'').replace(/\s+/g,' ').slice(0,260),
+      price_eur:x.price_eur!=null?Math.round(Number(x.price_eur)):null,
+      landed_cost_eur:Math.round(Number(importEconomics(x).importedTotalEur)||0)||null,
+      price_vs_task_median:Number.isFinite(x._priceVsTaskMedian)?Number(x._priceVsTaskMedian.toFixed(2)):null
+    }));
+    const prompt=`You are the cheap first-pass triage for Luxury Hunter, a buyer of second-hand luxury handbags in Asia for resale in Western Europe. Only a few listings can receive the expensive full analysis, so select ONLY those with a realistic chance of being a profitable, authentic, exact-target purchase.
+
+TASK: ${task.task_name}
+TARGET PRODUCT: ${task.product_query}
+TASK CRITERIA (abridged):
+${String(task.description||'').slice(0,1800)}
+
+Score each listing 0-100 for "worth a full analysis":
+- High: clearly the target product family/size, price well below typical European resale after the landed cost, no red flags.
+- Low: different model/size/product type (wallets, pouches, charms, straps, other bags), accessories only, replica wording, damaged beyond resale, price already near or above European resale, or too little information to identify the item.
+- price_vs_task_median < 1 means cheaper than the median asking price seen for this task (a positive signal, not proof).
+Never invent facts. Use only the listing text below (titles may be Korean, Japanese or Chinese).
+
+LISTINGS (JSON):
+${JSON.stringify(lines)}
+
+Return ONLY JSON: {"items":[{"i":0,"score":0,"reason_es":"motivo breve en español"}]} with one entry per listing.`;
+    const {data,usage:u}=await geminiJsonRequest({key,model,parts:[{text:prompt}],googleSearch:false});
+    calls++;
+    usage=u||usage;
+    for(const row of Array.isArray(data?.items)?data.items:[]){
+      const item=batch[Number(row?.i)];
+      if(!item)continue;
+      scores.set(item.id,{
+        score:clampNum(row.score),
+        reason:String(row.reason_es||'').slice(0,300)
+      });
+    }
+  }
+  return {scores,minScore,calls,model,usage};
+}
+
+function storeTriageReject(taskId,item,t){
+  const now=new Date().toISOString();
+  const economics=importEconomics(item);
+  const a={
+    brand:'',model:'',authenticity_risk:'',liquidity:'',
+    decision:'REJECT',opportunity_score:t.score,
+    landed_cost_eur:economics.importedTotalEur,
+    decision_reasons_es:[`Triaje IA (${t.score}/100): ${t.reason||'poco interés para un análisis completo.'}`],
+    notes:`Descartado en el triaje barato (${aiTriageModel()}) sin análisis completo.`,
+    triage:t
+  };
+  storeTaskAnalysis(taskId,item,a,'TRIAGE',{status:'not_required',triage:t},now);
+}
+
+function envList(name,fallback){
+  const raw=String(process.env[name]||'').trim();
+  return (raw?raw.split(','):fallback).map(s=>s.trim().toUpperCase()).filter(Boolean);
+}
+
+function alertRecipient(){
+  return String(
+    process.env.GLOBAL_EMAIL_TO||
+    globalEmailSetting().to||
+    process.env.SMTP_USER||
+    ''
+  ).trim();
+}
+
+function telegramConfigured(){
+  return !!(process.env.TELEGRAM_BOT_TOKEN&&process.env.TELEGRAM_CHAT_ID);
+}
+
+async function telegramSend(text,photoUrl=null){
+  if(!telegramConfigured())return {sent:false,reason:'telegram-not-configured'};
+  const base=`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+  const chat_id=process.env.TELEGRAM_CHAT_ID;
+  const post=async(method,body)=>{
+    const r=await fetch(`${base}/${method}`,{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({chat_id,...body}),
+      signal:AbortSignal.timeout(20000)
+    });
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok||data.ok===false)throw new Error(`Telegram ${method}: ${data.description||r.status}`);
+    return data;
+  };
+  if(photoUrl){
+    try{
+      await post('sendPhoto',{photo:photoUrl,caption:text.slice(0,1024),parse_mode:'HTML'});
+      return {sent:true};
+    }catch(e){
+      console.error('Telegram photo failed, sending text:',e.message);
+    }
+  }
+  await post('sendMessage',{text:text.slice(0,4096),parse_mode:'HTML',disable_web_page_preview:false});
+  return {sent:true};
+}
+
+function eur0(n){
+  return n==null||!Number.isFinite(Number(n))?'—':`${Math.round(Number(n))} €`;
+}
+
+function instantAlertText(x){
+  const profit=x.net_profit_low_eur!=null||x.net_profit_high_eur!=null
+    ? `${eur0(x.net_profit_low_eur)} – ${eur0(x.net_profit_high_eur)}`
+    : '—';
+  const resale=`${eur0(x.resale_low_eur)} – ${eur0(x.resale_high_eur)}`;
+  const pct=Number.isFinite(x._priceVsTaskMedian)?Math.round((1-x._priceVsTaskMedian)*100):null;
+  const vsMedian=pct===null
+    ? ''
+    : pct>0
+      ? `\n📉 ${pct}% por debajo del precio mediano de esta tarea`
+      : `\nPrecio ${Math.abs(pct)}% por encima de la mediana de esta tarea`;
+  return [
+    `🔥 <b>${htmlEsc(x.decision)}</b> · ${htmlEsc(x._task_name||'')}`,
+    `<b>${htmlEsc(x.model||x.title||'')}</b>`,
+    `${htmlEsc(x.source)} · precio ${eur0(x.price_eur)} · coste importado ${eur0(x.landed_cost_eur)}`,
+    `Reventa ${resale}`,
+    `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
+    x.url?`<a href="${htmlEsc(x.url)}">Abrir anuncio</a>`:''
+  ].filter(Boolean).join('\n');
+}
+
+async function sendInstantAlerts(task,runId,items){
+  if(['0','false','off','no'].includes(String(process.env.INSTANT_ALERTS||'').toLowerCase())){
+    return {sent:0,reason:'disabled'};
+  }
+  const decisions=envList('INSTANT_ALERT_DECISIONS',['STRONG BUY','BUY']);
+  const minProfit=process.env.INSTANT_ALERT_MIN_PROFIT_EUR!=null&&process.env.INSTANT_ALERT_MIN_PROFIT_EUR!==''
+    ? Number(process.env.INSTANT_ALERT_MIN_PROFIT_EUR)
+    : null;
+  const alreadyAlerted=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind='instant' LIMIT 1`);
+  const fresh=(items||[]).filter(x=>{
+    if(!decisions.includes(String(x.decision||'').toUpperCase()))return false;
+    if(minProfit!=null&&Number.isFinite(minProfit)&&!(Number(x.net_profit_low_eur)>=minProfit))return false;
+    return !alreadyAlerted.get(Number(x.id));
+  }).map(x=>({...x,_task_name:task.task_name,_task_id:task.id,_run_id:runId}));
+  if(!fresh.length)return {sent:0};
+
+  const rank={'STRONG BUY':0,'BUY':1,'WATCH':2};
+  fresh.sort((a,b)=>
+    (rank[String(a.decision).toUpperCase()]??9)-(rank[String(b.decision).toUpperCase()]??9) ||
+    Number(b.net_profit_low_eur??-1e9)-Number(a.net_profit_low_eur??-1e9)
+  );
+
+  const channels=[];
+  const errors=[];
+  const recipient=alertRecipient();
+  if(smtpConfig().configured&&recipient){
+    try{
+      const top=fresh[0];
+      const subject=`🔥 ${top.decision} · ${top.model||task.task_name} · ${eur0(top.net_profit_low_eur)} beneficio${fresh.length>1?` (+${fresh.length-1} más)`:''}`;
+      const html=`
+        <div style="font-family:Arial,sans-serif;color:#111827;max-width:1000px;margin:auto">
+          <h2 style="margin-bottom:4px">Aviso inmediato · ${htmlEsc(task.task_name)}</h2>
+          <p style="color:#6b7280;margin-top:0">Detectado ahora mismo por Luxury Hunter. Revisa el anuncio y la autenticación antes de comprar.</p>
+          <table style="width:100%;border-collapse:collapse">
+            <tbody>${fresh.map((x,i)=>globalEmailOpportunityRow(x,i+1)).join('')}</tbody>
+          </table>
+        </div>`;
+      const {transport,config:mailConfig}=getMailTransport();
+      await transport.sendMail({
+        from:mailConfig.from,
+        to:recipient,
+        subject,
+        html,
+        text:fresh.map(x=>
+          instantAlertText(x)
+            .replace(/<a href="([^"]+)">[^<]*<\/a>/g,(m,href)=>href.replace(/&amp;/g,'&'))
+            .replace(/<[^>]+>/g,'')
+        ).join('\n\n')
+      });
+      channels.push('email');
+    }catch(e){
+      errors.push(`email: ${e.message}`);
+    }
+  }
+  if(telegramConfigured()){
+    try{
+      for(const x of fresh){
+        await telegramSend(instantAlertText(x),x.image_url||null);
+      }
+      channels.push('telegram');
+    }catch(e){
+      errors.push(`telegram: ${e.message}`);
+    }
+  }
+  if(!channels.length){
+    if(errors.length)console.error('Instant alerts failed:',errors.join(' | '));
+    return {sent:0,errors,reason:errors.length?'error':'no-channel-configured'};
+  }
+
+  const now=new Date().toISOString();
+  const mark=db.prepare(`
+    INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at)
+    VALUES(?,?,?,'instant',?,?)
+  `);
+  for(const x of fresh)mark.run(Number(task.id),Number(x.id),Number(runId)||null,channels.join('+'),now);
+  console.log(`Task ${task.id}: aviso inmediato enviado (${channels.join('+')}) para ${fresh.length} oportunidad(es).`);
+  return {sent:fresh.length,channels,errors};
+}
+
+const HEALTH_ALERT_COOLDOWN_HOURS={
+  'gemini-capacity':6,
+  default:24
+};
+
+async function reportHealthIssue(key,message){
+  const state=getSetting('health_alerts',{})||{};
+  const now=new Date();
+  const entry=state[key]||{first_at:now.toISOString(),count:0,last_sent_at:null};
+  entry.count=Number(entry.count||0)+1;
+  entry.last_seen_at=now.toISOString();
+  entry.message=String(message||'').slice(0,500);
+  const cooldownMs=(HEALTH_ALERT_COOLDOWN_HOURS[key]??HEALTH_ALERT_COOLDOWN_HOURS.default)*3600*1000;
+  const lastSent=Date.parse(entry.last_sent_at||'');
+  const due=!Number.isFinite(lastSent)||now.getTime()-lastSent>=cooldownMs;
+  if(due){
+    const since=new Date(entry.first_at).toLocaleString('es-ES',{timeZone:'Europe/Madrid'});
+    const text=`⚠️ Luxury Hunter: problema "${key}"\nDesde: ${since} · ${entry.count} fallo(s)\n${entry.message}`;
+    let sent=false;
+    const recipient=alertRecipient();
+    if(smtpConfig().configured&&recipient){
+      try{
+        const {transport,config:mailConfig}=getMailTransport();
+        await transport.sendMail({
+          from:mailConfig.from,
+          to:recipient,
+          subject:`⚠️ Luxury Hunter necesita atención: ${key}`,
+          text,
+          html:`<div style="font-family:Arial,sans-serif"><h2 style="color:#b91c1c">Luxury Hunter necesita atención</h2>
+            <p><b>Problema:</b> ${htmlEsc(key)}<br><b>Desde:</b> ${htmlEsc(since)}<br><b>Fallos acumulados:</b> ${entry.count}</p>
+            <pre style="white-space:pre-wrap;background:#fef2f2;padding:12px;border-radius:6px">${htmlEsc(entry.message)}</pre>
+            <p style="color:#6b7280">Mientras esto no se resuelva, el bot puede no estar detectando oportunidades.</p></div>`
+        });
+        sent=true;
+      }catch(e){console.error('Health alert email failed:',e.message);}
+    }
+    if(telegramConfigured()){
+      try{await telegramSend(htmlEsc(text));sent=true;}catch(e){console.error('Health alert telegram failed:',e.message);}
+    }
+    if(sent)entry.last_sent_at=now.toISOString();
+  }
+  state[key]=entry;
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('health_alerts',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+    .run(JSON.stringify(state),now.toISOString());
+}
+
+function clearHealthIssue(key){
+  const state=getSetting('health_alerts',{})||{};
+  if(!state[key])return;
+  delete state[key];
+  db.prepare(`UPDATE app_settings SET value_json=?,updated_at=? WHERE key='health_alerts'`)
+    .run(JSON.stringify(state),new Date().toISOString());
+}
+
+async function reportRunHealth(status){
+  for(const [src,s] of Object.entries(status||{})){
+    if(['freshness','aiAnalysis','email','instantAlerts','prescreen'].includes(src))continue;
+    if(s&&s.ok===false){
+      await reportHealthIssue(`source-${src}`,`La fuente ${src} falla: ${s.error||s.warning||'sin detalle'}`);
+    }else if(s&&s.ok===true){
+      clearHealthIssue(`source-${src}`);
+    }
+  }
+}
+
 async function executeTask(taskId, runId=null) {
   if(runId && runIsAborted(runId)){
     return abortedResult(runId);
@@ -6545,6 +7114,7 @@ async function executeTask(taskId, runId=null) {
         `kept=${freshnessWindow.kept}, `+
         `stale=${freshnessWindow.stale}, `+
         `unknown=${freshnessWindow.unknown}, `+
+        `unknownKeptNew=${freshnessWindow.unknownKeptNew}, `+
         `future=${freshnessWindow.future}`
       );
     }else{
@@ -6618,14 +7188,26 @@ async function executeTask(taskId, runId=null) {
         if(runIsAborted(runId)){
           return abortedResult(runId,result.sessionId);
         }if(!matchesKeywordRules(item,task.keyword_rules)) db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);}
-    } else if(process.env.GEMINI_API_KEY){
+    } else if(aiConfigured()){
       const items=sessionListings(result.sessionId);
-      const pendingItems=[];
+      let pendingItems=[];
+      let capacityErrorFromTriage=null;
+      const prescreenStats={rejected:0,byCode:{}};
 
       for(const item of items){
         const existingAnalysis=db.prepare(
           'SELECT decision,verification_json FROM task_analyses WHERE task_id=? AND listing_id=?'
         ).get(taskId,item.id);
+
+        if(!existingAnalysis){
+          const pre=deterministicPrescreen(item);
+          if(pre){
+            storePrescreenReject(taskId,item,pre);
+            prescreenStats.rejected++;
+            prescreenStats.byCode[pre.code]=(prescreenStats.byCode[pre.code]||0)+1;
+            continue;
+          }
+        }
 
         if(existingAnalysis){
           let verificationStatus='';
@@ -6645,10 +7227,72 @@ async function executeTask(taskId, runId=null) {
             );
 
           if(!needsVerification)continue;
+          item._needsVerification=true;
         }
 
         pendingItems.push(item);
       }
+
+      result.status.prescreen={ok:true,...prescreenStats};
+      if(prescreenStats.rejected){
+        console.log(`Task ${taskId}: pre-filtro descartó ${prescreenStats.rejected} anuncios sin usar Gemini.`);
+      }
+
+      // Lo más barato respecto a la mediana de la tarea se analiza primero,
+      // así una buena oferta no espera detrás de anuncios caros.
+      const prioritized=prioritizeForAnalysis(taskId,pendingItems);
+      pendingItems=prioritized.items;
+
+      // Triaje barato antes del análisis completo (desactivable con AI_TRIAGE=0).
+      const triageEnabled=!['0','false','off','no'].includes(String(process.env.AI_TRIAGE||'').toLowerCase());
+      const toTriage=pendingItems.filter(x=>!x._needsVerification);
+      if(triageEnabled&&toTriage.length){
+        setTaskRunProgress(runId,32,'Triaje IA',`${toTriage.length} anuncios nuevos · ${aiTriageModel()}`);
+        try{
+          const triage=await triageWithAi(task,toTriage);
+          let kept=0,rejected=0,unscored=0;
+          const keep=new Set();
+          for(const item of toTriage){
+            const t=triage.scores.get(item.id);
+            if(!t){unscored++;keep.add(item.id);continue;}
+            item._triageScore=t.score;
+            if(t.score>=triage.minScore){kept++;keep.add(item.id);}
+            else{
+              rejected++;
+              storeTriageReject(taskId,item,t);
+              db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);
+            }
+          }
+          pendingItems=pendingItems.filter(x=>x._needsVerification||keep.has(x.id));
+          // Dentro de lo que pasa el triaje, primero la mejor puntuación.
+          pendingItems.sort((a,b)=>
+            Number(!!b._needsVerification)-Number(!!a._needsVerification) ||
+            (b._triageScore??-1)-(a._triageScore??-1) ||
+            (a._priceVsTaskMedian??9)-(b._priceVsTaskMedian??9)
+          );
+          result.status.triage={ok:true,model:triage.model,calls:triage.calls,minScore:triage.minScore,kept,rejected,unscored,usage:triage.usage};
+          console.log(`Task ${taskId}: triaje ${triage.model} -> ${kept} pasan, ${rejected} descartados, ${unscored} sin puntuar.`);
+        }catch(e){
+          if(e?.geminiCapacity===true){
+            capacityErrorFromTriage=e;
+          }
+          result.status.triage={ok:false,error:e.message};
+          console.error(`Task ${taskId}: triaje falló, se usa solo la prioridad por precio:`,e.message);
+        }
+      }
+
+      const maxAiItems=Number(process.env.AI_MAX_ITEMS_PER_TASK_RUN||5);
+      let deferred=0;
+      if(Number.isFinite(maxAiItems)&&maxAiItems>0&&pendingItems.length>maxAiItems){
+        deferred=pendingItems.length-maxAiItems;
+        for(const item of pendingItems.slice(maxAiItems)){
+          db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);
+        }
+        pendingItems=pendingItems.slice(0,maxAiItems);
+        console.log(`Task ${taskId}: ${deferred} anuncios menos prioritarios aplazados a la siguiente ejecución.`);
+      }
+      result.status.prescreen.medianAskingEur=prioritized.median;
+      result.status.prescreen.deferred=deferred;
 
       const total=pendingItems.length;
 
@@ -6680,8 +7324,9 @@ async function executeTask(taskId, runId=null) {
       let processed=0;
       let succeeded=0;
       let failed=0;
-      let stopRequested=false;
-      let capacityError=null;
+      let capacityError=capacityErrorFromTriage;
+      let stopRequested=!!capacityError;
+      let lastAiError=null;
       let lastReportedProgress=30;
 
       const worker=async()=>{
@@ -6742,6 +7387,7 @@ async function executeTask(taskId, runId=null) {
             await sleep(250);
           }catch(e){
             failed++;
+            lastAiError=String(e?.message||e).slice(0,300);
 
             console.error(
               `AI task ${taskId} listing ${item.id}:`,
@@ -6750,7 +7396,7 @@ async function executeTask(taskId, runId=null) {
 
             if(
               e?.geminiCapacity===true ||
-              /spending cap|quota|resource[_ -]?exhausted|rate limit|billing|exceeded.*cap/i
+              /spending cap|quota|resource[_ -]?exhausted|rate limit|billing|credits|exceeded.*cap/i
                 .test(String(e?.message||''))
             ){
               capacityError=e;
@@ -6781,7 +7427,7 @@ async function executeTask(taskId, runId=null) {
         }
       };
 
-      if(total){
+      if(total&&!stopRequested){
         const activeWorkers=Math.min(
           concurrency,
           total
@@ -6800,8 +7446,19 @@ async function executeTask(taskId, runId=null) {
         );
       }
 
+      const allAiFailed=total>0&&succeeded===0&&failed>0;
+      if(allAiFailed&&!capacityError){
+        await reportHealthIssue(
+          'gemini-errors',
+          `Ningún análisis de ${aiProviderLabel()} ha funcionado en "${task.task_name}" (${failed}/${total} fallidos). `+
+          `Último error: ${lastAiError||'desconocido'}`
+        ).catch(e=>console.error('Health alert failed:',e.message));
+      }else if(succeeded){
+        clearHealthIssue('gemini-errors');
+      }
+
       result.status.aiAnalysis={
-        ok:!capacityError,
+        ok:!capacityError&&!allAiFailed,
         state:capacityError?'blocked':'finished',
         processed,
         succeeded,
@@ -6815,7 +7472,7 @@ async function executeTask(taskId, runId=null) {
 
       if(capacityError){
         console.error(
-          `AI task ${taskId}: Gemini bloqueado por cuota/capacidad; `+
+          `AI task ${taskId}: ${aiProviderLabel()} bloqueado por cuota/capacidad; `+
           `se detiene el análisis restante de esta tarea.`
         );
 
@@ -6832,8 +7489,15 @@ async function executeTask(taskId, runId=null) {
             : new Error(String(capacityError));
 
         blockedError.geminiCapacity=true;
+        await reportHealthIssue(
+          'gemini-capacity',
+          `${aiProviderLabel()} no puede analizar anuncios (${blockedError.message}). `+
+          `Los anuncios se siguen descargando pero NINGUNO se evalúa ni se avisa hasta que se resuelva (${aiBillingHint()}).`
+        ).catch(e=>console.error('Health alert failed:',e.message));
+        await reportRunHealth(result.status).catch(()=>{});
         throw blockedError;
       }
+      if(succeeded)clearHealthIssue('gemini-capacity');
 
     }
     if(runIsAborted(runId)){
@@ -6847,6 +7511,19 @@ async function executeTask(taskId, runId=null) {
       'Preparando resultados',
       `${finalItems.length} anuncios en la ejecución`
     );
+
+    try{
+      const median=taskMedianAskingEur(taskId);
+      const withRatio=finalItems.map(x=>({
+        ...x,
+        _priceVsTaskMedian:median&&Number(x.price_eur)>0?Number(x.price_eur)/median:null
+      }));
+      result.status.instantAlerts=await sendInstantAlerts(task,Number(runId),withRatio);
+    }catch(e){
+      result.status.instantAlerts={sent:0,error:e.message};
+      console.error(`Instant alerts task ${taskId}:`,e.message);
+    }
+    await reportRunHealth(result.status).catch(e=>console.error('Run health:',e.message));
 
     let emailResult=null;
 
@@ -8095,7 +8772,12 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
   if(!recipient)return {sent:false,reason:'missing-recipient'};
 
   const now=new Date();
-  const intervalMinutes=Math.max(60,Number(setting.digest_interval_minutes||180));
+  // Por defecto un informe al día (DIGEST_SCHEDULE=daily) a partir de
+  // DIGEST_DAILY_HOUR en la zona horaria configurada. DIGEST_SCHEDULE=interval
+  // recupera el comportamiento anterior (cada digest_interval_minutes).
+  const daily=String(process.env.DIGEST_SCHEDULE||setting.schedule||'daily').toLowerCase()!=='interval';
+  const timezone=setting.timezone||'Europe/Madrid';
+  const intervalMinutes=daily?1440:Math.max(60,Number(setting.digest_interval_minutes||180));
   const intervalMs=intervalMinutes*60000;
   const state=getSetting('global_digest_state',{last_sent_at:null});
   const anchorRaw=state?.last_sent_at||setting.started_at||new Date(now.getTime()-intervalMs).toISOString();
@@ -8103,7 +8785,22 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
   const anchor=Number.isFinite(anchorDate.getTime())?anchorDate:new Date(now.getTime()-intervalMs);
   const elapsedMs=now.getTime()-anchor.getTime();
 
-  if(!force && elapsedMs < intervalMs-120000){
+  if(daily&&!force){
+    const dayKey=d=>new Intl.DateTimeFormat('en-CA',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
+    const hourOf=d=>Number(new Intl.DateTimeFormat('en-GB',{timeZone:timezone,hour:'2-digit',hourCycle:'h23'}).format(d));
+    const dailyHour=Number(process.env.DIGEST_DAILY_HOUR??setting.daily_hour??9);
+    const sentToday=!!state?.last_sent_at&&dayKey(new Date(state.last_sent_at))===dayKey(now);
+    if(sentToday||hourOf(now)<dailyHour){
+      return {
+        sent:false,
+        reason:'not-due',
+        schedule:'daily',
+        daily_hour:dailyHour,
+        already_sent_today:sentToday,
+        window_start:anchor.toISOString()
+      };
+    }
+  }else if(!force && elapsedMs < intervalMs-120000){
     return {
       sent:false,
       reason:'not-due',
@@ -8210,21 +8907,40 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
         >
           <b>No ha habido novedades.</b><br>
           No se detectaron STRONG BUY, BUY ni WATCH
-          durante las ultimas 3 horas.
+          durante ${htmlEsc(windowLabel)}.
         </td>
       </tr>`;
 
+  const failedRuns=runs.filter(r=>r.status==='error');
+  const errorCounts=new Map();
+  for(const r of failedRuns){
+    const msg=String(r.error||'Error desconocido').slice(0,220);
+    errorCounts.set(msg,(errorCounts.get(msg)||0)+1);
+  }
+  const healthBanner=failedRuns.length
+    ? `<div style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:16px;border-radius:8px;margin:18px 0">
+        <b>⚠️ ${failedRuns.length} de ${runs.length} ejecuciones han fallado en esta ventana.</b>
+        El bot puede no estar evaluando anuncios, así que "0 oportunidades" no significa que no las haya.<br><br>
+        ${[...errorCounts.entries()].slice(0,3).map(([m,n])=>`• ${htmlEsc(m)} <b>(${n}×)</b>`).join('<br>')}
+      </div>`
+    : '';
+
+  const windowHours=Math.max(1,Math.round(elapsedMs/3600000));
+  const windowLabel=windowHours>=20&&windowHours<=30
+    ? 'las ultimas 24 horas'
+    : `las ultimas ${windowHours} horas`;
   const sendTime=globalDigestMadridLabel(now,setting.timezone||'Europe/Madrid');
   const sendFull=globalDigestMadridFullLabel(now,setting.timezone||'Europe/Madrid');
-  const subject=`${setting.subject_prefix||'Resumen'} - ${sendTime}`;
+  const subject=`${failedRuns.length?'⚠️ ':''}${setting.subject_prefix||'Resumen'}${daily?` diario - ${new Intl.DateTimeFormat('es-ES',{timeZone:timezone,day:'numeric',month:'long'}).format(now)}`:` - ${sendTime}`}${failedRuns.length?` (${failedRuns.length} fallos)`:''}`;
   const headline=opportunities.length
-    ? `${opportunities.length} anuncio${opportunities.length===1?'':'s'} interesante${opportunities.length===1?'':'s'} en las ultimas 3 horas`
+    ? `${opportunities.length} anuncio${opportunities.length===1?'':'s'} interesante${opportunities.length===1?'':'s'} en ${windowLabel}`
     : 'No ha habido novedades';
 
   const html=`
     <div style="font-family:Arial,sans-serif;color:#111827;max-width:1000px;margin:auto">
       <h2 style="margin-bottom:4px">Resumen Luxury Hunter</h2>
-      <p style="color:#6b7280;margin-top:0">Enviado: ${htmlEsc(sendFull)} - Ventana resumida: ultimos ${intervalMinutes} min.</p>
+      <p style="color:#6b7280;margin-top:0">Enviado: ${htmlEsc(sendFull)} - Ventana resumida: ${htmlEsc(windowLabel)}.</p>
+      ${healthBanner}
       <div style="background:#f3f4f6;padding:16px;border-radius:8px;margin:18px 0">
         <b>${htmlEsc(headline)}</b><br><br>
         STRONG BUY: <b>${counts['STRONG BUY']}</b><br>
@@ -8263,7 +8979,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     to:recipient,
     subject,
     html,
-    text:`Resumen ${sendTime}\nSTRONG BUY: ${counts['STRONG BUY']}\nBUY: ${counts.BUY}\nWATCH: ${counts.WATCH}\n${opportunities.length?'':'No ha habido novedades.'}`
+    text:`${failedRuns.length?`⚠️ ${failedRuns.length}/${runs.length} ejecuciones fallidas: ${[...errorCounts.keys()][0]}\n`:''}Resumen ${sendTime}\nSTRONG BUY: ${counts['STRONG BUY']}\nBUY: ${counts.BUY}\nWATCH: ${counts.WATCH}\n${opportunities.length?'':'No ha habido novedades.'}`
   });
 
   const sentAt=now.toISOString();
@@ -8298,7 +9014,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
   });
 
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run(
-    'email','global-digest',`3h digest: ${runs.length} task runs; ${opportunities.length} opportunities; sent to ${recipient}`,sentAt
+    'email','global-digest',`${daily?'daily':'interval'} digest: ${runs.length} task runs; ${opportunities.length} opportunities; sent to ${recipient}`,sentAt
   );
 
   return {
@@ -8319,7 +9035,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
 function statusPayload() {
   return {
     app:'Luxury Hunter v1.7.1', port:PORT, xianyuBaseUrl:XIANYU_BASE_URL,
-    bunjangCliExists:fs.existsSync(bunjangCli), geminiConfigured:!!process.env.GEMINI_API_KEY, emailConfigured:smtpConfig().configured,
+    bunjangCliExists:fs.existsSync(bunjangCli), geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
     listingCount:db.prepare('SELECT COUNT(*) n FROM listings').get().n,
     taskCount:db.prepare('SELECT COUNT(*) n FROM tasks').get().n,
     runningTasks:[...runningTaskIds],
@@ -8428,6 +9144,14 @@ const server=http.createServer(async(req,res)=>{
       const b=await readBody(req); const to=String(b.to||'').trim(); if(!to)return json(res,400,{error:'Indica un destinatario.'});
       const {transport,config}=getMailTransport(); await transport.sendMail({from:config.from,to,subject:'Luxury Hunter · correo de prueba',text:'El envío de correo de Luxury Hunter funciona correctamente.',html:'<p><b>Luxury Hunter</b>: el envío de correo funciona correctamente.</p>'});
       return json(res,200,{ok:true,to});
+    }
+    if(req.method==='POST'&&u.pathname==='/api/health/report'){
+      const b=await readBody(req);
+      const key=String(b.key||'').replace(/[^a-z0-9_-]/gi,'').slice(0,60);
+      if(!key)return json(res,400,{error:'key required'});
+      if(b.clear){clearHealthIssue(key);return json(res,200,{cleared:true});}
+      await reportHealthIssue(key,String(b.message||''));
+      return json(res,200,{reported:true});
     }
     if(req.method==='GET'&&u.pathname==='/api/economics') return json(res,200,{economics:getEconomics()});
     if(req.method==='PUT'&&u.pathname==='/api/economics'){
