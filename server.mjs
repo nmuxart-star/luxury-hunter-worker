@@ -7598,7 +7598,21 @@ function exoticSkinTerm(item){
   return term;
 }
 
+// Xianyu sin verificación de autenticidad de la plataforma (验货宝) = descartado
+// siempre, sin gastar IA ni avisar. Política de Nil.
+function xianyuVerificationVeto(item){
+  if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
+  const v=detectMarketplaceVerification(item);
+  if(['AVAILABLE','PASSED'].includes(v.status))return null;
+  return {
+    code:'no_xianyu_verification',
+    term:v.status,
+    reasons:['El anuncio de Xianyu no permite la verificación de autenticidad de la plataforma (验货宝). Descartado por política.']
+  };
+}
 function deterministicPrescreen(item){
+  const veto=xianyuVerificationVeto(item);
+  if(veto)return veto;
   const title=String(item?.title||'').toLowerCase();
   const exotic=exoticSkinTerm(item);
   if(exotic){
@@ -7627,6 +7641,19 @@ function deterministicPrescreen(item){
   return null;
 }
 
+// Limpieza al arrancar: análisis positivos de Xianyu sin 验货宝 pasan a REJECT
+// para que no salgan en avisos, resúmenes ni se vuelvan a verificar.
+function vetoUnverifiableXianyuAnalyses(){
+  const rows=db.prepare(`SELECT ta.task_id,l.* FROM task_analyses ta JOIN listings l ON l.id=ta.listing_id
+    WHERE l.source='xianyu' AND UPPER(COALESCE(ta.decision,''))<>'REJECT'`).all();
+  let n=0;
+  for(const r of rows){
+    const {task_id,...item}=r;
+    const veto=xianyuVerificationVeto(item);
+    if(veto){storePrescreenReject(task_id,item,veto);n++;}
+  }
+  if(n)console.log(`Xianyu sin verificación: ${n} análisis pasados a descartados.`);
+}
 function storePrescreenReject(taskId,item,pre){
   const now=new Date().toISOString();
   const economics=importEconomics(item);
@@ -8374,6 +8401,13 @@ async function executeTask(taskId, runId=null) {
             storePrescreenReject(taskId,item,pre);
             prescreenStats.rejected++;
             prescreenStats.byCode[pre.code]=(prescreenStats.byCode[pre.code]||0)+1;
+            continue;
+          }
+        }else{
+          // Ya analizado antes: si es de Xianyu sin 验货宝 se descarta y no se toca más.
+          const veto=xianyuVerificationVeto(item);
+          if(veto){
+            if(String(existingAnalysis.decision||'').toUpperCase()!=='REJECT')storePrescreenReject(taskId,item,veto);
             continue;
           }
         }
@@ -10653,6 +10687,7 @@ async function schedulerTick(){
 server.listen(PORT,'127.0.0.1',async()=>{
   console.log(`Luxury Hunter v1.7 -> http://127.0.0.1:${PORT}`);
   try{applyAiSpendReset();}catch(e){console.error('AI spend reset:',e.message);}
+  try{vetoUnverifiableXianyuAnalyses();}catch(e){console.error('Xianyu veto:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();
   if(!['1','true','yes','on'].includes(schedulerDisabled)){
