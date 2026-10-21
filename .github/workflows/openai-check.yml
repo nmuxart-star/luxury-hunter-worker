@@ -1,0 +1,26 @@
+name: OpenAI check
+
+# Una llamada real y barata para comprobar modelo + búsqueda web y su coste.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Modelo'
+        default: 'gpt-6-luna'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node scripts/openai-check.mjs
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_TRIAGE_MODEL: ${{ inputs.model }}
