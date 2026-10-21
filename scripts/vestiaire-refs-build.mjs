@@ -12,7 +12,7 @@ const TYPES={
   B:['Bolso City de Cuero','main'],BC:['Bolso City','main'],
   BA:['Bandolera City de Cuero','crossbody'],BAC:['Bandolera City','crossbody'],
   CA:['Cabas City de Cuero','tote'],CAC:['Cabas City','tote'],
-  L:['Bolso City de Lino','other_material'],LA:['Bolso City de Lana','other_material'],
+  L:['Bolso City de Lino','other_material'],LO:['Bolso City de Lona','other_material'],LA:['Bolso City de Lana','other_material'],
   MO:['Bolso City de Cordero de Mongolia','other_material'],
   M:['Mini bolso City de Cuero','mini'],CT:['Cartera City de Cuero','other'],
   BO:['Bolso boston City de Cuero','other']
