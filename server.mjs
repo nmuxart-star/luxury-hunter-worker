@@ -3532,6 +3532,29 @@ function weightedPercentile(entries,p){
   return rows[rows.length-1].value;
 }
 
+// VESTIAIRE SNAPSHOT V1: precios pedidos en Vestiaire que Nil captura a mano
+// (data/vestiaire-refs.json en local; en la nube viaja cifrado dentro de
+// cloud/config.json). Se da a la IA como referencia de mercado de Vestiaire.
+let vestiaireRefsCache=null;
+function vestiaireRefs(){
+  if(vestiaireRefsCache)return vestiaireRefsCache;
+  const base=path.dirname(fileURLToPath(import.meta.url));
+  for(const [file,pick] of [[path.join(base,'data','vestiaire-refs.json'),j=>j],[path.join(base,'cloud','config.json'),j=>j.vestiaire_refs]]){
+    try{const j=pick(JSON.parse(fs.readFileSync(file,'utf8')));if(j?.tasks){vestiaireRefsCache=j;return j;}}catch{}
+  }
+  vestiaireRefsCache={tasks:{}};
+  return vestiaireRefsCache;
+}
+function vestiaireSnapshotBlock(task){
+  const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
+  if(!r?.all?.n)return '';
+  const fmt=s=>`n=${s.n}, p25 ${s.p25} €, median ${s.median} €, p75 ${s.p75} €, range ${s.min}-${s.max} €`;
+  const groups=Object.values(r.groups||{}).filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
+  return `\n\nVESTIAIRE MARKET SNAPSHOT (captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
+- All listings: ${fmt(r.all)}
+${r.vintage?.n>=3?`- Tagged vintage: ${fmt(r.vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${r.discounted_share}% of listings already show a price reduction, so real sale prices are usually below asking.
+Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`;
+}
 const VESTIAIRE_VALUATION_WEIGHT=Math.max(1,Number(process.env.VESTIAIRE_VALUATION_WEIGHT||2));
 function hostOf(url){
   try{return new URL(url).hostname.toLowerCase();}catch{return '';}
@@ -5171,7 +5194,7 @@ CONDITION-BASED VALUATION RULES:
 - The final condition-adjusted resale must come from observed prices of condition-SIMILAR comparables.
 - If there is insufficient condition-matched evidence, report insufficient evidence instead of inventing a resale adjustment.
 
-SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.
+SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task)}
 
 Return ONLY JSON:
 {
@@ -5327,7 +5350,7 @@ Requirements:
 11. Return real URLs and evidence-backed prices whenever available.
 12. Do not invent comparables if a page cannot be grounded.
 
-SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.
+SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task)}
 
 This is a RECALL fallback. The goal is to find genuine listings that a visual Google search would reasonably surface even when their titles use different terminology.`;
 
@@ -6567,7 +6590,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const item=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
   if(!item)throw new Error('Listing not found');
   const task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
-  const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}`:'';
+  const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task)}`:'';
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
   const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;

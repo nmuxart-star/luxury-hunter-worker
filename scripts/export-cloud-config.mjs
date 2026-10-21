@@ -48,7 +48,10 @@ if(erow) economics=parse(erow.value_json,null);
 let global_email={enabled:true,to:null,decisions:['STRONG BUY','BUY','WATCH'],always_send:true,task_interval_minutes:60,digest_interval_minutes:180,timezone:'Europe/Madrid',subject_prefix:'Resumen',started_at:null,scope:'all_task_runs_since_previous_digest',cloud_only:true};
 const grow=db.prepare("SELECT value_json FROM app_settings WHERE key='global_email'").get();
 if(grow) global_email={...global_email,...(parse(grow.value_json,{})||{})};
-const out={version:3,exported_at:new Date().toISOString(),tasks,economics,global_email};
+// Referencias de Vestiaire capturadas por Nil (van cifradas, no se publican).
+let vestiaire_refs=null;
+try{vestiaire_refs=JSON.parse(fs.readFileSync(path.join(root,'data','vestiaire-refs.json'),'utf8'));}catch{}
+const out={version:3,exported_at:new Date().toISOString(),tasks,economics,global_email,vestiaire_refs};
 fs.mkdirSync(path.join(root,'cloud'),{recursive:true});
 const outPath=path.join(root,'cloud','config.json');
 fs.writeFileSync(outPath,JSON.stringify(out,null,2)+'\n');
