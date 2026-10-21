@@ -5158,6 +5158,8 @@ CONDITION-BASED VALUATION RULES:
 - The final condition-adjusted resale must come from observed prices of condition-SIMILAR comparables.
 - If there is insufficient condition-matched evidence, report insufficient evidence instead of inventing a resale adjustment.
 
+SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.
+
 Return ONLY JSON:
 {
   "comparables": [
@@ -5311,6 +5313,8 @@ Requirements:
 10. Continue broadening until you either obtain at least 3 useful EXACT/NEAR comparables from at least 2 independent sources, or the available grounded evidence is genuinely exhausted.
 11. Return real URLs and evidence-backed prices whenever available.
 12. Do not invent comparables if a page cannot be grounded.
+
+SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.
 
 This is a RECALL fallback. The goal is to find genuine listings that a visual Google search would reasonably surface even when their titles use different terminology.`;
 
