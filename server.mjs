@@ -866,7 +866,10 @@ function recordAiSpend(model,purpose,body){
   const cached=Number(u.input_tokens_details?.cached_tokens)||0;
   const output=Number(u.output_tokens)||0;
   const searches=(body?.output||[]).filter(x=>x?.type==='web_search_call').length;
-  const usd=((input-cached)*pin+cached*pcached+output*pout)/1e6+searches*OPENAI_WEB_SEARCH_USD;
+  // Margen de seguridad: la factura real de OpenAI sale ~15-20 % por encima
+  // de lo calculado con tokens (imágenes, búsquedas...). Mejor pasarse.
+  const safety=Number(process.env.AI_COST_SAFETY_FACTOR||1.25);
+  const usd=(((input-cached)*pin+cached*pcached+output*pout)/1e6+searches*OPENAI_WEB_SEARCH_USD)*(Number.isFinite(safety)&&safety>=1?safety:1.25);
   const state=getAiSpend();
   state.usd=Number((state.usd+usd).toFixed(6));
   state.calls=(state.calls||0)+1;
