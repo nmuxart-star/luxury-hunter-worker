@@ -29,6 +29,7 @@ const relsAll=rd('xl/_rels/workbook.xml.rels');
 const rel=id=>{const l=[...relsAll.matchAll(/<[^:>\s]*:?Relationship\b[^>]*>/g)].map(m=>m[0]).find(x=>x.includes(`Id="${id}"`));return (l.match(/Target="([^"]+)"/)||[])[1].replace(/^\/?/,'').replace(/^(?!xl\/)/,'xl/');};
 const sheetPath=rel(rid);
 const sheetRelsPath=path.join(path.dirname(sheetPath),'_rels',path.basename(sheetPath)+'.rels');
+const drawRid=(rd(sheetRelsPath).match(/<[^>]*Relationship\b[^>]*drawing[^>]*>/)||[''])[0].match(/Id="([^"]+)"/)[1];
 const drawPath=((rd(sheetRelsPath).match(/Target="([^"]*drawing[^"]*)"/)||[])[1]||'').replace(/^\/?/,'').replace(/^(?!xl\/)/,'xl/');
 const drawRelsPath=path.join(path.dirname(drawPath),'_rels',path.basename(drawPath)+'.rels');
 const embed=new Map([...rd(drawRelsPath).matchAll(/<[^:>\s]*:?Relationship\b[^>]*>/g)].map(m=>[(m[0].match(/Id="([^"]+)"/)||[])[1],(m[0].match(/Target="([^"]+)"/)||[])[1].replace(/^\/?/,'').replace(/^(?!xl\/)/,'xl/')]));
@@ -50,6 +51,18 @@ for(const am of rd(drawPath).matchAll(/<xdr:oneCellAnchor>[\s\S]*?<\/xdr:oneCell
   const media=embed.get(rid2);
   const ref=refByRow.get(row);
   if(media&&ref)photos.push({ref,media});
+}
+
+// 1b) Fotos recortadas de las capturas de fichas (scripts/tools/vestiaire-crop-photos.py)
+const cropDir=path.join(root,'data','vestiaire-refs','photos','balenciaga-le-city');
+const crops=fs.existsSync(path.join(cropDir,'index.json'))?JSON.parse(fs.readFileSync(path.join(cropDir,'index.json'),'utf8')):{};
+const have=new Set(photos.map(p=>p.ref));
+for(const [ref,c] of Object.entries(crops)){
+  if(byId.has(ref)&&c.likes!=null&&byId.get(ref).likes==null)byId.get(ref).likes=c.likes;
+  if(have.has(ref)||!byId.has(ref))continue;
+  const name=`xl/media/vc_${ref}.jpg`;
+  fs.copyFileSync(path.join(cropDir,`${ref}.jpg`),path.join(dir,name));
+  photos.push({ref,media:name});have.add(ref);
 }
 
 // 2) Filas: solo anuncios con foto, ordenados por likes y luego fecha
@@ -80,7 +93,7 @@ withPhoto.forEach((f,ri)=>{
   rowsXml.push(`<x:row r="${r}" ht="${ROW_PT}" customHeight="1">${vals.map((v,i)=>cell(v,r,i)).join('')}</x:row>`);
 });
 const last=withPhoto.length+1;
-const newSheet=`<?xml version="1.0" encoding="utf-8"?><x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><x:sheetViews><x:sheetView workbookViewId="0"><x:pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></x:sheetView></x:sheetViews><x:cols>${widths.map((w,i)=>`<x:col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join('')}</x:cols><x:sheetData>${rowsXml.join('')}</x:sheetData><x:autoFilter ref="A1:${col(header.length-1)}${last}"/><x:drawing r:id="rIdDraw"/></x:worksheet>`;
+const newSheet=`<?xml version="1.0" encoding="utf-8"?><x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><x:sheetViews><x:sheetView workbookViewId="0"><x:pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></x:sheetView></x:sheetViews><x:cols>${widths.map((w,i)=>`<x:col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join('')}</x:cols><x:sheetData>${rowsXml.join('')}</x:sheetData><x:autoFilter ref="A1:${col(header.length-1)}${last}"/><x:drawing r:id="${drawRid}"/></x:worksheet>`;
 
 // 4) Dibujo: una foto por fila, con las imágenes que ya existían
 const drawing=`<?xml version="1.0" encoding="utf-8"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">${withPhoto.map((f,k)=>`<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>38100</xdr:colOff><xdr:row>${k+1}</xdr:row><xdr:rowOff>38100</xdr:rowOff></xdr:from><xdr:ext cx="1371600" cy="1028700"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${k+2}" name="Foto ${k+1}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rIdImg${k+1}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`).join('')}</xdr:wsDr>`;
@@ -88,6 +101,9 @@ const drawingRels=`<?xml version="1.0" encoding="utf-8"?><Relationships xmlns="h
 
 // 5) Escribe el paquete y empaqueta
 fs.writeFileSync(path.join(dir,sheetPath),newSheet);
+const ctPath=path.join(dir,'[Content_Types].xml');let ct=fs.readFileSync(ctPath,'utf8');
+if(!/Extension="jpg"/i.test(ct))ct=ct.replace(/(<Types[^>]*>)/,'$1<Default Extension="jpg" ContentType="image/jpeg"/>');
+fs.writeFileSync(ctPath,ct);
 fs.writeFileSync(path.join(dir,drawPath),drawing);
 fs.writeFileSync(path.join(dir,drawRelsPath),drawingRels);
 const sstAdd=newStrings.map(t=>`<x:si><x:t xml:space="preserve">${esc(t)}</x:t></x:si>`).join('');
