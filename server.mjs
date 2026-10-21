@@ -9559,6 +9559,10 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     if(s)s[d]++;
   }
 
+  const windowHours=Math.max(1,Math.round(elapsedMs/3600000));
+  const windowLabel=windowHours>=20&&windowHours<=30
+    ? 'las ultimas 24 horas'
+    : `las ultimas ${windowHours} horas`;
   const summaries=[...summariesByTask.values()];
   const taskRows=summaries.length?summaries.map(s=>`
     <tr>
@@ -9602,10 +9606,6 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
       </div>`
     : '';
 
-  const windowHours=Math.max(1,Math.round(elapsedMs/3600000));
-  const windowLabel=windowHours>=20&&windowHours<=30
-    ? 'las ultimas 24 horas'
-    : `las ultimas ${windowHours} horas`;
   const sendTime=globalDigestMadridLabel(now,setting.timezone||'Europe/Madrid');
   const sendFull=globalDigestMadridFullLabel(now,setting.timezone||'Europe/Madrid');
   const subject=`${failedRuns.length?'⚠️ ':''}${setting.subject_prefix||'Resumen'}${daily?` diario - ${new Intl.DateTimeFormat('es-ES',{timeZone:timezone,day:'numeric',month:'long'}).format(now)}`:` - ${sendTime}`}${failedRuns.length?` (${failedRuns.length} fallos)`:''}`;
@@ -9662,6 +9662,40 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
 
   const sentAt=now.toISOString();
 
+  // El mismo resumen, corto, por Telegram (si está configurado).
+  let telegram=null;
+  if(telegramConfigured()){
+    try{
+      const lines=[
+        `<b>📊 ${htmlEsc(subject)}</b>`,
+        failedRuns.length?`⚠️ ${failedRuns.length}/${runs.length} ejecuciones fallidas: ${htmlEsc([...errorCounts.keys()][0]||'')}`:null,
+        `${htmlEsc(headline)}`,
+        `STRONG BUY: <b>${counts['STRONG BUY']}</b> · BUY: <b>${counts.BUY}</b> · WATCH: <b>${counts.WATCH}</b>`,
+        `Productos analizados: ${totalAnalyzed} · Tareas: ${summaries.length}`,
+        aiProvider()==='openai'?`Gasto IA hoy: ${getAiSpend().usd.toFixed(2)} $`:null
+      ].filter(Boolean);
+      const top=opportunities.slice(0,8).map((x,i)=>{
+        const title=htmlEsc(String(x.title||'').slice(0,70));
+        // Enlaces cortos (los de Goofish llevan cientos de caracteres de rastreo).
+        const id=String(x.url||'').match(/goofish\.com\/item\?id=(\d+)/)?.[1];
+        const url=id?`https://www.goofish.com/item?id=${id}`:String(x.url||'');
+        const link=url?`<a href="${htmlEsc(url)}">${title}</a>`:title;
+        const profit=x.net_profit_low_eur!=null||x.net_profit_high_eur!=null?` · beneficio ${eur0(x.net_profit_low_eur)}–${eur0(x.net_profit_high_eur)}`:'';
+        return `${i+1}. <b>${htmlEsc(String(x.decision||''))} ${x.opportunity_score??'—'}</b> · ${htmlEsc(x._task_name||'')}\n${link}\n${eur0(x.price_eur)} → coste ${eur0(x.landed_cost_eur)}${profit}`;
+      });
+      // Máximo 4096 caracteres por mensaje: se quitan anuncios hasta caber
+      // (cortar el texto rompería las etiquetas HTML).
+      while(top.length&&[...lines,'',...top].join('\n').length>3800)top.pop();
+      if(top.length)lines.push('',...top);
+      if(opportunities.length>top.length)lines.push(`… y ${opportunities.length-top.length} más en el email.`);
+      await telegramSend(lines.join('\n'));
+      telegram={sent:true};
+    }catch(e){
+      telegram={sent:false,error:e.message};
+      console.error('Telegram digest failed:',e.message);
+    }
+  }
+
   const markGlobalDigestSent=db.prepare(`
     INSERT OR IGNORE INTO notifications(
       task_id,
@@ -9706,7 +9740,8 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     analyzed:totalAnalyzed,
     counts,
     opportunities:opportunities.length,
-    previously_emailed_skipped:previouslyEmailedSkipped
+    previously_emailed_skipped:previouslyEmailedSkipped,
+    telegram
   };
 }
 
