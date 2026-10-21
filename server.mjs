@@ -901,9 +901,27 @@ function recordAiSpend(model,purpose,body){
     .run(JSON.stringify(state),new Date().toISOString());
   return usd;
 }
+// Reparto del presupuesto a lo largo del día: a las 00:00 solo se puede usar
+// un 15 % y el resto se va liberando por horas (lo no gastado se acumula).
+// Así el arranque del día no se come todo el importe. AI_PACE=off lo desactiva.
+function aiPaceShare(){
+  if(String(process.env.AI_PACE||'').toLowerCase()==='off')return 1;
+  const start=Math.min(1,Math.max(0,Number(process.env.AI_PACE_START_SHARE??0.15)));
+  const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Madrid',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).map(x=>[x.type,x.value]));
+  const hours=Number(p.hour)+Number(p.minute)/60;
+  return Math.min(1,start+(1-start)*hours/24);
+}
 function assertAiBudget(){
   const budget=aiDailyBudgetUsd();
   const spend=getAiSpend();
+  const paced=budget*aiPaceShare();
+  if(spend.usd<budget&&spend.usd>=paced){
+    const err=new Error(`Ritmo de gasto de IA: ${spend.usd.toFixed(2)} $ usados de ${paced.toFixed(2)} $ disponibles a esta hora (${budget.toFixed(2)} $ en todo el día). Los anuncios pendientes se analizan más tarde.`);
+    err.geminiCapacity=true;
+    err.aiBudget=true;
+    err.aiPace=true;
+    throw err;
+  }
   if(spend.usd>=budget){
     const err=new Error(`Presupuesto diario de IA alcanzado (${spend.usd.toFixed(2)} $ de ${budget.toFixed(2)} $). Se reanuda mañana.`);
     err.geminiCapacity=true;
@@ -919,7 +937,7 @@ function verifyBudgetLeftUsd(){
   const budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
   if(!Number.isFinite(budget)||budget<=0)return Infinity;
   const spent=Number(getAiSpend()?.byPurpose?.verify?.usd||0);
-  return budget-spent;
+  return budget*aiPaceShare()-spent;
 }
 
 function openaiInputFromParts(parts,detail='auto'){
@@ -8642,7 +8660,9 @@ async function executeTask(taskId, runId=null) {
           : null
       };
 
-      if(capacityError?.aiBudget){
+      if(capacityError?.aiPace){
+        console.log(`Task ${taskId}: ${capacityError.message}`);
+      }else if(capacityError?.aiBudget){
         console.log(`Task ${taskId}: ${capacityError.message}`);
         await reportHealthIssue('ai-budget',`${capacityError.message} Los anuncios nuevos se siguen descargando pero no se analizan. Puedes subir el límite con la variable AI_DAILY_BUDGET_USD.`)
           .catch(e=>console.error('Health alert failed:',e.message));
