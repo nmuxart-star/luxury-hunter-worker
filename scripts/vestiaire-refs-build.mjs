@@ -66,7 +66,7 @@ for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.fichas.txt')).sort()){
     const [id,size,dims,material,color,condition,price,before,country,tags='',published,notes='']=line.split('|');
     if(!Number(price)){console.log(`Ficha rara en ${f}: ${line}`);continue;}
     fichas.push({id,size,dims,material,color,condition,price_eur:Number(price),original_eur:before?Number(before):null,
-      country,vintage:tags.includes('v'),we_love:tags.includes('w'),published,notes,
+      country,vintage:tags.includes('v'),we_love:tags.includes('w'),excluded:tags.includes('x'),published,notes,
       url:`https://es.vestiairecollective.com/mujer-bolsos/bolsos-de-mano/balenciaga/bolsos-de-mano-city-balenciaga-de-${MATERIAL_SLUG[slug(material)]||slug(material)}-${slug(color)}-${id}.shtml`});
   }
   out.tasks[task]=out.tasks[task]||{all:{n:0},groups:{}};

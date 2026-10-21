@@ -3546,7 +3546,7 @@ function vestiaireRefs(){
   return vestiaireRefsCache;
 }
 function vestiaireFichasBlock(r){
-  const f=(r?.fichas||[]).slice(0,40);
+  const f=(r?.fichas||[]).filter(x=>!x.excluded).slice(0,60);
   if(!f.length)return '';
   const rows=f.map(x=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
   return `\n\nVESTIAIRE LISTINGS CHECKED BY NIL (real current Vestiaire Collective listings read by Nil from the listing page; CURRENT asking prices; size inferred from the listed measurements):

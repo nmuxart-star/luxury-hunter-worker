@@ -52,7 +52,7 @@ const disc=(p,o)=>o&&o>p?Math.max(1,Math.round(100*(o-p)/o)):'';
 for(const [task,t] of Object.entries(refs.tasks)){
   const fichas=(t.fichas||[]).slice().sort((a,b)=>a.size.localeCompare(b.size)||a.price_eur-b.price_eur);
   const sizes={};
-  for(const f of fichas)(sizes[f.size]=sizes[f.size]||[]).push(f.price_eur);
+  for(const f of fichas.filter(x=>!x.excluded))(sizes[f.size]=sizes[f.size]||[]).push(f.price_eur);
   const med=a=>{const s=[...a].sort((x,y)=>x-y);const m=Math.floor(s.length/2);return s.length%2?s[m]:Math.round((s[m-1]+s[m])/2);};
   const resumen=[
     ...Object.entries(t.groups||{}).map(([,g])=>['Listado (búsqueda)',g.label,g.n,g.min,g.p25,g.median,g.p75,g.max]),
@@ -61,9 +61,9 @@ for(const [task,t] of Object.entries(refs.tasks)){
   ];
   const file=path.join(outDir,`Vestiaire - ${task}.xlsx`);
   writeXlsx(file,[
-    {name:'Fichas',header:['Referencia','Talla','Medidas (cm)','Material','Color','Estado','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','Publicado','Notas','Enlace'],
-     widths:[12,12,13,10,12,16,10,13,9,12,8,8,12,48,14],
-     rows:fichas.map(f=>[f.id,f.size,f.dims,f.material,f.color,f.condition,f.price_eur,f.original_eur??'',disc(f.price_eur,f.original_eur),f.country,yn(f.vintage),yn(f.we_love),f.published,f.notes,{link:f.url,text:'Ver anuncio'}])},
+    {name:'Fichas',header:['Referencia','Talla','Medidas (cm)','Material','Color','Estado','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','No es un City','Publicado','Notas','Enlace'],
+     widths:[12,12,13,10,12,16,10,13,9,12,8,8,12,12,48,14],
+     rows:fichas.map(f=>[f.id,f.size,f.dims,f.material,f.color,f.condition,f.price_eur,f.original_eur??'',disc(f.price_eur,f.original_eur),f.country,yn(f.vintage),yn(f.we_love),yn(f.excluded),f.published,f.notes,{link:f.url,text:'Ver anuncio'}])},
     {name:'Listado',header:['Captura','Tipo','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','Descartado (no es un City)'],
      widths:[9,32,10,13,9,14,8,8,24],
      rows:(t.items||[]).map(i=>[Number(i.screen),i.title,i.price_eur,i.original_eur??'',disc(i.price_eur,i.original_eur),i.country,yn(i.vintage),yn(i.we_love),yn(i.excluded)])},
