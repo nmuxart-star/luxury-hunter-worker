@@ -21,7 +21,11 @@ const GROUP_LABEL={main:'Bolso (tamaño estándar/variado, piel)',crossbody:'Ban
 const pct=(a,p)=>{if(!a.length)return null;const s=[...a].sort((x,y)=>x-y);const i=(s.length-1)*p;const lo=Math.floor(i),hi=Math.ceil(i);return Math.round(s[lo]+(s[hi]-s[lo])*(i-lo));};
 const stats=a=>({n:a.length,min:a.length?Math.min(...a):null,p25:pct(a,.25),median:pct(a,.5),p75:pct(a,.75),max:a.length?Math.max(...a):null});
 
+// Conserva las fichas que vienen del Excel (vestiaire-xlsx-import.mjs) al reconstruir.
+const prevPath=path.join(root,'data','vestiaire-refs.json');
+const prev=fs.existsSync(prevPath)?JSON.parse(fs.readFileSync(prevPath,'utf8')):{tasks:{}};
 const out={built_at:new Date().toISOString(),tasks:{}};
+for(const [name,t] of Object.entries(prev.tasks||{}))if(t.fichas)out.tasks[name]={fichas:t.fichas};
 for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.txt')&&!f.endsWith('.fichas.txt')).sort()){
   const text=fs.readFileSync(path.join(dir,f),'utf8');
   const task=(text.match(/^# task:\s*(.+)$/m)||[])[1]?.trim();
@@ -44,6 +48,7 @@ for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.txt')&&!f.endsWith('.f
     if(prices.length)groups[g]={label:GROUP_LABEL[g],...stats(prices)};
   }
   out.tasks[task]={
+    ...(out.tasks[task]||{}),
     source:'Capturas de búsqueda en Vestiaire hechas por Nil (precios pedidos, no vendidos)',
     captured_on:captured.length?`${captured[3]}-${captured[2]}-${captured[1]}`:null,
     all:stats(valid.map(i=>i.price_eur)),

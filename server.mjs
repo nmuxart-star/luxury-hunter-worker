@@ -3545,23 +3545,47 @@ function vestiaireRefs(){
   vestiaireRefsCache={tasks:{}};
   return vestiaireRefsCache;
 }
-function vestiaireFichasBlock(r){
-  const f=(r?.fichas||[]).filter(x=>!x.excluded).slice(0,60);
-  if(!f.length)return '';
-  const rows=f.map(x=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
-  return `\n\nVESTIAIRE LISTINGS CHECKED BY NIL (real current Vestiaire Collective listings read by Nil from the listing page; CURRENT asking prices; size inferred from the listed measurements):
+const VESTIAIRE_SIZE_RE=[['Nano',/\bnano\b/i],['Part Time',/part\s?time/i],['Mini',/\bmini\b|\bmicro\b/i],['Small',/\bsmall\b|\bpetit\b|\bpetite\b|\bpeque/i],['Medium',/\bmedium\b|\bmediano\b|\bmoyen\b|中号/i],['Large',/\blarge\b|\bgrande\b|\bgrand\b|大号/i],['Bandolera',/bandolera|crossbody|messenger|shoulder strap/i]];
+const VESTIAIRE_COLOR_RE=[['negro',/negro|black|noir|schwarz|黑/i],['blanco',/blanc|white|bianco|weiss|白/i],['marron',/marr[oó]n|brown|marron|braun|棕|咖/i],['azul',/azul|blue|bleu|blu|蓝/i],['rosa',/rosa|pink|rose|粉/i],['rojo',/rojo|red|rouge|rosso|红/i],['amarillo',/amarillo|yellow|jaune|giallo|黄/i],['verde',/verde|green|vert|verde|绿/i],['gris',/gris|grey|gray|grigio|灰/i],['plateado',/plateado|silver|argent|argento|银/i],['dorado',/dorado|gold|or\b|oro|金/i],['beige',/beige|crudo|nude|taupe|ecru|khaki|caqui/i]];
+function vestiaireMatchFichas(fichas,item){
+  const text=`${item?.title||''} ${item?.description||''}`;
+  const size=(VESTIAIRE_SIZE_RE.find(([,re])=>re.test(text))||[])[0];
+  const colorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(t))||[])[0];
+  const itemColor=colorOf(text);
+  const price=Number(item?.price_eur)||0;
+  const scored=fichas.filter(f=>!f.excluded).map(f=>{
+    let score=0;
+    if(size&&f.size&&f.size.toLowerCase().startsWith(size.toLowerCase()))score+=3;
+    if(itemColor&&colorOf(String(f.color||''))===itemColor)score+=2;
+    if(f.vintage&&/vintage|vintag|古着|빈티지/i.test(text))score+=1;
+    const dist=price>0?Math.abs(Number(f.price_eur)-price)/price:1;
+    return {f,score,dist};
+  });
+  scored.sort((a,b)=>b.score-a.score||a.dist-b.dist||(b.f.likes||0)-(a.f.likes||0));
+  const strong=scored.filter(x=>x.score>0).slice(0,12);
+  return strong.length?strong:scored.slice(0,8);
+}
+function vestiaireFichasBlock(r,item){
+  const picked=vestiaireMatchFichas(r?.fichas||[],item);
+  if(!picked.length)return '';
+  const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
+  return `\n\nVESTIAIRE LISTINGS CHECKED BY NIL (real current Vestiaire Collective listings read by Nil from the listing page; CURRENT asking prices; size inferred from the listed measurements). These are the closest matches to THIS listing by size, colour and price:
 ${rows}
 These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels.`;
 }
-function vestiaireSnapshotBlock(task){
+function vestiaireSnapshotBlock(task,item){
   const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
-  if(!r?.all?.n&&!r?.fichas?.length)return '';
+  if(!r)return '';
   const fmt=s=>`n=${s.n}, p25 ${s.p25} €, median ${s.median} €, p75 ${s.p75} €, range ${s.min}-${s.max} €`;
-  const groups=Object.values(r.groups||{}).filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
-  return `\n\nVESTIAIRE MARKET SNAPSHOT (captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
+  let out='';
+  if(r.all?.n){
+    const groups=Object.values(r.groups||{}).filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
+    out+=`\n\nVESTIAIRE MARKET SNAPSHOT (captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
 - All listings: ${fmt(r.all)}
 ${r.vintage?.n>=3?`- Tagged vintage: ${fmt(r.vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${r.discounted_share}% of listings already show a price reduction, so real sale prices are usually below asking.
-Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`.replace(/^[\s\S]*$/,m=>r?.all?.n?m:'')+vestiaireFichasBlock(r);
+Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`;
+  }
+  return out+vestiaireFichasBlock(r,item);
 }
 const VESTIAIRE_VALUATION_WEIGHT=Math.max(1,Number(process.env.VESTIAIRE_VALUATION_WEIGHT||2));
 function hostOf(url){
@@ -5202,7 +5226,7 @@ CONDITION-BASED VALUATION RULES:
 - The final condition-adjusted resale must come from observed prices of condition-SIMILAR comparables.
 - If there is insufficient condition-matched evidence, report insufficient evidence instead of inventing a resale adjustment.
 
-SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task)}
+SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task,item)}
 
 Return ONLY JSON:
 {
@@ -5358,7 +5382,7 @@ Requirements:
 11. Return real URLs and evidence-backed prices whenever available.
 12. Do not invent comparables if a page cannot be grounded.
 
-SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task)}
+SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task,item)}
 
 This is a RECALL fallback. The goal is to find genuine listings that a visual Google search would reasonably surface even when their titles use different terminology.`;
 
@@ -6598,7 +6622,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const item=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
   if(!item)throw new Error('Listing not found');
   const task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
-  const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task)}`:'';
+  const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task,item)}`:'';
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
   const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
