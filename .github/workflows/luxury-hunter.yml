@@ -99,6 +99,19 @@ jobs:
         with:
           node-version: '24'
 
+      # En el servidor propio no viene instalado el CLI de GitHub, que hace
+      # falta para recuperar el estado (memoria, avisos enviados, gasto IA).
+      - name: Ensure GitHub CLI
+        shell: bash
+        run: |
+          if command -v gh >/dev/null 2>&1; then gh --version | head -1; exit 0; fi
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt-get update -y >/dev/null && sudo apt-get install -y gh >/dev/null
+          gh --version | head -1
+
       - name: Restore previous Luxury Hunter state
         env:
           GH_TOKEN: ${{ github.token }}
@@ -125,8 +138,25 @@ jobs:
           done
 
           if [ -z "$RESTORED_RUN" ]; then
-            echo "No previous persistent state artifact was available."
+            echo "::warning::No previous persistent state artifact was available."
+            exit 0
           fi
+          # Por si alguna ejecución anterior arrancó sin memoria: se juntan los
+          # avisos enviados, análisis y valoraciones de las últimas ejecuciones.
+          mkdir -p .merge
+          N=0
+          for PREV_RUN in $(gh run list --workflow luxury-hunter.yml --limit 12 --json databaseId -q '.[].databaseId' 2>/dev/null || true); do
+            [ "$PREV_RUN" = "${GITHUB_RUN_ID:-}" ] && continue
+            [ "$PREV_RUN" = "$RESTORED_RUN" ] && continue
+            [ $N -ge 5 ] && break
+            if gh run download "$PREV_RUN" -n luxury-hunter-state -D ".merge/$PREV_RUN" >/dev/null 2>&1 && [ -f ".merge/$PREV_RUN/luxury-hunter.sqlite3" ]; then
+              N=$((N+1))
+            fi
+          done
+          if [ $N -gt 0 ]; then
+            node scripts/merge-state.mjs data/luxury-hunter.sqlite3 .merge/*/luxury-hunter.sqlite3 || echo "merge-state failed (continuing)"
+          fi
+          rm -rf .merge
 
       - name: Install Luxury Hunter dependencies
         run: npm install --no-audit --no-fund
