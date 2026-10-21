@@ -1,7 +1,18 @@
 // Prueba de la API de eBay: una búsqueda por marketplace, igual que Luxury Hunter.
 // Muestra solo datos públicos de los anuncios (nunca las claves).
 const q=process.argv[2]||'Celine Luggage';
-const id=process.env.EBAY_CLIENT_ID||'', secret=process.env.EBAY_CLIENT_SECRET||'';
+const rawId=process.env.EBAY_CLIENT_ID||'', rawSecret=process.env.EBAY_CLIENT_SECRET||'';
+// Diagnóstico sin mostrar las claves: solo su forma.
+const shape=v=>({
+  longitud:v.length,
+  espaciosOComillas:/^[\s"']|[\s"']$/.test(v),
+  production:/PRD/.test(v),
+  sandbox:/SBX/.test(v),
+  pareceDevId:/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v.trim())
+});
+console.log('App ID  :',JSON.stringify(shape(rawId)));
+console.log('Cert ID :',JSON.stringify(shape(rawSecret)));
+const id=rawId.trim().replace(/^["']|["']$/g,''), secret=rawSecret.trim().replace(/^["']|["']$/g,'');
 const tok=await fetch('https://api.ebay.com/identity/v1/oauth2/token',{
   method:'POST',
   headers:{'content-type':'application/x-www-form-urlencoded',authorization:'Basic '+Buffer.from(`${id}:${secret}`).toString('base64')},
