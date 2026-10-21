@@ -7686,6 +7686,92 @@ function alertButtons(listingId){
   ]];
 }
 
+// Enlace para abrir el anuncio en la app del móvil. Telegram solo admite
+// https, así que Xianyu pasa por la página puente docs/open.html (GitHub
+// Pages) que salta a fleamarket://. Mercari, Bunjang y eBay abren su app
+// solas con su enlace web (enlaces universales).
+const APP_BRIDGE_URL=String(process.env.APP_BRIDGE_URL||'https://nmuxart-star.github.io/luxury-hunter-worker/open.html');
+function listingAppLink(x){
+  const url=String(x?.url||'');
+  const id=String(x?.source_id||'').trim()||url.match(/[?&]id=(\d+)/)?.[1]||'';
+  if(x?.source==='xianyu'&&id){
+    const web=`https://www.goofish.com/item?id=${id}`;
+    return `${APP_BRIDGE_URL}?app=${encodeURIComponent(`fleamarket://item?id=${id}`)}&web=${encodeURIComponent(web)}`;
+  }
+  return url;
+}
+
+function telegramImageUrl(u){
+  let s=String(u||'').trim();
+  if(s.startsWith('//'))s='https:'+s;
+  if(/^http:\/\/[^/]*(alicdn\.com|bunjang\.co\.kr|mercdn\.net|rakuten\.co\.jp|ebayimg\.com)/i.test(s))s=s.replace(/^http:/,'https:');
+  return /^https:\/\//i.test(s)?s:'';
+}
+
+function listingTelegramImages(x,max=4){
+  let urls=[];
+  try{urls=collectListingImageUrls(x,max);}catch{}
+  if(x?.image_url)urls.unshift(x.image_url);
+  return [...new Set(urls.map(telegramImageUrl).filter(Boolean))].slice(0,max);
+}
+
+// Álbum de fotos (hasta 10). Si Telegram no puede descargar alguna URL
+// (protección de la web), se descargan aquí y se suben.
+async function telegramSendAlbum(images,caption=''){
+  const chat_id=process.env.TELEGRAM_CHAT_ID;
+  const list=(images||[]).slice(0,10);
+  if(!list.length)return {sent:false};
+  if(list.length===1){
+    try{
+      await telegramApi('sendPhoto',{chat_id,photo:list[0],caption:caption.slice(0,1024),parse_mode:'HTML'});
+      return {sent:true};
+    }catch{}
+  }else{
+    const media=list.map((u,i)=>({type:'photo',media:u,...(i===0&&caption?{caption:caption.slice(0,1024),parse_mode:'HTML'}:{})}));
+    try{
+      await telegramApi('sendMediaGroup',{chat_id,media});
+      return {sent:true};
+    }catch{}
+  }
+  const fd=new FormData();
+  fd.append('chat_id',String(chat_id));
+  const media=[];
+  for(const [i,u] of list.entries()){
+    try{
+      const r=await fetch(u,{signal:AbortSignal.timeout(15000),headers:{'user-agent':'Mozilla/5.0'}});
+      if(!r.ok)continue;
+      const buf=Buffer.from(await r.arrayBuffer());
+      if(!buf.length||buf.length>9e6)continue;
+      const name=`p${i}.jpg`;
+      fd.append(name,new Blob([buf],{type:r.headers.get('content-type')||'image/jpeg'}),name);
+      media.push({type:'photo',media:`attach://${name}`,...(media.length===0&&caption?{caption:caption.slice(0,1024),parse_mode:'HTML'}:{})});
+    }catch{}
+  }
+  if(!media.length)return {sent:false};
+  fd.append('media',JSON.stringify(media));
+  const base=String(process.env.TELEGRAM_API_BASE||'https://api.telegram.org').replace(/\/$/,'');
+  const r=await fetch(`${base}/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMediaGroup`,{method:'POST',body:fd,signal:AbortSignal.timeout(60000)});
+  const data=await r.json().catch(()=>({}));
+  return {sent:!!data.ok,error:data.ok?null:data.description};
+}
+
+// Aviso con fotos: álbum con el texto + mensaje corto con los botones
+// (Telegram no permite botones en un álbum).
+async function telegramSendListing(text,x){
+  if(!telegramConfigured())return {sent:false};
+  const images=listingTelegramImages(x,4);
+  let album={sent:false};
+  if(images.length&&text.length<=1024){
+    album=await telegramSendAlbum(images,text).catch(()=>({sent:false}));
+  }
+  if(album.sent){
+    await telegramApi('sendMessage',{chat_id:process.env.TELEGRAM_CHAT_ID,text:'¿Te interesa este anuncio?',reply_markup:{inline_keyboard:alertButtons(x.id)}});
+  }else{
+    await telegramSend(text,null,{buttons:alertButtons(x.id)});
+  }
+  return {sent:true};
+}
+
 function listingFeedback(listingId){
   return db.prepare('SELECT action FROM listing_feedback WHERE listing_id=?').get(Number(listingId))?.action||null;
 }
@@ -7756,7 +7842,7 @@ function instantAlertText(x){
     `${htmlEsc(x.source)} · precio ${eur0(x.price_eur)} · coste importado ${eur0(x.landed_cost_eur)}`,
     `Reventa ${resale}`,
     `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
-    x.url?`<a href="${htmlEsc(x.url)}">Abrir anuncio</a>`:''
+    x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir en la app</a>`:''
   ].filter(Boolean).join('\n');
 }
 
@@ -7834,7 +7920,7 @@ async function sendInstantAlerts(task,runId,items){
   if(telegramConfigured()){
     try{
       for(const x of fresh){
-        await telegramSend(instantAlertText(x),x.image_url||null,{buttons:alertButtons(x.id)});
+        await telegramSendListing(instantAlertText(x),x);
       }
       channels.push('telegram');
     }catch(e){
@@ -7890,7 +7976,7 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
       .replace(/^🔥 <b>[^<]*<\/b>/,`👀 <b>Posible oportunidad · revísala</b>`)
       +(why?`\n<i>${htmlEsc(why.slice(0,220))}</i>`:'');
     try{
-      await telegramSend(text,x.image_url||null,{buttons:alertButtons(x.id)});
+      await telegramSendListing(text,x);
       mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
       sent++;
     }catch(e){
@@ -9953,9 +10039,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
       ].filter(Boolean);
       const top=opportunities.slice(0,8).map((x,i)=>{
         const title=htmlEsc(String(x.title||'').slice(0,70));
-        // Enlaces cortos (los de Goofish llevan cientos de caracteres de rastreo).
-        const id=String(x.url||'').match(/goofish\.com\/item\?id=(\d+)/)?.[1];
-        const url=id?`https://www.goofish.com/item?id=${id}`:String(x.url||'');
+        const url=listingAppLink(x);
         const link=url?`<a href="${htmlEsc(url)}">${title}</a>`:title;
         const profit=x.net_profit_low_eur!=null||x.net_profit_high_eur!=null?` · beneficio ${eur0(x.net_profit_low_eur)}–${eur0(x.net_profit_high_eur)}`:'';
         return `${i+1}. <b>${htmlEsc(String(x.decision||''))} ${x.opportunity_score??'—'}</b> · ${htmlEsc(x._task_name||'')}\n${link}\n${eur0(x.price_eur)} → coste ${eur0(x.landed_cost_eur)}${profit}`;
@@ -9966,6 +10050,23 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
       if(top.length)lines.push('',...top);
       if(opportunities.length>top.length)lines.push(`… y ${opportunities.length-top.length} más en el email.`);
       await telegramSend(lines.join('\n'));
+      // Fotos de los mejores anuncios del resumen (una por anuncio, numeradas).
+      const shown=opportunities.slice(0,top.length);
+      const photos=[];
+      for(const [i,x] of shown.entries()){
+        const img=listingTelegramImages(x,1)[0];
+        if(img)photos.push({img,cap:`${i+1}. ${String(x.title||'').slice(0,60)}`});
+      }
+      if(photos.length){
+        const chat_id=process.env.TELEGRAM_CHAT_ID;
+        try{
+          await telegramApi('sendMediaGroup',{chat_id,media:photos.slice(0,10).map(p=>({type:'photo',media:p.img,caption:p.cap}))});
+        }catch(e){
+          // Alguna URL no la puede descargar Telegram: se suben desde aquí.
+          const r=await telegramSendAlbum(photos.map(p=>p.img),'Fotos del resumen (mismo orden que la lista)').catch(err=>({sent:false,error:err.message}));
+          if(!r.sent)console.error('Telegram digest photos failed:',e.message,r.error||'');
+        }
+      }
       telegram={sent:true};
     }catch(e){
       telegram={sent:false,error:e.message};
@@ -10158,6 +10259,12 @@ const server=http.createServer(async(req,res)=>{
       const id=Number(b.listingId)||0;
       const r=await telegramSend(`🧪 <b>Prueba de botones</b>\nPulsa uno: el bot lo guardará en la próxima comprobación.`,null,{buttons:alertButtons(id)});
       return json(res,200,r);
+    }
+    if(req.method==='POST'&&u.pathname==='/api/telegram/test-listing'){
+      const b=await readBody(req);
+      const x=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(b.listingId));
+      if(!x)return json(res,404,{error:'listing not found'});
+      return json(res,200,await telegramSendListing(instantAlertText({...x,decision:'PRUEBA',_task_name:'Prueba de fotos y enlace'}),x));
     }
     if(req.method==='POST'&&u.pathname==='/api/telegram/poll'){
       return json(res,200,{...(await pollTelegramUpdates()),feedback:db.prepare('SELECT * FROM listing_feedback ORDER BY created_at DESC LIMIT 5').all()});

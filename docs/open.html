@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Abrir en la app</title>
+<style>
+  :root{--bg:#fff;--fg:#111827;--muted:#6b7280;--btn:#ffe60f;--btn-fg:#111}
+  @media (prefers-color-scheme:dark){:root{--bg:#111827;--fg:#f9fafb;--muted:#9ca3af}}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:16px;box-sizing:border-box}
+  main{max-width:360px;text-align:center}
+  a.btn{display:block;margin:12px 0;padding:14px 18px;border-radius:12px;background:var(--btn);color:var(--btn-fg);font-weight:600;text-decoration:none}
+  a.alt{color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+<main>
+  <p id="msg">Abriendo la app…</p>
+  <a class="btn" id="app" href="#">Abrir en la app</a>
+  <a class="alt" id="web" href="#">Abrir en la web</a>
+</main>
+<script>
+// Página puente de Luxury Hunter: Telegram solo admite enlaces https, así que
+// esta página reenvía al esquema de la app (p. ej. fleamarket:// de Xianyu).
+// Solo se aceptan esquemas y webs de marketplaces conocidos.
+(function(){
+  var q=new URLSearchParams(location.search);
+  var app=q.get('app')||'';
+  var web=q.get('web')||'';
+  var okApp=/^(fleamarket|bunjang|mercari):\/\//i.test(app);
+  var okWeb=/^https:\/\/([a-z0-9-]+\.)*(goofish\.com|taobao\.com|bunjang\.co\.kr|mercari\.com|rakuten\.co\.jp|ebay\.[a-z.]+|fril\.jp|paypayfleamarket\.yahoo\.co\.jp|buyee\.jp|komehyo\.jp)(\/|$)/i.test(web);
+  var appA=document.getElementById('app'), webA=document.getElementById('web');
+  if(okWeb){webA.href=web;}else{webA.style.display='none';}
+  if(!okApp){
+    appA.style.display='none';
+    if(okWeb){location.replace(web);}else{document.getElementById('msg').textContent='Enlace no válido.';}
+    return;
+  }
+  appA.href=app;
+  location.href=app;
+  setTimeout(function(){document.getElementById('msg').textContent='Si no se ha abierto la app, pulsa el botón.';},1500);
+})();
+</script>
+</body>
+</html>

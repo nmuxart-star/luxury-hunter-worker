@@ -1,8 +1,14 @@
 name: Telegram check
 
-# Envía un mensaje de prueba con los secrets de Telegram. No usa IA.
+# Prueba de Telegram. Sin "listing": mensaje de texto. Con "listing": busca en
+# Xianyu y envía un anuncio real con fotos, enlace a la app y botones. No usa IA.
 on:
   workflow_dispatch:
+    inputs:
+      listing:
+        description: 'Enviar un anuncio real de prueba (fotos + enlace app)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -10,12 +16,13 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - name: Send test message
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        if: ${{ !inputs.listing }}
         run: |
           code=$(curl -s -o resp.json -w '%{http_code}' -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -25,3 +32,22 @@ jobs:
           grep -o '"ok":[a-z]*' resp.json || true
           grep -o '"description":"[^"]*"' resp.json || true
           test "$code" = 200
+
+      - uses: actions/checkout@v4
+        if: ${{ inputs.listing }}
+      - uses: actions/setup-node@v4
+        if: ${{ inputs.listing }}
+        with:
+          node-version: '24'
+      - name: Real listing to Telegram
+        if: ${{ inputs.listing }}
+        env:
+          XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          mkdir -p .xianyu/state
+          openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/xianyu-state.enc -out .xianyu/state/Nil.json -pass env:XIANYU_STATE_PASSWORD
+          export XIANYU_STATE_FILE="$PWD/.xianyu/state/Nil.json"
+          node scripts/telegram-listing-check.mjs "迪奥 戴妃包" 700 1700
