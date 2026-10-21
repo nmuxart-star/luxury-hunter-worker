@@ -20,7 +20,8 @@ concurrency:
 
 jobs:
   hunt:
-    runs-on: ubuntu-latest
+    # LH_RUNNER=lh-vps ejecuta el bot en el servidor propio (runner autoalojado).
+    runs-on: ${{ vars.LH_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 355
     env:
       # IA: OpenAI si existe OPENAI_API_KEY; si no, Gemini.
@@ -208,6 +209,32 @@ jobs:
       - name: Run due tasks
         run: node scripts/github-run.mjs
 
+      # Si Goofish dio la sesión por caducada o bloqueó la búsqueda, se envía
+      # un QR a Telegram para renovarla escaneando con la app (máx. 1 vez / 20 h).
+      - name: Xianyu QR renewal if needed
+        if: always()
+        env:
+          XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
+        shell: bash
+        run: |
+          if [ ! -f .xianyu/state/Nil.json ] || [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then exit 0; fi
+          if [ "${XIANYU_SESSION_STATUS:-}" != "expired" ] && [ ! -f .xianyu-needs-login ]; then
+            echo "Xianyu session fine; no QR needed."; exit 0
+          fi
+          LAST=0
+          [ -f .state/xianyu-qr-last ] && LAST=$(cat .state/xianyu-qr-last)
+          NOW=$(date +%s)
+          mkdir -p lh-upload
+          echo "$LAST" > lh-upload/xianyu-qr-last
+          if [ $((NOW-LAST)) -lt 72000 ]; then
+            echo "QR already requested in the last 20 h; skipping."; exit 0
+          fi
+          echo "$NOW" > lh-upload/xianyu-qr-last
+          if node scripts/xianyu-qr-login.mjs .xianyu/state/Nil.json 4; then
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out lh-upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
+            echo "New Xianyu session saved."
+          fi
+
       - name: Collect persistent state
         if: always()
         shell: bash
@@ -221,6 +248,9 @@ jobs:
           # Si esta ejecución no renovó la sesión de Xianyu, conserva la anterior.
           if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
             cp .state/xianyu-state.enc lh-upload/
+          fi
+          if [ ! -f lh-upload/xianyu-qr-last ] && [ -f .state/xianyu-qr-last ]; then
+            cp .state/xianyu-qr-last lh-upload/
           fi
 
       - name: Save persistent state

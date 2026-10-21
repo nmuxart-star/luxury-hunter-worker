@@ -2130,6 +2130,8 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
         ? 'Xianyu pide iniciar sesión de nuevo; Xianyu queda en pausa en esta ejecución.'
         : 'Xianyu no ha devuelto resultados de búsqueda; Xianyu queda en pausa en esta ejecución.';
       console.log(`Xianyu direct: ${xianyuPausedReason} (${res.where||''})`);
+      // Señal para el workflow: al terminar, pedir a Nil un QR por Telegram.
+      try{fs.writeFileSync(path.join(__dirname,'.xianyu-needs-login'),xianyuPausedReason);}catch{}
       await reportHealthIssue(res.login?'xianyu-login':'xianyu-search',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad.').catch(()=>{});
       perQuery.push({query:keyword,login:!!res.login,noResponse:!!res.noResponse,where:res.where||null});
       break;
@@ -2138,6 +2140,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       xianyuPausedAt=Date.now();
       xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa el resto de esta ejecución para proteger tu cuenta.';
       await reportHealthIssue('xianyu-risk',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad. Se reintentará en la próxima ejecución.').catch(()=>{});
+      try{fs.writeFileSync(path.join(__dirname,'.xianyu-needs-login'),xianyuPausedReason);}catch{}
       perQuery.push({query:keyword,risk:true});
       break;
     }
