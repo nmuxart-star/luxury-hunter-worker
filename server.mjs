@@ -3545,15 +3545,23 @@ function vestiaireRefs(){
   vestiaireRefsCache={tasks:{}};
   return vestiaireRefsCache;
 }
+function vestiaireFichasBlock(r){
+  const f=(r?.fichas||[]).slice(0,40);
+  if(!f.length)return '';
+  const rows=f.map(x=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
+  return `\n\nVESTIAIRE LISTINGS CHECKED BY NIL (real current Vestiaire Collective listings read by Nil from the listing page; CURRENT asking prices; size inferred from the listed measurements):
+${rows}
+These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels.`;
+}
 function vestiaireSnapshotBlock(task){
   const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
-  if(!r?.all?.n)return '';
+  if(!r?.all?.n&&!r?.fichas?.length)return '';
   const fmt=s=>`n=${s.n}, p25 ${s.p25} €, median ${s.median} €, p75 ${s.p75} €, range ${s.min}-${s.max} €`;
   const groups=Object.values(r.groups||{}).filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
   return `\n\nVESTIAIRE MARKET SNAPSHOT (captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
 - All listings: ${fmt(r.all)}
 ${r.vintage?.n>=3?`- Tagged vintage: ${fmt(r.vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${r.discounted_share}% of listings already show a price reduction, so real sale prices are usually below asking.
-Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`;
+Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`.replace(/^[\s\S]*$/,m=>r?.all?.n?m:'')+vestiaireFichasBlock(r);
 }
 const VESTIAIRE_VALUATION_WEIGHT=Math.max(1,Number(process.env.VESTIAIRE_VALUATION_WEIGHT||2));
 function hostOf(url){

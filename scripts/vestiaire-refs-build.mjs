@@ -22,7 +22,7 @@ const pct=(a,p)=>{if(!a.length)return null;const s=[...a].sort((x,y)=>x-y);const
 const stats=a=>({n:a.length,min:a.length?Math.min(...a):null,p25:pct(a,.25),median:pct(a,.5),p75:pct(a,.75),max:a.length?Math.max(...a):null});
 
 const out={built_at:new Date().toISOString(),tasks:{}};
-for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.txt')).sort()){
+for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.txt')&&!f.endsWith('.fichas.txt')).sort()){
   const text=fs.readFileSync(path.join(dir,f),'utf8');
   const task=(text.match(/^# task:\s*(.+)$/m)||[])[1]?.trim();
   const captured=(text.match(/(\d{2})-(\d{2})-(\d{4})/)||[]);
@@ -52,6 +52,26 @@ for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.txt')).sort()){
     groups,items
   };
   console.log(`${task}: ${valid.length} anuncios válidos (${items.length-valid.length} descartados), mediana ${out.tasks[task].all.median} €`);
+}
+// Fichas individuales (con enlace): comparables reales para la IA.
+const slug=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').split(/\s+/)[0];
+const MATERIAL_SLUG={piel:'cuero',ante:'ante',lona:'lona',lino:'lino'};
+for(const f of fs.readdirSync(dir).filter(f=>f.endsWith('.fichas.txt')).sort()){
+  const text=fs.readFileSync(path.join(dir,f),'utf8');
+  const task=(text.match(/^# task:\s*(.+)$/m)||[])[1]?.trim();
+  if(!task)continue;
+  const fichas=[];
+  for(const line of text.split('\n')){
+    if(!/^\d/.test(line))continue;
+    const [id,size,dims,material,color,condition,price,before,country,tags='',published,notes='']=line.split('|');
+    if(!Number(price)){console.log(`Ficha rara en ${f}: ${line}`);continue;}
+    fichas.push({id,size,dims,material,color,condition,price_eur:Number(price),original_eur:before?Number(before):null,
+      country,vintage:tags.includes('v'),we_love:tags.includes('w'),published,notes,
+      url:`https://es.vestiairecollective.com/mujer-bolsos/bolsos-de-mano/balenciaga/bolsos-de-mano-city-balenciaga-de-${MATERIAL_SLUG[slug(material)]||slug(material)}-${slug(color)}-${id}.shtml`});
+  }
+  out.tasks[task]=out.tasks[task]||{all:{n:0},groups:{}};
+  out.tasks[task].fichas=fichas;
+  console.log(`${task}: ${fichas.length} fichas con enlace`);
 }
 fs.writeFileSync(path.join(root,'data','vestiaire-refs.json'),JSON.stringify(out,null,1)+'\n');
 console.log('OK data/vestiaire-refs.json');
