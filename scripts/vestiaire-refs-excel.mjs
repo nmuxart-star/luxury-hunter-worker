@@ -49,7 +49,9 @@ function writeXlsx(file,sheets){
 }
 const yn=b=>b?'Sí':'';
 const disc=(p,o)=>o&&o>p?Math.max(1,Math.round(100*(o-p)/o)):'';
+const BRANDS={'Balenciaga Le City':'Balenciaga','Fendi Baguette':'Fendi','Chloe Paddington':'Chloé','Saint Laurent Mombasa':'Saint Laurent','Dior Saddle':'Dior','Chanel Classic Flap':'Chanel','Louis Vuitton Speedy 25':'Louis Vuitton','Bottega Veneta Intrecciato':'Bottega Veneta','Gucci Jackie':'Gucci','Prada Tessuto':'Prada','Celine Luggage':'Celine','Louis Vuitton Pochette Accessoires':'Louis Vuitton','Louis Vuitton Murakami Multicolore':'Louis Vuitton','Fendi Spy':'Fendi','Miu Miu Wander Arcadie':'Miu Miu','Balenciaga Rodeo':'Balenciaga','Alaia Le Teckel':'Alaïa','Lady Dior':'Dior','Loewe Puzzle':'Loewe','Hermes Evelyne':'Hermès','Gucci Horsebit':'Gucci'};
 for(const [task,t] of Object.entries(refs.tasks)){
+  const brand=BRANDS[task]||task.split(' ')[0];
   const fichas=(t.fichas||[]).slice().sort((a,b)=>a.size.localeCompare(b.size)||a.price_eur-b.price_eur);
   const sizes={};
   for(const f of fichas.filter(x=>!x.excluded))(sizes[f.size]=sizes[f.size]||[]).push(f.price_eur);
@@ -61,12 +63,12 @@ for(const [task,t] of Object.entries(refs.tasks)){
   ];
   const file=path.join(outDir,`Vestiaire - ${task}.xlsx`);
   writeXlsx(file,[
-    {name:'Fichas',header:['Referencia','Talla','Medidas (cm)','Material','Color','Estado','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','No es un City','Publicado','Notas','Enlace'],
-     widths:[12,12,13,10,12,16,10,13,9,12,8,8,12,12,48,14],
-     rows:fichas.map(f=>[f.id,f.size,f.dims,f.material,f.color,f.condition,f.price_eur,f.original_eur??'',disc(f.price_eur,f.original_eur),f.country,yn(f.vintage),yn(f.we_love),yn(f.excluded),f.published,f.notes,{link:f.url,text:'Ver anuncio'}])},
-    {name:'Listado',header:['Captura','Tipo','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','Descartado (no es un City)'],
-     widths:[9,32,10,13,9,14,8,8,24],
-     rows:(t.items||[]).map(i=>[Number(i.screen),i.title,i.price_eur,i.original_eur??'',disc(i.price_eur,i.original_eur),i.country,yn(i.vintage),yn(i.we_love),yn(i.excluded)])},
+    {name:'Fichas',header:['Marca','Referencia','Talla','Medidas (cm)','Material','Color','Estado','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','No es un City','Publicado','Notas','Enlace'],
+     widths:[14,12,12,13,10,12,16,10,13,9,12,8,8,12,12,48,14],
+     rows:fichas.map(f=>[brand,f.id,f.size,f.dims,f.material,f.color,f.condition,f.price_eur,f.original_eur??'',disc(f.price_eur,f.original_eur),f.country,yn(f.vintage),yn(f.we_love),yn(f.excluded),f.published,f.notes,{link:f.url,text:'Ver anuncio'}])},
+    {name:'Listado',header:['Marca','Captura','Tipo','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','Descartado (no es un City)'],
+     widths:[14,9,32,10,13,9,14,8,8,24],
+     rows:(t.items||[]).map(i=>[brand,Number(i.screen),i.title,i.price_eur,i.original_eur??'',disc(i.price_eur,i.original_eur),i.country,yn(i.vintage),yn(i.we_love),yn(i.excluded)])},
     {name:'Resumen',header:['Fuente','Grupo / talla','Nº anuncios','Mínimo €','25 % más barato €','Mediana €','75 % €','Máximo €'],
      widths:[20,38,12,10,18,11,9,10],rows:resumen}
   ]);
