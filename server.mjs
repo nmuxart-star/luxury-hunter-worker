@@ -884,6 +884,16 @@ function assertAiBudget(){
   }
 }
 
+// Las verificaciones (búsqueda web + modelo potente, ~0,05-0,09 $ cada una)
+// tienen su propio tope diario para que nunca dejen sin presupuesto al
+// triaje y al análisis, que son los que encuentran oportunidades nuevas.
+function verifyBudgetLeftUsd(){
+  const budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
+  if(!Number.isFinite(budget)||budget<=0)return Infinity;
+  const spent=Number(getAiSpend()?.byPurpose?.verify?.usd||0);
+  return budget-spent;
+}
+
 function openaiInputFromParts(parts,detail='auto'){
   const content=[];
   for(const p of parts||[]){
@@ -958,9 +968,11 @@ async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true
   if(webSearch){
     // Mismo papel que el Google Search de Gemini, pero limitado desde el
     // origen a las webs de reventa de lujo de confianza.
+    const ctx=String(process.env.OPENAI_SEARCH_CONTEXT||'low');
     payload.tools=[{
       type:'web_search',
-      filters:{allowed_domains:openaiMarketSearchDomains()}
+      filters:{allowed_domains:openaiMarketSearchDomains()},
+      ...(ctx&&ctx!=='default'?{search_context_size:ctx}:{})
     }];
     payload.tool_choice='required';
     payload.include=['web_search_call.action.sources'];
@@ -984,6 +996,11 @@ async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true
     let body={};
     if(text){
       try{body=JSON.parse(text);}catch{body={message:text.slice(0,2000)};}
+    }
+    if(!r.ok&&webSearch&&/search_context_size/i.test(JSON.stringify(body?.error||''))&&!process.env.__LH_NO_SEARCH_CTX){
+      // El modelo no admite ese parámetro: se repite sin él.
+      process.env.OPENAI_SEARCH_CONTEXT='default';
+      return openaiResponsesRequest({key,model,parts,webSearch,json,purpose});
     }
     if(!r.ok){
       const err=geminiHttpError(body,r.status);
@@ -6556,14 +6573,27 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const verifyWatchMin=Number(process.env.VERIFY_WATCH_MIN_SCORE||60);
   // Un WATCH con mucho margen también se verifica aunque puntúe poco
   // (caso típico: buen precio pero fotos insuficientes).
-  const verifyWatchProfit=Number(process.env.VERIFY_WATCH_MIN_PROFIT_EUR||250);
+  const verifyWatchProfit=Number(process.env.VERIFY_WATCH_MIN_PROFIT_EUR||300);
   const bigMarginWatch=preliminaryDecision==='WATCH'&&
-    Number(a.opportunity_score)>=45&&
+    Number(a.opportunity_score)>=50&&
     Number(a.net_profit_low_eur)>=verifyWatchProfit;
   const worthVerifying=['BUY','STRONG BUY'].includes(preliminaryDecision)||
     (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin)||
     bigMarginWatch;
-  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&!worthVerifying){
+  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&worthVerifying&&verifyBudgetLeftUsd()<=0){
+    // Candidato serio pero sin presupuesto de verificación hoy: se verifica
+    // en cuanto haya presupuesto (mañana), en vez de perderlo.
+    verification={
+      status:'pending_budget',
+      preliminary_decision:preliminaryDecision,
+      ai_preliminary_decision:aiPreliminaryDecision,
+      marketplace_verification:marketplaceVerification
+    };
+    a.decision_reasons_es=[
+      ...reasonsForStorage(a),
+      'Verificación de mercado pendiente: el presupuesto de verificación de hoy está agotado; se hará en cuanto se renueve.'
+    ].slice(0,4);
+  }else if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&!worthVerifying){
     verification={
       status:'skipped_cost',
       preliminary_decision:preliminaryDecision,
@@ -8243,6 +8273,8 @@ async function executeTask(taskId, runId=null) {
             );
 
           if(!needsVerification)continue;
+          // Pendiente de presupuesto: solo se reintenta cuando lo hay.
+          if(verificationStatus==='pending_budget'&&verifyBudgetLeftUsd()<=0)continue;
           item._needsVerification=true;
         }
 

@@ -30,7 +30,8 @@ jobs:
       OPENAI_TRIAGE_MODEL: ${{ vars.OPENAI_TRIAGE_MODEL || 'gpt-6-luna' }}
       AI_TRIAGE_MIN_SCORE: ${{ vars.AI_TRIAGE_MIN_SCORE || '50' }}
       # Tope de gasto diario en OpenAI (USD). Al alcanzarlo se deja de analizar hasta mañana.
-      AI_DAILY_BUDGET_USD: ${{ vars.AI_DAILY_BUDGET_USD || '1' }}
+      AI_DAILY_BUDGET_USD: ${{ vars.AI_DAILY_BUDGET_USD || '1.5' }}
+      AI_VERIFY_DAILY_BUDGET_USD: ${{ vars.AI_VERIFY_DAILY_BUDGET_USD || '0.8' }}
       # Verificación cara (fotos + búsqueda web) solo para BUY/STRONG BUY o WATCH con esta puntuación.
       VERIFY_WATCH_MIN_SCORE: ${{ vars.VERIFY_WATCH_MIN_SCORE || '60' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
