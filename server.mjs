@@ -3374,6 +3374,8 @@ async function searchJapanRadarLive(opts){
 // POSITIVE MARKET VERIFICATION V1.6
 const CENTRAL_AI_INSTRUCTION = `You are the first-pass central AI screening engine for Luxury Hunter. Analyze this second-hand luxury handbag listing conservatively for resale in Europe. First verify that the listing appears to match the target product family; search-query similarity is not proof. The user's task requirements below are mandatory evaluation context. Never certify authenticity from photos alone.
 
+RESALE REFERENCE: when estimating the European resale price, use Vestiaire Collective prices as the primary reference (Nil resells against Vestiaire). Other resellers (Collector Square, The RealReal, Fashionphile, eBay...) are secondary evidence used to confirm or adjust.
+
 EXOTIC SKIN POLICY (mandatory): if the title, description or photos indicate genuine exotic leather (crocodile, alligator, caiman, python or other snake, ostrich, lizard, stingray/galuchat, eel), decision MUST be REJECT with the reason "piel exótica (CITES)". Embossed/printed calf leather imitating these is NOT exotic.
 
 AUTHENTICITY RISK STABILITY RULES:
@@ -3530,6 +3532,11 @@ function weightedPercentile(entries,p){
   return rows[rows.length-1].value;
 }
 
+const VESTIAIRE_VALUATION_WEIGHT=Math.max(1,Number(process.env.VESTIAIRE_VALUATION_WEIGHT||2));
+function hostOf(url){
+  try{return new URL(url).hostname.toLowerCase();}catch{return '';}
+}
+
 function luxuryComparableValuationWeight(c){
   const url=String(c?.url||'').trim();
   const tier=luxuryMarketTier(url);
@@ -3548,6 +3555,12 @@ function luxuryComparableValuationWeight(c){
   // Mayor relevancia para el mercado europeo.
   if(europe){
     weight*=1.35;
+  }
+
+  // Vestiaire Collective es la referencia principal de Nil para revender:
+  // sus anuncios pesan el doble que los de otras webs (que siguen contando).
+  if(/(^|\.)vestiairecollective\.com/i.test(hostOf(url))){
+    weight*=VESTIAIRE_VALUATION_WEIGHT;
   }
 
   // Una venta confirmada tiene más valor que un asking price.
@@ -5906,6 +5919,7 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
       tier_1_base:1.00,
       tier_2_ebay_base:0.70,
       europe_multiplier:1.35,
+      vestiaire_multiplier:VESTIAIRE_VALUATION_WEIGHT,
       sold_multiplier:1.50,
       current_multiplier:1.00,
       unknown_status_multiplier:0.75
