@@ -855,6 +855,23 @@ function aiDailyBudgetUsd(){
   const n=Number(process.env.AI_DAILY_BUDGET_USD??1);
   return Number.isFinite(n)&&n>0?n:Infinity;
 }
+// Ajuste manual del gasto de hoy (una sola vez por valor): variable
+// AI_SPEND_RESET="AAAA-MM-DD:usd" → el contador de ese día pasa a "usd".
+function applyAiSpendReset(){
+  const raw=String(process.env.AI_SPEND_RESET||'').trim();
+  const m=raw.match(/^(\d{4}-\d{2}-\d{2}):(\d+(?:\.\d+)?)$/);
+  if(!m||m[1]!==aiSpendDay())return;
+  if(getSetting('ai_spend_reset_applied',null)===raw)return;
+  const state=getSetting('ai_spend',{})||{};
+  const next={...(state.day===m[1]?state:{day:m[1],calls:0,webSearches:0,byPurpose:{}}),usd:Number(m[2]),byPurpose:{},resetFrom:state.day===m[1]?state.usd:0};
+  const now=new Date().toISOString();
+  const put=db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`);
+  put.run('ai_spend',JSON.stringify(next),now);
+  put.run('ai_spend_reset_applied',JSON.stringify(raw),now);
+  console.log(`Gasto de IA de hoy ajustado a ${m[2]} $ (antes ${next.resetFrom} $).`);
+}
+
 function getAiSpend(){
   const state=getSetting('ai_spend',{})||{};
   return state.day===aiSpendDay()?state:{day:aiSpendDay(),usd:0,calls:0,webSearches:0,byPurpose:{}};
@@ -10542,6 +10559,7 @@ async function schedulerTick(){
 }
 server.listen(PORT,'127.0.0.1',async()=>{
   console.log(`Luxury Hunter v1.7 -> http://127.0.0.1:${PORT}`);
+  try{applyAiSpendReset();}catch(e){console.error('AI spend reset:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();
   if(!['1','true','yes','on'].includes(schedulerDisabled)){
