@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 
@@ -815,9 +816,16 @@ const OPENAI_IMAGE_TYPES=new Set(['image/jpeg','image/png','image/webp','image/g
 
 // Coste: cada propósito usa el modelo y el nivel de razonamiento mínimo
 // suficiente. Solo la verificación de candidatos serios usa el modelo caro.
+// Verificación "ligera": los WATCH se verifican con el modelo barato y solo
+// los BUY / STRONG BUY (posible compra real) con el modelo potente.
+const verifyTierStore=new AsyncLocalStorage();
+
 function openaiPurposeConfig(purpose,requestedModel){
   const cheap=process.env.OPENAI_TRIAGE_MODEL||'gpt-6-luna';
   const strong=process.env.OPENAI_MODEL||'gpt-6.1-sol';
+  if(purpose==='verify'&&verifyTierStore.getStore()==='lite'){
+    return {model:process.env.OPENAI_VERIFY_LITE_MODEL||cheap,effort:'low',detail:'low'};
+  }
   const cfg={
     triage:{model:cheap,effort:process.env.OPENAI_TRIAGE_EFFORT||'none',detail:'low'},
     repair:{model:cheap,effort:'none',detail:'low'},
@@ -6605,6 +6613,10 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
       `Sin verificación de mercado (puntuación ${a.opportunity_score??'—'} < ${verifyWatchMin}) para ahorrar coste.`
     ].slice(0,4);
   }else if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)){
+    // WATCH → modelo barato; BUY/STRONG BUY → modelo potente.
+    verifyTierStore.enterWith(
+      ['BUY','STRONG BUY'].includes(preliminaryDecision)||String(process.env.VERIFY_LITE_FOR_WATCH||'1')==='0'?'full':'lite'
+    );
     try{
       reportProgress(
         38,
