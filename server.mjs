@@ -213,6 +213,12 @@ CREATE TABLE IF NOT EXISTS notifications (
   sent_at TEXT NOT NULL,
   UNIQUE(task_id, listing_id, kind)
 );
+CREATE TABLE IF NOT EXISTS listing_feedback (
+  listing_id INTEGER PRIMARY KEY,
+  action TEXT NOT NULL,
+  source TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,
   value_json TEXT NOT NULL,
@@ -2025,7 +2031,7 @@ function parseXianyuSearchJson(json){
   return out;
 }
 
-async function xianyuDirectSearchOnce(keyword){
+async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
   const x=await getXianyuDirect();
   const page=await x.context.newPage();
   try{
@@ -2070,7 +2076,25 @@ async function xianyuDirectSearchOnce(keyword){
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
-    return {risk:false,sorted,items:parseXianyuSearchJson(json),ret:json?.ret||null};
+    // Rango de precio de la tarea en la propia web (como un usuario): así los
+    // 30 resultados son del rango útil y no baratijas o artículos de lujo fuera de presupuesto.
+    let priced=false;
+    if((minCny||maxCny)&&String(process.env.XIANYU_PRICE_FILTER||'1')!=='0'){
+      try{
+        const box=page.locator('div[class*="search-price-input-container"]').first();
+        if(await box.isVisible({timeout:3000}).catch(()=>false)){
+          const inputs=box.getByPlaceholder('¥');
+          if(minCny){await inputs.nth(0).fill(String(minCny));await sleep(700+Math.random()*800);}
+          if(maxCny){await inputs.nth(1).fill(String(maxCny));await sleep(700+Math.random()*800);}
+          const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
+          await page.keyboard.press('Tab');
+          const j3=await (await next).json().catch(()=>null);
+          if(xianyuRiskIn(j3))return {risk:true};
+          if(j3?.data?.resultList){json=j3;priced=true;}
+        }
+      }catch{}
+    }
+    return {risk:false,sorted,priced,items:parseXianyuSearchJson(json),ret:json?.ret||null};
   }finally{
     await page.close().catch(()=>{});
   }
@@ -2092,7 +2116,9 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     done++;
     let res;
     try{
-      res=await xianyuDirectSearchOnce(keyword);
+      const minCny=Number.isFinite(Number(minEur))&&Number(minEur)>0?Math.floor(eurTo(Number(minEur),'CNY')||0)||null:null;
+      const maxCny=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Math.ceil(eurTo(Number(maxEur),'CNY')||0)||null:null;
+      res=await xianyuDirectSearchOnce(keyword,{minCny,maxCny});
     }catch(e){
       res={noResponse:true,where:e.message};
     }
@@ -2126,15 +2152,25 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       const hi=maxEur===null||maxEur===undefined||maxEur===''?NaN:Number(maxEur);
       if(Number.isFinite(lo)&&pe!=null&&pe<lo){rejected.belowMin++;continue;}
       if(Number.isFinite(hi)&&hi>0&&pe!=null&&pe>hi){rejected.aboveMax++;continue;}
+      // Si ya se abrió la ficha antes, no perder descripción, fotos ni vendedor.
+      const prev=db.prepare('SELECT description,raw_json,seller_sales,seller_items FROM listings WHERE source=? AND source_id=?').get('xianyu',it.id);
+      let prevRaw={};
+      try{prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};}catch{}
+      const detail=prevRaw?.detailFetched?prevRaw:null;
       upsertListing({
-        source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:'',
+        source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:detail?prev.description:'',
         original_price:it.price,currency:'CNY',price_eur:pe,seller_name:it.seller,image_url:it.image,
+        seller_sales:detail?prev.seller_sales:null,seller_items:detail?prev.seller_items:null,
         status:'',purchase_via:'China agent',
-        raw:{'商品信息':{'商品ID':it.id,'商品标题':it.title,'当前售价':it.price,'商品链接':it.url,'商品主图链接':it.image,'发货地区':it.area,'“想要”人数':it.wants,'商品标签':it.tags,'发布时间':it.publishedLocal},publishedAt:it.publishedAt,searchOnly:true}
+        raw:{
+          ...(detail||{}),
+          '商品信息':{...(detail?.['商品信息']||{}),'商品ID':it.id,'商品标题':it.title,'当前售价':it.price,'商品链接':it.url,'商品主图链接':it.image,'发货地区':it.area,'“想要”人数':it.wants,'商品标签':it.tags,'发布时间':it.publishedLocal},
+          publishedAt:it.publishedAt,searchOnly:!detail
+        }
       },sessionId,keyword);
       localKept++;kept++;
     }
-    perQuery.push({query:keyword,sortedNewest:res.sorted,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
+    perQuery.push({query:keyword,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     await sleep(2500+Math.random()*2500);
   }
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
@@ -2142,6 +2178,82 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   clearHealthIssue('xianyu-risk');
   clearHealthIssue('xianyu-search');
   return {ok:true,mode:'direct',perQuery,kept};
+}
+
+// ── XIANYU DETAIL V1 ────────────────────────────────────────────────────
+// Solo para los pocos anuncios que pasan el triaje: abre la ficha (fotos,
+// descripción, vendedor) con un límite por hora. Si Xianyu pide
+// verificación, se dejan de abrir fichas un rato (la búsqueda sigue).
+const XIANYU_DETAIL_API='h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/';
+const xianyuDetailLog=[];
+let xianyuDetailPausedAt=0;
+
+function xianyuDetailBudgetLeft(){
+  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR||4,4,0,20);
+  const now=Date.now();
+  while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
+  if(now-xianyuDetailPausedAt<XIANYU_PAUSE_MS)return 0;
+  return Math.max(0,perHour-xianyuDetailLog.length);
+}
+
+async function fetchXianyuDetailOnce(sourceId){
+  const x=await getXianyuDirect();
+  const page=await x.context.newPage();
+  try{
+    const resp=page.waitForResponse(r=>r.url().includes(XIANYU_DETAIL_API)&&r.request().method()==='POST',{timeout:30000});
+    await page.goto(`https://www.goofish.com/item?id=${encodeURIComponent(sourceId)}`,{waitUntil:'domcontentloaded',timeout:40000});
+    let json=null;
+    try{json=await (await resp).json();}catch{}
+    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
+    if(!json?.data?.itemDO)return {missing:true};
+    return {ok:true,item:json.data.itemDO,seller:json.data.sellerDO||{}};
+  }finally{
+    await page.close().catch(()=>{});
+  }
+}
+
+async function enrichXianyuDetails(items){
+  if(!xianyuDirectMode())return {fetched:0};
+  let fetched=0,skipped=0;
+  for(const item of items||[]){
+    if(item.source!=='xianyu')continue;
+    let raw={};
+    try{raw=JSON.parse(item.raw_json||'{}');}catch{}
+    if(raw.detailFetched)continue;
+    if(xianyuDetailBudgetLeft()<=0){skipped++;continue;}
+    xianyuDetailLog.push(Date.now());
+    // Misma cola que las búsquedas: nunca dos páginas de Xianyu a la vez.
+    const run=xianyuQueue.then(()=>fetchXianyuDetailOnce(item.source_id));
+    xianyuQueue=run.catch(()=>{});
+    const res=await run.catch(e=>({error:e.message}));
+    if(res?.risk){
+      xianyuDetailPausedAt=Date.now();
+      console.log('Xianyu detail: verificación anti-bot; no se abren más fichas durante 2 h (la búsqueda sigue).');
+      break;
+    }
+    if(!res?.ok)continue;
+    const ido=res.item, sdo=res.seller;
+    const images=(ido.imageInfos||[]).map(i=>String(i?.url||'').replace(/^\/\//,'https://')).filter(Boolean);
+    const info={...(raw['商品信息']||{}),'商品图片列表':images,'“想要”人数':ido.wantCnt??raw?.['商品信息']?.['“想要”人数'],'浏览量':ido.browseCnt??null};
+    const sellerInfo={
+      '卖家注册天数':sdo.userRegDay??null,
+      '芝麻信用':sdo?.zhimaLevelInfo?.levelName||null,
+      '卖家已售':sdo.hasSoldNumInteger??null,
+      '卖家在售':sdo.itemCount??null,
+      '好评率':sdo.newGoodRatioRate??null
+    };
+    const newRaw={...raw,'商品信息':info,'卖家信息':sellerInfo,detailFetched:new Date().toISOString(),searchOnly:false};
+    const desc=String(ido.desc||'').trim();
+    db.prepare('UPDATE listings SET description=?,raw_json=?,image_url=COALESCE(NULLIF(?,\'\'),image_url),seller_sales=?,seller_items=? WHERE id=?')
+      .run(desc,JSON.stringify(newRaw),images[0]||'',Number(sdo.hasSoldNumInteger)||null,Number(sdo.itemCount)||null,Number(item.id));
+    item.description=desc;
+    item.raw_json=JSON.stringify(newRaw);
+    if(images[0])item.image_url=images[0];
+    fetched++;
+    await sleep(3000+Math.random()*3000);
+  }
+  if(fetched||skipped)console.log(`Xianyu detail: ${fetched} fichas abiertas${skipped?`, ${skipped} sin abrir por límite horario`:''}.`);
+  return {fetched,skipped};
 }
 
 let xianyuQueue=Promise.resolve();
@@ -3213,6 +3325,8 @@ async function searchJapanRadarLive(opts){
 
 // POSITIVE MARKET VERIFICATION V1.6
 const CENTRAL_AI_INSTRUCTION = `You are the first-pass central AI screening engine for Luxury Hunter. Analyze this second-hand luxury handbag listing conservatively for resale in Europe. First verify that the listing appears to match the target product family; search-query similarity is not proof. The user's task requirements below are mandatory evaluation context. Never certify authenticity from photos alone.
+
+EXOTIC SKIN POLICY (mandatory): if the title, description or photos indicate genuine exotic leather (crocodile, alligator, caiman, python or other snake, ostrich, lizard, stingray/galuchat, eel), decision MUST be REJECT with the reason "piel exótica (CITES)". Embossed/printed calf leather imitating these is NOT exotic.
 
 AUTHENTICITY RISK STABILITY RULES:
 - An implausibly low price is an authenticity RISK SIGNAL, but price alone is NOT sufficient evidence for HIGH authenticity risk or REJECT.
@@ -6390,7 +6504,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}`:'';
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
-  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}\nURL: ${item.url}`;
+  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
   reportProgress(
     8,
     'Cargando imágenes',
@@ -6436,9 +6550,16 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   };
   // Ahorro: la verificación cara (fotos + búsqueda web) solo para candidatos
   // serios. Un WATCH flojo se guarda sin verificar y no se vuelve a pagar.
-  const verifyWatchMin=Number(process.env.VERIFY_WATCH_MIN_SCORE||70);
+  const verifyWatchMin=Number(process.env.VERIFY_WATCH_MIN_SCORE||60);
+  // Un WATCH con mucho margen también se verifica aunque puntúe poco
+  // (caso típico: buen precio pero fotos insuficientes).
+  const verifyWatchProfit=Number(process.env.VERIFY_WATCH_MIN_PROFIT_EUR||250);
+  const bigMarginWatch=preliminaryDecision==='WATCH'&&
+    Number(a.opportunity_score)>=45&&
+    Number(a.net_profit_low_eur)>=verifyWatchProfit;
   const worthVerifying=['BUY','STRONG BUY'].includes(preliminaryDecision)||
-    (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin);
+    (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin)||
+    bigMarginWatch;
   if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&!worthVerifying){
     verification={
       status:'skipped_cost',
@@ -7292,7 +7413,7 @@ function abortedResult(runId,sessionId=null){
 const PRESCREEN_COUNTERFEIT_TERMS=[
   'replica','réplica','super copy','supercopy','mirror quality','fake bag',
   '레플','레플리카','미러급','이미테이션','짝퉁',
-  '高仿','复刻','精仿','超a','a货','莆田',
+  '高仿','复刻','精仿','超a','a货','莆田','一比一','1:1','高版本','原单','尾单','顶配','私货','对版','肉眼无法辨别','同款皮',
   'レプリカ','スーパーコピー','ノベルティ','novelty'
 ];
 const PRESCREEN_ACCESSORY_ONLY_TERMS=[
@@ -7302,8 +7423,35 @@ const PRESCREEN_ACCESSORY_ONLY_TERMS=[
   '只有防尘袋','仅防尘袋','空盒'
 ];
 
+// Pieles exóticas (CITES): sin permiso de importación se requisan en aduana.
+// "Grabado/estampado cocodrilo" en piel de vaca sí se puede importar.
+const PRESCREEN_EXOTIC_TERMS=[
+  'crocodile','croc ','alligator','caiman','porosus','niloticus','python','ostrich','lizard','stingray','galuchat','shagreen','snakeskin','snake skin','eel skin',
+  '鳄鱼皮','真鳄鱼','鳄鱼','蟒蛇皮','蟒蛇','真蛇皮','鸵鸟皮','鸵鸟','蜥蜴皮','蜥蜴','珍珠鱼皮','鳗鱼皮',
+  'クロコダイル','クロコ','アリゲーター','カイマン','パイソン','オーストリッチ','リザード','スティングレイ','ガルーシャ','ヘビ革','蛇革',
+  '크로커다일','악어가죽','악어','파이톤','오스트리치','타조','리자드','도마뱀','가오리'
+];
+const PRESCREEN_EXOTIC_IMITATION=/embossed|emboss|stamped|print|effect|型押し|型押|エンボス|压纹|压花|印花|纹路|蛇纹|鳄鱼纹|엠보|무늬|패턴/i;
+
+function exoticSkinTerm(item){
+  const text=`${item?.title||''} ${item?.description||''}`.toLowerCase();
+  const term=PRESCREEN_EXOTIC_TERMS.find(t=>text.includes(t));
+  if(!term)return null;
+  // "cocodrilo grabado" en el mismo anuncio: piel normal, no se descarta.
+  if(PRESCREEN_EXOTIC_IMITATION.test(text))return null;
+  return term;
+}
+
 function deterministicPrescreen(item){
   const title=String(item?.title||'').toLowerCase();
+  const exotic=exoticSkinTerm(item);
+  if(exotic){
+    return {
+      code:'exotic_skin',
+      term:exotic,
+      reasons:[`Piel exótica ("${exotic.trim()}"): requiere permiso CITES y se puede requisar en aduana. Descartado por política.`]
+    };
+  }
   const counterfeit=PRESCREEN_COUNTERFEIT_TERMS.find(t=>title.includes(t));
   if(counterfeit){
     return {
@@ -7395,7 +7543,7 @@ function storePolicyReject(taskId,item,stage){
 async function triageWithAi(task,items){
   const key=aiApiKey();
   const model=aiTriageModel();
-  const minScore=Number(process.env.AI_TRIAGE_MIN_SCORE||60);
+  const minScore=Number(process.env.AI_TRIAGE_MIN_SCORE||50);
   const scores=new Map();
   let calls=0;
   let usage=null;
@@ -7433,9 +7581,12 @@ TARGET PRODUCT: ${task.product_query}
 TASK CRITERIA (abridged):
 ${String(task.description||'').slice(0,1800)}
 
+Prefer recall over precision: a full analysis costs about one cent, a missed bargain costs hundreds of euros. When a listing plausibly matches the target and the price looks attractive, score it at least 55 even if information is incomplete.
+
 Score each listing 0-100 for "worth a full analysis":
 - High: clearly the target product family/size, price well below typical European resale after the landed cost, no red flags.
 - Low: different model/size/product type (wallets, pouches, charms, straps, other bags), accessories only, replica wording, damaged beyond resale, price already near or above European resale, or too little information to identify the item.
+- Score 0: genuine exotic leather (crocodile, alligator, python/snake, ostrich, lizard, stingray) — CITES import risk. Embossed calf is fine.
 - price_vs_task_median < 1 means cheaper than the median asking price seen for this task (a positive signal, not proof).
 Never invent facts. Use only the listing text below (titles may be Korean, Japanese or Chinese).
 
@@ -7491,31 +7642,94 @@ function telegramConfigured(){
   return !!(process.env.TELEGRAM_BOT_TOKEN&&process.env.TELEGRAM_CHAT_ID);
 }
 
-async function telegramSend(text,photoUrl=null){
+async function telegramApi(method,body={},timeoutMs=20000){
+  const base=String(process.env.TELEGRAM_API_BASE||"https://api.telegram.org").replace(/\/$/,"");
+  const r=await fetch(`${base}/bot${process.env.TELEGRAM_BOT_TOKEN}/${method}`,{
+    method:'POST',
+    headers:{'content-type':'application/json'},
+    body:JSON.stringify(body),
+    signal:AbortSignal.timeout(timeoutMs)
+  });
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok||data.ok===false)throw new Error(`Telegram ${method}: ${data.description||r.status}`);
+  return data;
+}
+
+async function telegramSend(text,photoUrl=null,{buttons=null}={}){
   if(!telegramConfigured())return {sent:false,reason:'telegram-not-configured'};
-  const base=`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
   const chat_id=process.env.TELEGRAM_CHAT_ID;
-  const post=async(method,body)=>{
-    const r=await fetch(`${base}/${method}`,{
-      method:'POST',
-      headers:{'content-type':'application/json'},
-      body:JSON.stringify({chat_id,...body}),
-      signal:AbortSignal.timeout(20000)
-    });
-    const data=await r.json().catch(()=>({}));
-    if(!r.ok||data.ok===false)throw new Error(`Telegram ${method}: ${data.description||r.status}`);
-    return data;
-  };
-  if(photoUrl){
+  const extra=buttons?{reply_markup:{inline_keyboard:buttons}}:{};
+  if(photoUrl&&text.length<=1024){
     try{
-      await post('sendPhoto',{photo:photoUrl,caption:text.slice(0,1024),parse_mode:'HTML'});
+      await telegramApi('sendPhoto',{chat_id,photo:photoUrl,caption:text,parse_mode:'HTML',...extra});
       return {sent:true};
     }catch(e){
       console.error('Telegram photo failed, sending text:',e.message);
     }
   }
-  await post('sendMessage',{text:text.slice(0,4096),parse_mode:'HTML',disable_web_page_preview:false});
+  await telegramApi('sendMessage',{chat_id,text:text.slice(0,4096),parse_mode:'HTML',disable_web_page_preview:false,...extra});
   return {sent:true};
+}
+
+// ── TELEGRAM BUTTONS V1 ─────────────────────────────────────────────────
+// Cada aviso lleva "✅ Me interesa" / "❌ No me interesa". Lo que pulse Nil
+// se guarda en listing_feedback: los descartados no vuelven a avisarse ni a
+// salir en el resumen, y los marcados se destacan en el resumen.
+function alertButtons(listingId){
+  const id=Number(listingId);
+  return [[
+    {text:'✅ Me interesa',callback_data:`ok:${id}`},
+    {text:'❌ No me interesa',callback_data:`no:${id}`}
+  ]];
+}
+
+function listingFeedback(listingId){
+  return db.prepare('SELECT action FROM listing_feedback WHERE listing_id=?').get(Number(listingId))?.action||null;
+}
+
+let telegramPolling=false;
+async function pollTelegramUpdates(){
+  if(!telegramConfigured()||telegramPolling)return {processed:0};
+  telegramPolling=true;
+  let processed=0;
+  try{
+    const offset=Number(getSetting('telegram_update_offset',0))||0;
+    const data=await telegramApi('getUpdates',{offset,timeout:0,allowed_updates:['callback_query']});
+    let next=offset;
+    for(const u of data.result||[]){
+      next=Math.max(next,Number(u.update_id)+1);
+      const cq=u.callback_query;
+      if(!cq)continue;
+      // Solo el chat de Nil puede valorar anuncios.
+      if(String(cq.message?.chat?.id||cq.from?.id)!==String(process.env.TELEGRAM_CHAT_ID))continue;
+      const m=String(cq.data||'').match(/^(ok|no):(\d+)$/);
+      if(!m){await telegramApi('answerCallbackQuery',{callback_query_id:cq.id}).catch(()=>{});continue;}
+      const action=m[1]==='ok'?'interested':'not_interested';
+      db.prepare(`INSERT INTO listing_feedback(listing_id,action,source,created_at) VALUES(?,?,?,?)
+        ON CONFLICT(listing_id) DO UPDATE SET action=excluded.action,created_at=excluded.created_at`)
+        .run(Number(m[2]),action,'telegram',new Date().toISOString());
+      processed++;
+      await telegramApi('answerCallbackQuery',{
+        callback_query_id:cq.id,
+        text:action==='interested'?'Apuntado: te interesa.':'Descartado: no volverá a avisarte.'
+      }).catch(()=>{});
+      await telegramApi('editMessageReplyMarkup',{
+        chat_id:cq.message.chat.id,
+        message_id:cq.message.message_id,
+        reply_markup:{inline_keyboard:[[{text:action==='interested'?'✅ Te interesa':'❌ Descartado',callback_data:'noop'}]]}
+      }).catch(()=>{});
+    }
+    if(next!==offset){
+      db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('telegram_update_offset',?,?)
+        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+        .run(JSON.stringify(next),new Date().toISOString());
+    }
+  }catch(e){
+    console.error('Telegram updates failed:',e.message);
+  }finally{
+    telegramPolling=false;
+  }
+  return {processed};
 }
 
 function eur0(n){
@@ -7570,9 +7784,11 @@ async function sendInstantAlerts(task,runId,items){
       try{final=JSON.parse(x.verification_json||'{}')?.final||{};}catch{}
       if(final.resale_estimate_market_verified!==true)return false;
     }
+    if(listingFeedback(x.id)==='not_interested')return false;
     return !alreadyAlerted.get(Number(x.id));
   }).map(x=>({...x,_task_name:task.task_name,_task_id:task.id,_run_id:runId}));
-  if(!fresh.length)return {sent:0};
+  const soft=await sendSoftAlerts(task,runId,items,new Set(fresh.map(x=>Number(x.id))));
+  if(!fresh.length)return {sent:0,soft};
 
   const rank={'STRONG BUY':0,'BUY':1,'WATCH':2};
   fresh.sort((a,b)=>
@@ -7615,7 +7831,7 @@ async function sendInstantAlerts(task,runId,items){
   if(telegramConfigured()){
     try{
       for(const x of fresh){
-        await telegramSend(instantAlertText(x),x.image_url||null);
+        await telegramSend(instantAlertText(x),x.image_url||null,{buttons:alertButtons(x.id)});
       }
       channels.push('telegram');
     }catch(e){
@@ -7634,7 +7850,52 @@ async function sendInstantAlerts(task,runId,items){
   `);
   for(const x of fresh)mark.run(Number(task.id),Number(x.id),Number(runId)||null,channels.join('+'),now);
   console.log(`Task ${task.id}: aviso inmediato enviado (${channels.join('+')}) para ${fresh.length} oportunidad(es).`);
-  return {sent:fresh.length,channels,errors};
+  return {sent:fresh.length,channels,errors,soft};
+}
+
+// ── SOFT ALERTS V1 ──────────────────────────────────────────────────────
+// "Posible oportunidad, revísala": buen margen pero sin la certeza que
+// exige el aviso fuerte (p. ej. fotos insuficientes). Solo por Telegram,
+// con botones, y como mucho una vez por anuncio.
+async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
+  if(['0','false','off','no'].includes(String(process.env.SOFT_ALERTS||'').toLowerCase()))return {sent:0,reason:'disabled'};
+  if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
+  const minScore=Number(process.env.SOFT_ALERT_MIN_SCORE||50);
+  const minMarginPct=Number(process.env.SOFT_ALERT_MIN_MARGIN_PCT||20);
+  const taskMin=Number(task.notify_min_profit_eur);
+  const minProfit=Number(process.env.SOFT_ALERT_MIN_PROFIT_EUR||0)||Math.max(150,Number.isFinite(taskMin)?Math.round(taskMin*0.6):150);
+  const already=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind IN ('instant','soft') LIMIT 1`);
+  const picks=(items||[]).filter(x=>{
+    if(strictIds.has(Number(x.id)))return false;
+    if(!['STRONG BUY','BUY','WATCH'].includes(String(x.decision||'').toUpperCase()))return false;
+    if(String(x.authenticity_risk||'').toUpperCase()==='HIGH')return false;
+    if(!(Number(x.opportunity_score)>=minScore))return false;
+    const profitLow=Number(x.net_profit_low_eur);
+    if(!(profitLow>=minProfit))return false;
+    const landed=Number(x.landed_cost_eur);
+    if(landed>0&&!(profitLow/landed*100>=minMarginPct))return false;
+    if(listingFeedback(x.id)==='not_interested')return false;
+    return !already.get(Number(x.id));
+  }).sort((a,b)=>Number(b.net_profit_low_eur)-Number(a.net_profit_low_eur)).slice(0,3);
+  if(!picks.length)return {sent:0};
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'soft','telegram',?)`);
+  let sent=0;
+  for(const x of picks){
+    let why='';
+    try{why=String(JSON.parse(x.decision_reasons_es_json||'[]')[0]||'');}catch{}
+    const text=instantAlertText({...x,_task_name:task.task_name})
+      .replace(/^🔥 <b>[^<]*<\/b>/,`👀 <b>Posible oportunidad · revísala</b>`)
+      +(why?`\n<i>${htmlEsc(why.slice(0,220))}</i>`:'');
+    try{
+      await telegramSend(text,x.image_url||null,{buttons:alertButtons(x.id)});
+      mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
+      sent++;
+    }catch(e){
+      console.error('Soft alert failed:',e.message);
+    }
+  }
+  if(sent)console.log(`Task ${task.id}: ${sent} posible(s) oportunidad(es) enviada(s) por Telegram.`);
+  return {sent};
 }
 
 const HEALTH_ALERT_COOLDOWN_HOURS={
@@ -7697,7 +7958,7 @@ async function reportRunHealth(status){
   for(const [src,s] of Object.entries(status||{})){
     // triage no es una fuente: si falla se usa la prioridad por precio y los
     // fallos reales de IA ya se avisan aparte (gemini-errors / ai-budget).
-    if(['freshness','aiAnalysis','email','instantAlerts','prescreen','triage'].includes(src))continue;
+    if(['freshness','aiAnalysis','email','instantAlerts','prescreen','triage','xianyuDetail'].includes(src))continue;
     if(s&&s.ok===false){
       await reportHealthIssue(`source-${src}`,`La fuente ${src} falla: ${s.error||s.warning||'sin detalle'}`);
     }else if(s&&s.ok===true){
@@ -7947,7 +8208,7 @@ async function executeTask(taskId, runId=null) {
         }
       }
 
-      const maxAiItems=Number(process.env.AI_MAX_ITEMS_PER_TASK_RUN||5);
+      const maxAiItems=Number(process.env.AI_MAX_ITEMS_PER_TASK_RUN||10);
       let deferred=0;
       if(Number.isFinite(maxAiItems)&&maxAiItems>0&&pendingItems.length>maxAiItems){
         deferred=pendingItems.length-maxAiItems;
@@ -7956,6 +8217,18 @@ async function executeTask(taskId, runId=null) {
         }
         pendingItems=pendingItems.slice(0,maxAiItems);
         console.log(`Task ${taskId}: ${deferred} anuncios menos prioritarios aplazados a la siguiente ejecución.`);
+      }
+      // Xianyu: abrir la ficha completa solo de los candidatos que van a
+      // análisis (mejor puntuación de triaje primero).
+      const xianyuPending=pendingItems.filter(x=>x.source==='xianyu');
+      if(xianyuPending.length){
+        try{
+          result.status.xianyuDetail=await enrichXianyuDetails(
+            [...xianyuPending].sort((a,b)=>(b._triageScore??-1)-(a._triageScore??-1))
+          );
+        }catch(e){
+          console.error(`Task ${taskId}: fichas de Xianyu no disponibles:`,e.message);
+        }
       }
       result.status.prescreen.medianAskingEur=prioritized.median;
       result.status.prescreen.deferred=deferred;
@@ -9527,6 +9800,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
       const decision=String(x.decision||'').toUpperCase();
       if(!['STRONG BUY','BUY','WATCH'].includes(decision))continue;
 
+      if(listingFeedback(x.id)==='not_interested')continue;
       if(listingWasEverEmailed(x.id)){
         previouslyEmailedSkipped++;
         continue;
@@ -9876,6 +10150,22 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='GET'&&u.pathname==='/api/xianyu/accounts'){
       try{return json(res,200,{accounts:await xianyuFetch('/api/accounts',{timeoutMs:7000})});}catch(e){return json(res,200,{accounts:[],error:e.message});}
     }
+    if(req.method==='POST'&&u.pathname==='/api/telegram/test-alert'){
+      const b=await readBody(req);
+      const id=Number(b.listingId)||0;
+      const r=await telegramSend(`🧪 <b>Prueba de botones</b>\nPulsa uno: el bot lo guardará en la próxima comprobación.`,null,{buttons:alertButtons(id)});
+      return json(res,200,r);
+    }
+    if(req.method==='POST'&&u.pathname==='/api/telegram/poll'){
+      return json(res,200,{...(await pollTelegramUpdates()),feedback:db.prepare('SELECT * FROM listing_feedback ORDER BY created_at DESC LIMIT 5').all()});
+    }
+    if(req.method==='POST'&&u.pathname==='/api/xianyu/detail'){
+      const b=await readBody(req);
+      const ids=(Array.isArray(b.listingIds)?b.listingIds:[b.listingId]).map(Number).filter(Boolean);
+      const items=ids.map(id=>db.prepare('SELECT * FROM listings WHERE id=?').get(id)).filter(Boolean);
+      const r=await enrichXianyuDetails(items);
+      return json(res,200,{...r,items:ids.map(id=>{const l=db.prepare('SELECT id,title,description,seller_sales,raw_json FROM listings WHERE id=?').get(id);let raw={};try{raw=JSON.parse(l?.raw_json||'{}');}catch{}return l?{id:l.id,title:l.title,desc:String(l.description||'').slice(0,80),sales:l.seller_sales,images:(raw['商品信息']?.['商品图片列表']||[]).length,seller:raw['卖家信息']||null}:null;})});
+    }
     if(req.method==='POST'&&u.pathname==='/api/search/global'){const b=await readBody(req);return json(res,200,await globalSearch(b));}
     if(req.method==='GET'&&u.pathname==='/api/search/latest'){
       const s=db.prepare('SELECT * FROM search_sessions ORDER BY started_at DESC LIMIT 1').get();
@@ -10101,5 +10391,11 @@ server.listen(PORT,'127.0.0.1',async()=>{
     setInterval(()=>schedulerTick().catch(e=>console.error('Scheduler:',e.message)),30000);
   } else {
     console.log('Scheduler disabled for one-shot/cloud execution.');
+  }
+  // Botones de Telegram: se recogen las pulsaciones cada 20 s mientras el
+  // servidor está vivo (en GitHub, durante cada ejecución).
+  if(telegramConfigured()&&!['0','off','false','no'].includes(String(process.env.TELEGRAM_POLL||'').toLowerCase())){
+    pollTelegramUpdates().catch(()=>{});
+    setInterval(()=>pollTelegramUpdates().catch(()=>{}),20000).unref?.();
   }
 });

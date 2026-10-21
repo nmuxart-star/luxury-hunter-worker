@@ -27,11 +27,11 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-6.1-sol' }}
       OPENAI_TRIAGE_MODEL: ${{ vars.OPENAI_TRIAGE_MODEL || 'gpt-6-luna' }}
-      AI_TRIAGE_MIN_SCORE: ${{ vars.AI_TRIAGE_MIN_SCORE || '60' }}
+      AI_TRIAGE_MIN_SCORE: ${{ vars.AI_TRIAGE_MIN_SCORE || '50' }}
       # Tope de gasto diario en OpenAI (USD). Al alcanzarlo se deja de analizar hasta mañana.
       AI_DAILY_BUDGET_USD: ${{ vars.AI_DAILY_BUDGET_USD || '1' }}
       # Verificación cara (fotos + búsqueda web) solo para BUY/STRONG BUY o WATCH con esta puntuación.
-      VERIFY_WATCH_MIN_SCORE: ${{ vars.VERIFY_WATCH_MIN_SCORE || '70' }}
+      VERIFY_WATCH_MIN_SCORE: ${{ vars.VERIFY_WATCH_MIN_SCORE || '60' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # Fuentes por API oficial (se activan solas si existen los secretos).
       RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
@@ -63,7 +63,7 @@ jobs:
       # Avisos inmediatos (email siempre; Telegram si hay secretos).
       INSTANT_ALERT_DECISIONS: ${{ vars.INSTANT_ALERT_DECISIONS || 'STRONG BUY,BUY' }}
       INSTANT_ALERT_MIN_PROFIT_EUR: ${{ vars.INSTANT_ALERT_MIN_PROFIT_EUR || '' }}
-      AI_MAX_ITEMS_PER_TASK_RUN: ${{ vars.AI_MAX_ITEMS_PER_TASK_RUN || '5' }}
+      AI_MAX_ITEMS_PER_TASK_RUN: ${{ vars.AI_MAX_ITEMS_PER_TASK_RUN || '10' }}
       # Informe: uno al día a partir de esta hora (Europe/Madrid).
       DIGEST_SCHEDULE: ${{ vars.DIGEST_SCHEDULE || 'daily' }}
       DIGEST_DAILY_HOUR: ${{ vars.DIGEST_DAILY_HOUR || '9' }}
