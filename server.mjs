@@ -8026,6 +8026,46 @@ function instantAlertText(x){
   ].filter(Boolean).join('\n');
 }
 
+// ── LÍMITE DE AVISOS POR MODELO ─────────────────────────────────────────
+// Evita que un modelo con muchos anuncios (p. ej. Lady Dior) llene Telegram:
+// tope por tarea cada 24 h, se descartan casi-duplicados (mismo vendedor y
+// precio parecido, o mismo título) y, en los avisos suaves, cada nuevo aviso
+// tiene que superar al peor que ya se ha enviado hoy de esa tarea.
+function recentTaskAlerts(taskId,kinds,hours=24){
+  const since=new Date(Date.now()-hours*3600e3).toISOString();
+  return db.prepare(`SELECT n.listing_id,n.kind,l.seller_name,l.title,l.price_eur,ta.net_profit_low_eur
+    FROM notifications n JOIN listings l ON l.id=n.listing_id
+    LEFT JOIN task_analyses ta ON ta.task_id=n.task_id AND ta.listing_id=n.listing_id
+    WHERE n.task_id=? AND n.sent_at>=? AND n.kind IN (${kinds.map(()=>'?').join(',')})`).all(Number(taskId),since,...kinds);
+}
+const normTitle=t=>String(t||'').toLowerCase().replace(/[^\p{L}\p{N}]+/gu,'');
+function isNearDuplicateAlert(x,sent){
+  const seller=String(x.seller_name||'').trim();
+  const price=Number(x.price_eur)||0;
+  const title=normTitle(x.title);
+  return sent.some(s=>{
+    if(title&&title.length>8&&normTitle(s.title)===title)return true;
+    if(seller&&String(s.seller_name||'').trim()===seller){
+      const p=Number(s.price_eur)||0;
+      if(price>0&&p>0&&Math.abs(price-p)/Math.max(price,p)<=0.1)return true;
+    }
+    return false;
+  });
+}
+function limitTaskAlerts(task,picks,{kinds,max,mustBeatWorst=false}){
+  const sent=recentTaskAlerts(task.id,kinds);
+  let room=Math.max(0,max-sent.length);
+  const worst=sent.length?Math.min(...sent.map(s=>Number(s.net_profit_low_eur)||0)):null;
+  const out=[];
+  for(const x of picks){
+    if(room<=0)break;
+    if(isNearDuplicateAlert(x,[...sent,...out]))continue;
+    if(mustBeatWorst&&worst!=null&&!(Number(x.net_profit_low_eur)>worst))continue;
+    out.push(x);room--;
+  }
+  return out;
+}
+
 async function sendInstantAlerts(task,runId,items){
   if(['0','false','off','no'].includes(String(process.env.INSTANT_ALERTS||'').toLowerCase())){
     return {sent:0,reason:'disabled'};
@@ -8056,14 +8096,15 @@ async function sendInstantAlerts(task,runId,items){
     if(listingFeedback(x.id)==='not_interested')return false;
     return !alreadyAlerted.get(Number(x.id));
   }).map(x=>({...x,_task_name:task.task_name,_task_id:task.id,_run_id:runId}));
-  const soft=await sendSoftAlerts(task,runId,items,new Set(fresh.map(x=>Number(x.id))));
-  if(!fresh.length)return {sent:0,soft};
-
   const rank={'STRONG BUY':0,'BUY':1,'WATCH':2};
   fresh.sort((a,b)=>
     (rank[String(a.decision).toUpperCase()]??9)-(rank[String(b.decision).toUpperCase()]??9) ||
     Number(b.net_profit_low_eur??-1e9)-Number(a.net_profit_low_eur??-1e9)
   );
+  const freshAll=fresh.slice();
+  fresh.splice(0,fresh.length,...limitTaskAlerts(task,freshAll,{kinds:['instant'],max:Number(process.env.INSTANT_ALERT_TASK_DAILY_MAX||4)}));
+  const soft=await sendSoftAlerts(task,runId,items,new Set(freshAll.map(x=>Number(x.id))));
+  if(!fresh.length)return {sent:0,soft};
 
   const channels=[];
   const errors=[];
@@ -8145,7 +8186,9 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
     if(landed>0&&!(profitLow/landed*100>=minMarginPct))return false;
     if(listingFeedback(x.id)==='not_interested')return false;
     return !already.get(Number(x.id));
-  }).sort((a,b)=>Number(b.net_profit_low_eur)-Number(a.net_profit_low_eur)).slice(0,3);
+  }).sort((a,b)=>Number(b.net_profit_low_eur)-Number(a.net_profit_low_eur));
+  const picksLimited=limitTaskAlerts(task,picks,{kinds:['instant','soft'],max:Number(process.env.SOFT_ALERT_TASK_DAILY_MAX||3),mustBeatWorst:true});
+  picks.splice(0,picks.length,...picksLimited);
   if(!picks.length)return {sent:0};
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'soft','telegram',?)`);
   let sent=0;
