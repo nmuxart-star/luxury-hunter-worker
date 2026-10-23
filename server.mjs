@@ -7645,6 +7645,17 @@ function exoticSkinTerm(item){
 // Xianyu sin verificación de autenticidad de la plataforma (验货宝) = descartado
 // siempre, sin gastar IA ni avisar. Política de Nil.
 function xianyuVerificationVeto(item){
+  // eBay: solo anuncios con la Garantía de Autenticidad de eBay (un experto
+  // revisa el bolso antes de enviarlo). El resto se descarta sin IA.
+  if(String(item?.source||'').toLowerCase().startsWith('ebay-')&&!['0','false','off','no'].includes(String(process.env.EBAY_REQUIRE_AUTHENTICITY||'').toLowerCase())){
+    let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
+    if(raw.authenticityGuarantee===true)return null;
+    return {
+      code:'no_ebay_authenticity_guarantee',
+      term:'sin garantía',
+      reasons:['El anuncio de eBay no tiene la Garantía de Autenticidad de eBay. Descartado por política.']
+    };
+  }
   if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
   const v=detectMarketplaceVerification(item);
   if(['AVAILABLE','PASSED'].includes(v.status))return null;
@@ -7689,14 +7700,14 @@ function deterministicPrescreen(item){
 // para que no salgan en avisos, resúmenes ni se vuelvan a verificar.
 function vetoUnverifiableXianyuAnalyses(){
   const rows=db.prepare(`SELECT ta.task_id,l.* FROM task_analyses ta JOIN listings l ON l.id=ta.listing_id
-    WHERE l.source='xianyu' AND UPPER(COALESCE(ta.decision,''))<>'REJECT'`).all();
+    WHERE (l.source='xianyu' OR l.source LIKE 'ebay-%') AND UPPER(COALESCE(ta.decision,''))<>'REJECT'`).all();
   let n=0;
   for(const r of rows){
     const {task_id,...item}=r;
     const veto=xianyuVerificationVeto(item);
     if(veto){storePrescreenReject(task_id,item,veto);n++;}
   }
-  if(n)console.log(`Xianyu sin verificación: ${n} análisis pasados a descartados.`);
+  if(n)console.log(`Sin verificación de autenticidad (Xianyu/eBay): ${n} análisis pasados a descartados.`);
 }
 function storePrescreenReject(taskId,item,pre){
   const now=new Date().toISOString();
@@ -8457,11 +8468,20 @@ async function reportRunHealth(status){
     // triage no es una fuente: si falla se usa la prioridad por precio y los
     // fallos reales de IA ya se avisan aparte (gemini-errors / ai-budget).
     if(['freshness','aiAnalysis','email','instantAlerts','prescreen','triage','xianyuDetail'].includes(src))continue;
+    // Un fallo suelto (p. ej. Bunjang tarda en responder una vez) no avisa:
+    // solo a partir de 3 fallos seguidos de la misma fuente.
+    const streaks=getSetting('source_fail_streak',{})||{};
     if(s&&s.ok===false){
-      await reportHealthIssue(`source-${src}`,`La fuente ${src} falla: ${s.error||s.warning||'sin detalle'}`);
+      streaks[src]=Number(streaks[src]||0)+1;
+      if(streaks[src]>=Number(process.env.SOURCE_ALERT_MIN_STREAK||3)){
+        await reportHealthIssue(`source-${src}`,`La fuente ${src} falla (${streaks[src]} veces seguidas): ${s.error||s.warning||'sin detalle'}`);
+      }
     }else if(s&&s.ok===true){
+      streaks[src]=0;
       clearHealthIssue(`source-${src}`);
     }
+    db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('source_fail_streak',?,?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify(streaks),new Date().toISOString());
   }
 }
 
