@@ -852,9 +852,51 @@ const OPENAI_WEB_SEARCH_USD=0.01;
 function aiSpendDay(){
   return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Madrid',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 }
+// Tope mensual (factura de OpenAI, mes en UTC): el presupuesto de cada día es
+// lo que queda del mes repartido entre los días que faltan, sin pasar nunca
+// de AI_DAILY_BUDGET_USD. AI_MONTH_SPENT_RESET="AAAA-MM:usd" ajusta lo gastado
+// en el mes al valor real del panel de OpenAI (una vez por valor).
+function aiMonthKey(){return new Date().toISOString().slice(0,7);}
+function getAiMonthSpend(){
+  const st=getSetting('ai_spend_month',{})||{};
+  return st.month===aiMonthKey()?st:{month:aiMonthKey(),usd:0};
+}
+function addAiMonthSpend(usd){
+  const st=getAiMonthSpend();
+  st.usd=Number((Number(st.usd||0)+usd).toFixed(6));
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_spend_month',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify(st),new Date().toISOString());
+}
+function applyAiMonthSpendReset(){
+  const raw=String(process.env.AI_MONTH_SPENT_RESET||'').trim();
+  const m=raw.match(/^(\d{4}-\d{2}):(\d+(?:\.\d+)?)$/);
+  if(!m||m[1]!==aiMonthKey())return;
+  if(getSetting('ai_month_reset_applied',null)===raw)return;
+  // El valor del panel ya incluye lo de hoy hasta ahora: se suma solo lo que
+  // se gaste a partir de este momento.
+  const now=new Date().toISOString();
+  const put=db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`);
+  put.run('ai_spend_month',JSON.stringify({month:m[1],usd:Number(m[2]),todayAtReset:getAiSpend().usd}),now);
+  put.run('ai_month_reset_applied',JSON.stringify(raw),now);
+  console.log(`Gasto de IA del mes ajustado a ${m[2]} $.`);
+}
+function aiMonthlyAllowanceTodayUsd(){
+  const cap=Number(process.env.AI_MONTHLY_BUDGET_USD||0);
+  if(!Number.isFinite(cap)||cap<=0)return Infinity;
+  const now=new Date();
+  const daysInMonth=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+1,0)).getUTCDate();
+  const daysLeft=daysInMonth-now.getUTCDate()+1;
+  const month=getAiMonthSpend();
+  // Lo gastado antes de hoy = mes - hoy (lo de hoy ya contado en el mes).
+  const todaySinceReset=Math.max(0,getAiSpend().usd-Number(month.todayAtReset||0));
+  const beforeToday=Math.max(0,Number(month.usd||0)-todaySinceReset);
+  return Math.max(0,(cap-beforeToday)/daysLeft);
+}
 function aiDailyBudgetUsd(){
   const n=Number(process.env.AI_DAILY_BUDGET_USD??1);
-  return Number.isFinite(n)&&n>0?n:Infinity;
+  const daily=Number.isFinite(n)&&n>0?n:Infinity;
+  return Math.min(daily,aiMonthlyAllowanceTodayUsd());
 }
 // Ajuste manual del gasto de hoy (una sola vez por valor): variable
 // AI_SPEND_RESET="AAAA-MM-DD:usd" → el contador de ese día pasa a "usd".
@@ -897,6 +939,7 @@ function recordAiSpend(model,purpose,body){
   bp.usd=Number((bp.usd+usd).toFixed(6));
   bp.calls++;
   state.byPurpose[purpose]=bp;
+  addAiMonthSpend(usd);
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_spend',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
     .run(JSON.stringify(state),new Date().toISOString());
@@ -935,8 +978,10 @@ function assertAiBudget(){
 // tienen su propio tope diario para que nunca dejen sin presupuesto al
 // triaje y al análisis, que son los que encuentran oportunidades nuevas.
 function verifyBudgetLeftUsd(){
-  const budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
+  let budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
   if(!Number.isFinite(budget)||budget<=0)return Infinity;
+  // Con tope mensual, la verificación nunca pasa de la mitad del día.
+  budget=Math.min(budget,aiDailyBudgetUsd()*0.5);
   const spent=Number(getAiSpend()?.byPurpose?.verify?.usd||0);
   return budget*aiPaceShare()-spent;
 }
@@ -10873,6 +10918,7 @@ async function schedulerTick(){
 server.listen(PORT,'127.0.0.1',async()=>{
   console.log(`Luxury Hunter v1.7 -> http://127.0.0.1:${PORT}`);
   try{applyAiSpendReset();}catch(e){console.error('AI spend reset:',e.message);}
+  try{applyAiMonthSpendReset();}catch(e){console.error('AI month reset:',e.message);}
   try{vetoUnverifiableXianyuAnalyses();}catch(e){console.error('Xianyu veto:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();

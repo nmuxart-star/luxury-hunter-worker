@@ -20,6 +20,8 @@ let stats={listings:0,analyses:0,notifications:0,feedback:0};
 let spendToday=Number(getSetting(db,'ai_spend')?.day===today?getSetting(db,'ai_spend').usd:0)||0;
 let lastDigest=getSetting(db,'global_digest_state')?.last_sent_at||null;
 let tgOffset=Number(getSetting(db,'telegram_update_offset')||0);
+const monthNow=new Date().toISOString().slice(0,7);
+let month=(getSetting(db,'ai_spend_month')||{});if(month.month!==monthNow)month={month:monthNow,usd:0};
 
 const listingCols=cols(db,'listings').filter(c=>c!=='id');
 const analysisCols=hasTable(db,'task_analyses')?cols(db,'task_analyses').filter(c=>!['id','task_id','listing_id'].includes(c)):[];
@@ -78,10 +80,13 @@ for(const file of others){
   const dg=getSetting(src,'global_digest_state')?.last_sent_at;
   if(dg&&(!lastDigest||dg>lastDigest))lastDigest=dg;
   tgOffset=Math.max(tgOffset,Number(getSetting(src,'telegram_update_offset')||0));
+  const sm=getSetting(src,'ai_spend_month');
+  if(sm?.month===monthNow&&Number(sm.usd||0)>Number(month.usd||0))month=sm;
   src.close();
 }
 const cur=getSetting(db,'ai_spend');
 putSetting('ai_spend',{...(cur?.day===today?cur:{day:today,calls:0,webSearches:0,byPurpose:{}}),usd:Number(spendToday.toFixed(4))});
 if(lastDigest)putSetting('global_digest_state',{...(getSetting(db,'global_digest_state')||{}),last_sent_at:lastDigest});
 if(tgOffset)putSetting('telegram_update_offset',tgOffset);
+if(month.usd)putSetting('ai_spend_month',month);
 console.log(`merge-state: +${stats.listings} anuncios, +${stats.analyses} análisis, +${stats.notifications} avisos, +${stats.feedback} valoraciones; gasto IA hoy ${spendToday.toFixed(2)} $; último resumen ${lastDigest||'-'}`);

@@ -33,6 +33,8 @@ jobs:
       AI_DAILY_BUDGET_USD: ${{ vars.AI_DAILY_BUDGET_USD || '0.75' }}
       AI_VERIFY_DAILY_BUDGET_USD: ${{ vars.AI_VERIFY_DAILY_BUDGET_USD || '0.4' }}
       AI_SPEND_RESET: ${{ vars.AI_SPEND_RESET || '' }}
+      AI_MONTHLY_BUDGET_USD: ${{ vars.AI_MONTHLY_BUDGET_USD || '20' }}
+      AI_MONTH_SPENT_RESET: ${{ vars.AI_MONTH_SPENT_RESET || '' }}
       # Verificación cara (fotos + búsqueda web) solo para BUY/STRONG BUY o WATCH con esta puntuación.
       VERIFY_WATCH_MIN_SCORE: ${{ vars.VERIFY_WATCH_MIN_SCORE || '60' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
