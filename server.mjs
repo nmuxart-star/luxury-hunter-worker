@@ -7650,10 +7650,13 @@ function xianyuVerificationVeto(item){
   if(String(item?.source||'').toLowerCase().startsWith('ebay-')&&!['0','false','off','no'].includes(String(process.env.EBAY_REQUIRE_AUTHENTICITY||'').toLowerCase())){
     let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
     if(raw.authenticityGuarantee===true)return null;
+    // Excepción: vendedores con muchísimas ventas y valoraciones casi perfectas.
+    const fb=Number(item?.seller_sales), pct=Number(item?.seller_reviews);
+    if(fb>=Number(process.env.EBAY_TRUSTED_MIN_FEEDBACK||2000)&&pct>=Number(process.env.EBAY_TRUSTED_MIN_PCT||99.5))return null;
     return {
       code:'no_ebay_authenticity_guarantee',
       term:'sin garantía',
-      reasons:['El anuncio de eBay no tiene la Garantía de Autenticidad de eBay. Descartado por política.']
+      reasons:['El anuncio de eBay no tiene la Garantía de Autenticidad de eBay ni es de un vendedor con muchas ventas y valoraciones casi perfectas. Descartado por política.']
     };
   }
   if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
@@ -8219,6 +8222,7 @@ function instantAlertText(x){
     `${htmlEsc(x.source)} · precio ${eur0(x.price_eur)} · coste importado ${eur0(x.landed_cost_eur)}`,
     `Reventa ${resale}`,
     `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
+    String(x.source||'').startsWith('ebay-')?(()=>{let r={};try{r=JSON.parse(x.raw_json||'{}')}catch{};return r.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`;})():'',
     x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir en la app</a>`:''
   ].filter(Boolean).join('\n');
 }
