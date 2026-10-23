@@ -829,6 +829,7 @@ function openaiPurposeConfig(purpose,requestedModel){
   const cfg={
     triage:{model:cheap,effort:process.env.OPENAI_TRIAGE_EFFORT||'none',detail:'low'},
     repair:{model:cheap,effort:'none',detail:'low'},
+    telegram:{model:cheap,effort:'low',detail:'high'},
     screen:{model:process.env.OPENAI_SCREEN_MODEL||cheap,effort:process.env.OPENAI_SCREEN_EFFORT||'low',detail:'low'},
     verify:{model:strong,effort:process.env.OPENAI_VERIFY_EFFORT||'low',detail:process.env.OPENAI_IMAGE_DETAIL||'auto'}
   }[purpose]||{model:requestedModel||strong,effort:'low',detail:'auto'};
@@ -7956,6 +7957,143 @@ function listingFeedback(listingId){
   return db.prepare('SELECT action FROM listing_feedback WHERE listing_id=?').get(Number(listingId))?.action||null;
 }
 
+// ── TELEGRAM: RECÁLCULO CON PRECIO NEGOCIADO ────────────────────────────
+// Nil responde a un aviso (o manda una captura, o un enlace) con el precio
+// que ha conseguido con el vendedor y el bot recalcula coste, beneficio y si
+// ahora merece la pena, con la reventa que ya estimó para ese anuncio.
+const TG_CURRENCY=[
+  ['CNY',/¥|￥|元|rmb|cny|yuan|kuai/i],
+  ['JPY',/円|jpy|yen/i],
+  ['KRW',/₩|원|krw|won/i],
+  ['EUR',/€|eur|euro/i],
+  ['USD',/\$|usd|dólar|dolar/i]
+];
+function parseNegotiatedPrice(text){
+  const t=String(text||'');
+  const re=/(¥|￥|€|₩|\$)?\s*(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:[.,]\d{1,2})?)\s*(k\b|mil\b)?\s*(€|euros?|eur|¥|￥|元|rmb|cny|yuan|円|jpy|yen|₩|원|won|krw|\$|usd)?/gi;
+  const found=[];
+  for(const m of t.matchAll(re)){
+    let raw=m[2];
+    if(/[.,\s]\d{3}$/.test(raw)&&!/[.,]\d{1,2}$/.test(raw.replace(/[.,\s]\d{3}$/,'')))raw=raw.replace(/[.,\s]/g,'');
+    else raw=raw.replace(',','.');
+    let n=Number(raw);
+    if(!Number.isFinite(n)||n<=0)continue;
+    if(m[3])n*=1000;
+    const tag=`${m[1]||''}${m[4]||''}`;
+    const cur=(TG_CURRENCY.find(([,r])=>r.test(tag))||[])[0]||null;
+    found.push({amount:n,currency:cur});
+  }
+  return found.find(x=>x.currency)||found.sort((a,b)=>b.amount-a.amount)[0]||null;
+}
+function listingIdFromTelegramMessage(m){
+  if(!m)return null;
+  for(const row of m.reply_markup?.inline_keyboard||[])for(const b of row){
+    const k=String(b.callback_data||'').match(/^(?:ok|no):(\d+)$/);if(k)return Number(k[1]);
+  }
+  const urls=[...(m.entities||[]),...(m.caption_entities||[])].map(e=>e.url).filter(Boolean);
+  const text=`${m.text||''} ${m.caption||''} ${urls.join(' ')}`;
+  const dec=decodeURIComponent(text.replace(/%(?![0-9a-f]{2})/gi,'%25'));
+  const ids=[...dec.matchAll(/(?:[?&]id=|item\/|products\/|\/item\?id=)(\d{6,})/gi)].map(x=>x[1]);
+  for(const id of ids){
+    const row=db.prepare('SELECT id FROM listings WHERE source_id=? ORDER BY last_seen DESC LIMIT 1').get(id);
+    if(row)return row.id;
+  }
+  return null;
+}
+async function telegramFileBase64(fileId){
+  const f=await telegramApi('getFile',{file_id:fileId});
+  const base=String(process.env.TELEGRAM_API_BASE||'https://api.telegram.org').replace(/\/$/,'');
+  const r=await fetch(`${base}/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${f.result.file_path}`,{signal:AbortSignal.timeout(30000)});
+  if(!r.ok)throw new Error(`descarga de la foto: ${r.status}`);
+  return Buffer.from(await r.arrayBuffer()).toString('base64');
+}
+// Captura sin enlace: la IA barata lee la captura y la compara con los
+// anuncios avisados recientemente. No se guarda la imagen.
+async function identifyListingFromScreenshot(fileId){
+  const cands=db.prepare(`SELECT DISTINCT l.id,l.source,l.title,l.original_price,l.currency,ta.model
+    FROM notifications n JOIN listings l ON l.id=n.listing_id
+    LEFT JOIN task_analyses ta ON ta.listing_id=l.id AND ta.task_id=n.task_id
+    WHERE n.sent_at>=? ORDER BY n.sent_at DESC LIMIT 40`).all(new Date(Date.now()-21*86400e3).toISOString());
+  const data=await telegramFileBase64(fileId);
+  const prompt=`You receive a screenshot shared by a luxury handbag reseller. It shows either a marketplace listing (Xianyu/Goofish, Bunjang, Mercari, Buyee...) or a chat with the seller where a lower price was agreed.
+Candidate listings previously sent to the reseller (JSON): ${JSON.stringify(cands)}
+Return ONLY JSON: {"listing_id": <id of the candidate that is clearly the same listing, or null>, "agreed_price": <the negotiated/agreed price if visible, otherwise the listing price shown, number or null>, "currency": "CNY"|"JPY"|"KRW"|"EUR"|"USD"|null, "seen_title": "<short title read from the image>"}
+Match only when title, product and price context clearly point to the same listing; otherwise listing_id null.`;
+  const {data:out}=await geminiJsonRequest({key:aiApiKey(),model:aiTriageModel(),parts:[{text:prompt},{inline_data:{mime_type:'image/jpeg',data}}],purpose:'telegram'});
+  return out||{};
+}
+function telegramMaxPriceFor(listing,resaleLow,minProfit,minMarginPct){
+  let lo=0,hi=Math.max(1,resaleLow);
+  const ok=p=>{const landed=importEconomics({...listing,price_eur:p}).importedTotalEur;const prof=resaleLow-landed;return prof>=minProfit&&prof/landed*100>=minMarginPct;};
+  if(!ok(0))return null;
+  for(let i=0;i<40;i++){const mid=(lo+hi)/2;if(ok(mid))lo=mid;else hi=mid;}
+  return lo;
+}
+function fmtMoney(n,cur){
+  if(!Number.isFinite(Number(n)))return '—';
+  const sym={CNY:'¥',JPY:'¥',KRW:'₩',EUR:'€',USD:'$'}[cur]||cur;
+  return `${Math.round(Number(n)).toLocaleString('es-ES')} ${sym}`;
+}
+async function handleTelegramNegotiation(msg){
+  const chat_id=msg.chat.id;
+  const reply=(text)=>telegramApi('sendMessage',{chat_id,text,parse_mode:'HTML',reply_to_message_id:msg.message_id,disable_web_page_preview:true}).catch(e=>console.error('Telegram reply failed:',e.message));
+  const text=`${msg.text||''} ${msg.caption||''}`.trim();
+  if(/^\/(start|help|ayuda)/i.test(text)||(!msg.photo&&!msg.reply_to_message&&!parseNegotiatedPrice(text)&&!listingIdFromTelegramMessage(msg))){
+    return reply('Para recalcular un anuncio con el precio que has negociado:\n• Responde al aviso con el precio (p. ej. <b>3200¥</b> o <b>450€</b>), o\n• mándame la captura del anuncio o del chat con el vendedor, con el precio si no se ve.');
+  }
+  let listingId=listingIdFromTelegramMessage(msg.reply_to_message)||listingIdFromTelegramMessage(msg);
+  let price=parseNegotiatedPrice(text);
+  const photo=(msg.photo||[]).slice(-1)[0];
+  if((!listingId||!price)&&photo){
+    try{
+      const ai=await identifyListingFromScreenshot(photo.file_id);
+      if(!listingId&&Number(ai.listing_id))listingId=Number(ai.listing_id);
+      if(!price&&Number(ai.agreed_price)>0)price={amount:Number(ai.agreed_price),currency:ai.currency||null};
+    }catch(e){
+      return reply(`No he podido leer la captura (${htmlEsc(e.message)}). Responde al aviso del anuncio con el precio, por ejemplo <b>3200¥</b>.`);
+    }
+  }
+  if(!listingId)return reply('No sé de qué anuncio se trata. Responde directamente al aviso que te envié (mantén pulsado → Responder) con el precio negociado, o pégame el enlace del anuncio.');
+  const listing=db.prepare('SELECT * FROM listings WHERE id=?').get(listingId);
+  if(!listing)return reply('No encuentro ese anuncio en la base de datos del bot.');
+  if(!price)return reply(`Es el anuncio <b>${htmlEsc(listing.title.slice(0,80))}</b>. ¿A qué precio lo has dejado? Respóndeme con el número y la moneda, por ejemplo <b>3200¥</b>.`);
+  const cur=price.currency||listing.currency||'EUR';
+  const newEur=toEur(price.amount,cur);
+  if(!Number.isFinite(newEur))return reply(`No tengo el cambio de ${cur} a euros ahora mismo.`);
+  const a=db.prepare('SELECT * FROM task_analyses WHERE listing_id=? ORDER BY updated_at DESC LIMIT 1').get(listingId);
+  const task=a?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(a.task_id))):null;
+  const low=Number(a?.resale_low_eur), high=Number(a?.resale_high_eur);
+  if(!a||!Number.isFinite(low))return reply('Ese anuncio todavía no tiene una reventa estimada, así que no puedo recalcular el beneficio.');
+  const before=importEconomics(listing);
+  const after=importEconomics({...listing,price_eur:newEur});
+  const landed=after.importedTotalEur;
+  const pLow=low-landed, pHigh=Number.isFinite(high)?high-landed:null;
+  const margin=landed>0?pLow/landed*100:0;
+  const strongProfit=Number(task?.notify_min_profit_eur)||250;
+  const strongMargin=Number(process.env.INSTANT_ALERT_MIN_MARGIN_PCT??30);
+  const softProfit=Math.max(150,Math.round(strongProfit*0.6)), softMargin=Number(process.env.SOFT_ALERT_MIN_MARGIN_PCT||20);
+  const risky=String(a.authenticity_risk||'').toUpperCase()==='HIGH';
+  const verdict=risky?'⚠️ Riesgo de autenticidad alto: aunque salgan los números, no lo compraría sin verificación.'
+    : pLow>=strongProfit&&margin>=strongMargin?'🔥 <b>Ahora sí es una oportunidad clara.</b>'
+    : pLow>=softProfit&&margin>=softMargin?'👀 <b>Interesante, revísalo.</b>'
+    : '❌ <b>Sigue sin compensar</b> con este precio.';
+  const maxEur=telegramMaxPriceFor(listing,low,strongProfit,strongMargin);
+  const maxLocal=maxEur!=null?eurTo(maxEur,listing.currency||'EUR'):null;
+  const lines=[
+    `♻️ <b>Recalculado con el precio negociado</b>${task?` · ${htmlEsc(task.task_name)}`:''}`,
+    `<b>${htmlEsc(a.model||listing.title||'')}</b>`,
+    `Precio: <b>${fmtMoney(price.amount,cur)}</b> (≈ ${eur0(newEur)}) · antes ${fmtMoney(listing.original_price,listing.currency||'EUR')} (≈ ${eur0(listing.price_eur)})`,
+    `Coste puesto en España: ${eur0(landed)} (antes ${eur0(before.importedTotalEur)})`,
+    `Reventa estimada: ${eur0(low)} – ${eur0(high)}`,
+    `Beneficio neto: <b>${eur0(pLow)}${pHigh!=null?` – ${eur0(pHigh)}`:''}</b> · margen ${Math.round(margin)} % (antes ${eur0(low-before.importedTotalEur)})`,
+    verdict,
+    maxLocal!=null?`Precio máximo para que sea oportunidad clara: <b>${fmtMoney(maxLocal,listing.currency||'EUR')}</b> (≈ ${eur0(maxEur)})`:'',
+    listing.url?`<a href="${htmlEsc(listingAppLink(listing))}">📱 Abrir en la app</a>`:''
+  ].filter(Boolean);
+  await reply(lines.join('\n'));
+  return true;
+}
+
 let telegramPolling=false;
 async function pollTelegramUpdates(){
   if(!telegramConfigured()||telegramPolling)return {processed:0};
@@ -7963,10 +8101,15 @@ async function pollTelegramUpdates(){
   let processed=0;
   try{
     const offset=Number(getSetting('telegram_update_offset',0))||0;
-    const data=await telegramApi('getUpdates',{offset,timeout:0,allowed_updates:['callback_query']});
+    const data=await telegramApi('getUpdates',{offset,timeout:0,allowed_updates:['callback_query','message']});
     let next=offset;
     for(const u of data.result||[]){
       next=Math.max(next,Number(u.update_id)+1);
+      if(u.message&&String(u.message.chat?.id)===String(process.env.TELEGRAM_CHAT_ID)){
+        try{await handleTelegramNegotiation(u.message);processed++;}
+        catch(e){console.error('Telegram negotiation failed:',e.message);}
+        continue;
+      }
       const cq=u.callback_query;
       if(!cq)continue;
       // Solo el chat de Nil puede valorar anuncios.
