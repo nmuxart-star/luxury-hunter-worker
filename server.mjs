@@ -852,9 +852,8 @@ const OPENAI_WEB_SEARCH_USD=0.01;
 function aiSpendDay(){
   return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Madrid',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 }
-// Tope mensual (factura de OpenAI, mes en UTC): el presupuesto de cada día es
-// lo que queda del mes repartido entre los días que faltan, sin pasar nunca
-// de AI_DAILY_BUDGET_USD. AI_MONTH_SPENT_RESET="AAAA-MM:usd" ajusta lo gastado
+// Tope mensual (factura de OpenAI, mes en UTC): cada día puede gastar hasta
+// AI_DAILY_BUDGET_USD, pero nunca más de lo que queda del mes. AI_MONTH_SPENT_RESET="AAAA-MM:usd" ajusta lo gastado
 // en el mes al valor real del panel de OpenAI (una vez por valor).
 function aiMonthKey(){return new Date().toISOString().slice(0,7);}
 function getAiMonthSpend(){
@@ -884,14 +883,13 @@ function applyAiMonthSpendReset(){
 function aiMonthlyAllowanceTodayUsd(){
   const cap=Number(process.env.AI_MONTHLY_BUDGET_USD||0);
   if(!Number.isFinite(cap)||cap<=0)return Infinity;
-  const now=new Date();
-  const daysInMonth=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+1,0)).getUTCDate();
-  const daysLeft=daysInMonth-now.getUTCDate()+1;
   const month=getAiMonthSpend();
   // Lo gastado antes de hoy = mes - hoy (lo de hoy ya contado en el mes).
   const todaySinceReset=Math.max(0,getAiSpend().usd-Number(month.todayAtReset||0));
   const beforeToday=Math.max(0,Number(month.usd||0)-todaySinceReset);
-  return Math.max(0,(cap-beforeToday)/daysLeft);
+  // Sin repartir: el día puede llegar a AI_DAILY_BUDGET_USD mientras quede
+  // presupuesto del mes; al llegar a los 20 $ del mes, se para.
+  return Math.max(0,cap-beforeToday);
 }
 function aiDailyBudgetUsd(){
   const n=Number(process.env.AI_DAILY_BUDGET_USD??1);
@@ -8717,6 +8715,23 @@ async function executeTask(taskId, runId=null) {
         }
       }
 
+      // Tope diario de análisis completos por modelo: cuando se llega, solo
+      // pasan los que el triaje puntúa muy alto (los mejores).
+      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY||12);
+      const dayKey=aiSpendDay();
+      const dayCounts=(()=>{const st=getSetting('ai_task_day',{})||{};return st.day===dayKey?st:{day:dayKey,counts:{}};})();
+      if(Number.isFinite(dayCap)&&dayCap>0){
+        const used=Number(dayCounts.counts[taskId]||0);
+        const room=Math.max(0,dayCap-used);
+        const elite=Number(process.env.AI_DAY_CAP_ELITE_SCORE||85);
+        const kept=[];let skipped=0;
+        for(const it of pendingItems){
+          if(it._needsVerification||kept.filter(x=>!x._needsVerification).length<room||(Number(it._triageScore)>=elite))kept.push(it);
+          else{skipped++;db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,it.id);}
+        }
+        if(skipped)console.log(`Task ${taskId}: tope diario de ${dayCap} análisis alcanzado (${used} hoy); ${skipped} anuncios no se analizan.`);
+        pendingItems=kept;
+      }
       const maxAiItems=Number(process.env.AI_MAX_ITEMS_PER_TASK_RUN||10);
       let deferred=0;
       if(Number.isFinite(maxAiItems)&&maxAiItems>0&&pendingItems.length>maxAiItems){
@@ -8739,6 +8754,9 @@ async function executeTask(taskId, runId=null) {
           console.error(`Task ${taskId}: fichas de Xianyu no disponibles:`,e.message);
         }
       }
+      dayCounts.counts[taskId]=Number(dayCounts.counts[taskId]||0)+pendingItems.filter(x=>!x._needsVerification).length;
+      db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_task_day',?,?)
+        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify(dayCounts),new Date().toISOString());
       result.status.prescreen.medianAskingEur=prioritized.median;
       result.status.prescreen.deferred=deferred;
 
