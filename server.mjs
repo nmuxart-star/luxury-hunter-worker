@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createSign } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
@@ -3629,14 +3629,183 @@ function weightedPercentile(entries,p){
 // (data/vestiaire-refs.json en local; en la nube viaja cifrado dentro de
 // cloud/config.json). Se da a la IA como referencia de mercado de Vestiaire.
 let vestiaireRefsCache=null;
-function vestiaireRefs(){
-  if(vestiaireRefsCache)return vestiaireRefsCache;
+function vestiaireFileRefs(){
   const base=path.dirname(fileURLToPath(import.meta.url));
   for(const [file,pick] of [[path.join(base,'data','vestiaire-refs.json'),j=>j],[path.join(base,'cloud','config.json'),j=>j.vestiaire_refs]]){
-    try{const j=pick(JSON.parse(fs.readFileSync(file,'utf8')));if(j?.tasks){vestiaireRefsCache=j;return j;}}catch{}
+    try{const j=pick(JSON.parse(fs.readFileSync(file,'utf8')));if(j?.tasks)return j;}catch{}
   }
-  vestiaireRefsCache={tasks:{}};
+  return {tasks:{}};
+}
+// La hoja de Nil manda: cada pestaña que se puede leer sustituye a la copia
+// fija de esa tarea; las tareas sin pestaña siguen con la copia fija.
+function vestiaireRefs(){
+  if(vestiaireRefsCache)return vestiaireRefsCache;
+  const file=vestiaireFileRefs();
+  vestiaireRefsCache=vestiaireSheetCache?.tasks
+    ? {...file,tasks:{...(file.tasks||{}),...vestiaireSheetCache.tasks}}
+    : file;
   return vestiaireRefsCache;
+}
+
+// ── VESTIAIRE SHEET V1 ───────────────────────────────────────────────────
+// Base de datos propia de Nil en Google Sheets ("Vestiaire – Base de datos").
+// Se lee con la API de Google Sheets (cuenta de servicio con permiso de
+// lectura en la hoja) y se refresca cada VESTIAIRE_SHEET_REFRESH_MIN minutos.
+// Si falla, se sigue con la última lectura buena o con la copia fija.
+const VESTIAIRE_SHEET_TAB_TASK={'balenciaga fotos':'Balenciaga Le City'};
+const VESTIAIRE_SHEET_REFRESH_MS=Math.max(5,Number(process.env.VESTIAIRE_SHEET_REFRESH_MIN||30))*60e3;
+let vestiaireSheetCache=null;
+let vestiaireSheetPromise=null;
+let googleSheetsToken=null;
+
+function vestiaireSheetConfigured(){
+  return !!(String(process.env.VESTIAIRE_SHEET_ID||'').trim()&&(String(process.env.GOOGLE_SHEETS_SA_JSON||'').trim()||String(process.env.GOOGLE_SHEETS_API_KEY||'').trim()));
+}
+async function googleSheetsAuth(){
+  const raw=String(process.env.GOOGLE_SHEETS_SA_JSON||'').trim();
+  if(!raw)return {query:`key=${encodeURIComponent(String(process.env.GOOGLE_SHEETS_API_KEY||'').trim())}`,headers:{}};
+  if(googleSheetsToken&&googleSheetsToken.exp>Date.now()+60e3)return {query:'',headers:{authorization:`Bearer ${googleSheetsToken.token}`}};
+  const sa=JSON.parse(raw);
+  const now=Math.floor(Date.now()/1000);
+  const b64=o=>Buffer.from(JSON.stringify(o)).toString('base64url');
+  const unsigned=`${b64({alg:'RS256',typ:'JWT'})}.${b64({iss:sa.client_email,scope:'https://www.googleapis.com/auth/spreadsheets.readonly',aud:'https://oauth2.googleapis.com/token',iat:now,exp:now+3600})}`;
+  const sig=createSign('RSA-SHA256').update(unsigned).sign(sa.private_key,'base64url');
+  const r=await fetch('https://oauth2.googleapis.com/token',{
+    method:'POST',
+    headers:{'content-type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({grant_type:'urn:ietf:params:oauth:grant-type:jwt-bearer',assertion:`${unsigned}.${sig}`}),
+    signal:AbortSignal.timeout(20000)
+  });
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok||!j.access_token)throw new Error(`Google token: ${j.error_description||j.error||r.status}`);
+  googleSheetsToken={token:j.access_token,exp:Date.now()+Number(j.expires_in||3600)*1000};
+  return {query:'',headers:{authorization:`Bearer ${j.access_token}`}};
+}
+function sheetNumber(v){
+  if(typeof v==='number')return Number.isFinite(v)?v:null;
+  const s=String(v??'').replace(/[€\s]/g,'');
+  if(!s)return null;
+  // Formato español: "1.155" = 1155; "1352,09" = 1352.09.
+  const n=Number(/,/.test(s)?s.replace(/\./g,'').replace(',','.'):/^\d{1,3}(\.\d{3})+$/.test(s)?s.replace(/\./g,''):s);
+  return Number.isFinite(n)?n:null;
+}
+function priceStats(list){
+  const a=list.filter(Number.isFinite).sort((x,y)=>x-y);
+  if(!a.length)return {n:0};
+  const q=p=>a[Math.min(a.length-1,Math.max(0,Math.round((a.length-1)*p)))];
+  return {n:a.length,min:Math.round(a[0]),p25:Math.round(q(0.25)),median:Math.round(q(0.5)),p75:Math.round(q(0.75)),max:Math.round(a[a.length-1])};
+}
+// Convierte una pestaña (fila 1 = cabecera) en fichas con el mismo formato
+// que data/vestiaire-refs.json, más el estado de venta y el precio vendido.
+function vestiaireSheetTab(values,today){
+  const head=(values[0]||[]).map(h=>String(h||'').trim().toLowerCase());
+  const col=name=>head.indexOf(name);
+  const c={likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €')};
+  if(c.ref<0||c.price<0)return null;
+  const get=(row,i)=>i>=0?row[i]:'';
+  const yes=v=>/^s[ií]|^yes|^true/i.test(String(v||'').trim());
+  const fichas=[];
+  for(const row of values.slice(1)){
+    const id=String(get(row,c.ref)||'').trim();
+    if(!/^\d{5,10}$/.test(id))continue;
+    const sold=/vendido/i.test(String(get(row,c.status)||''));
+    const askPrice=sheetNumber(get(row,c.price));
+    let soldPrice=sheetNumber(get(row,c.sold));
+    // Un precio de venta muy lejos del precio pedido suele ser una referencia
+    // que apunta a otro artículo: no se usa como prueba de reventa.
+    const soldSuspect=Number.isFinite(soldPrice)&&Number.isFinite(askPrice)&&askPrice>0&&(soldPrice<askPrice*0.3||soldPrice>askPrice*3);
+    if(soldSuspect)soldPrice=null;
+    fichas.push({
+      id,
+      size:String(get(row,c.size)||'').trim(),
+      dims:String(get(row,c.dims)||'').trim(),
+      material:String(get(row,c.material)||'').trim(),
+      color:String(get(row,c.color)||'').trim(),
+      condition:String(get(row,c.condition)||'').trim(),
+      price_eur:askPrice,
+      original_eur:sheetNumber(get(row,c.before)),
+      country:String(get(row,c.country)||'').trim(),
+      vintage:yes(get(row,c.vintage)),
+      we_love:yes(get(row,c.welove)),
+      published:String(get(row,c.published)||'').trim(),
+      likes:sheetNumber(get(row,c.likes)),
+      notes:String(get(row,c.notes)||'').trim().slice(0,200),
+      checked:String(get(row,c.checked)||'').trim(),
+      url:`https://es.vestiairecollective.com/${id}.shtml`,
+      sold,
+      sold_price_eur:sold?soldPrice:null,
+      sold_price_suspect:soldSuspect||undefined,
+      // Los vendidos no son anuncios a la venta: fuera de las comparables actuales.
+      excluded:sold
+    });
+  }
+  const active=fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur));
+  const groups={};
+  for(const f of active){
+    const k=(f.size||'Sin talla').trim();
+    (groups[k]||=[]).push(f.price_eur);
+  }
+  return {
+    source:'sheet',
+    captured_on:today,
+    fichas,
+    all:priceStats(active.map(f=>f.price_eur)),
+    vintage:priceStats(active.filter(f=>f.vintage).map(f=>f.price_eur)),
+    groups:Object.fromEntries(Object.entries(groups).map(([k,v])=>[k,{label:k,...priceStats(v)}])),
+    discounted_share:active.length?Math.round(active.filter(f=>Number.isFinite(f.original_eur)&&f.original_eur>f.price_eur).length/active.length*100):0,
+    sold_stats:priceStats(fichas.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>f.sold_price_eur))
+  };
+}
+function vestiaireSheetTaskName(tab){
+  const key=String(tab||'').trim().toLowerCase();
+  if(VESTIAIRE_SHEET_TAB_TASK[key])return VESTIAIRE_SHEET_TAB_TASK[key];
+  const names=db.prepare('SELECT task_name FROM tasks').all().map(t=>t.task_name);
+  return names.find(n=>n.toLowerCase()===key)||names.find(n=>n.toLowerCase().includes(key)||key.includes(n.toLowerCase()))||null;
+}
+async function loadVestiaireSheet(){
+  const id=String(process.env.VESTIAIRE_SHEET_ID||'').trim();
+  const auth=await googleSheetsAuth();
+  const q=extra=>[auth.query,extra].filter(Boolean).join('&');
+  const base=`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(id)}`;
+  const meta=await fetch(`${base}?${q('fields=sheets.properties.title')}`,{headers:auth.headers,signal:AbortSignal.timeout(20000)});
+  const mj=await meta.json().catch(()=>({}));
+  if(!meta.ok)throw new Error(`Sheets: ${mj?.error?.message||meta.status}`);
+  const titles=(mj.sheets||[]).map(s=>s.properties?.title).filter(Boolean);
+  const tabs=titles.map(t=>({t,task:vestiaireSheetTaskName(t)})).filter(x=>x.task);
+  if(!tabs.length)return {loadedAt:Date.now(),tasks:{},tabs:[]};
+  const ranges=tabs.map(x=>`ranges=${encodeURIComponent(`'${x.t.replace(/'/g,"''")}'!A1:AD2000`)}`).join('&');
+  const r=await fetch(`${base}/values:batchGet?${q(`${ranges}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`)}`,{headers:auth.headers,signal:AbortSignal.timeout(30000)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(`Sheets: ${j?.error?.message||r.status}`);
+  const today=new Date().toISOString().slice(0,10);
+  const tasks={};
+  (j.valueRanges||[]).forEach((vr,i)=>{
+    const parsed=vestiaireSheetTab(vr.values||[],today);
+    if(parsed?.fichas?.length)tasks[tabs[i].task]={...parsed,tab:tabs[i].t};
+  });
+  return {loadedAt:Date.now(),tasks,tabs:tabs.map(x=>x.t)};
+}
+async function refreshVestiaireSheet({force=false}={}){
+  if(!vestiaireSheetConfigured())return vestiaireSheetCache;
+  if(!force&&vestiaireSheetCache&&Date.now()-vestiaireSheetCache.loadedAt<VESTIAIRE_SHEET_REFRESH_MS)return vestiaireSheetCache;
+  if(vestiaireSheetPromise)return vestiaireSheetPromise;
+  vestiaireSheetPromise=(async()=>{
+    try{
+      const fresh=await loadVestiaireSheet();
+      vestiaireSheetCache=fresh;
+      vestiaireRefsCache=null;
+      const counts=Object.entries(fresh.tasks).map(([k,v])=>`${k} ${v.fichas.length}`).join(', ');
+      console.log(`Hoja de Vestiaire leída: ${counts||'sin pestañas de tareas'}.`);
+      clearHealthIssue?.('vestiaire-sheet');
+    }catch(e){
+      console.error('Hoja de Vestiaire no disponible, se usa la última lectura:',e.message);
+      reportHealthIssue?.('vestiaire-sheet',`No se pudo leer la hoja de Vestiaire (${e.message}). El bot sigue con la última copia.`).catch?.(()=>{});
+    }finally{
+      vestiaireSheetPromise=null;
+    }
+    return vestiaireSheetCache;
+  })();
+  return vestiaireSheetPromise;
 }
 const VESTIAIRE_SIZE_RE=[['Nano',/\bnano\b/i],['Part Time',/part\s?time/i],['Mini',/\bmini\b|\bmicro\b/i],['Small',/\bsmall\b|\bpetit\b|\bpetite\b|\bpeque/i],['Medium',/\bmedium\b|\bmediano\b|\bmoyen\b|中号/i],['Large',/\blarge\b|\bgrande\b|\bgrand\b|大号/i],['Bandolera',/bandolera|crossbody|messenger|shoulder strap/i]];
 const VESTIAIRE_COLOR_RE=[['negro',/negro|black|noir|schwarz|黑/i],['blanco',/blanc|white|bianco|weiss|白/i],['marron',/marr[oó]n|brown|marron|braun|棕|咖/i],['azul',/azul|blue|bleu|blu|蓝/i],['rosa',/rosa|pink|rose|粉/i],['rojo',/rojo|red|rouge|rosso|红/i],['amarillo',/amarillo|yellow|jaune|giallo|黄/i],['verde',/verde|green|vert|verde|绿/i],['gris',/gris|grey|gray|grigio|灰/i],['plateado',/plateado|silver|argent|argento|银/i],['dorado',/dorado|gold|or\b|oro|金/i],['beige',/beige|crudo|nude|taupe|ecru|khaki|caqui/i]];
@@ -3660,11 +3829,23 @@ function vestiaireMatchFichas(fichas,item){
 }
 function vestiaireFichasBlock(r,item){
   const picked=vestiaireMatchFichas(r?.fichas||[],item);
-  if(!picked.length)return '';
-  const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
-  return `\n\nVESTIAIRE LISTINGS CHECKED BY NIL (real current Vestiaire Collective listings read by Nil from the listing page; CURRENT asking prices; size inferred from the listed measurements). These are the closest matches to THIS listing by size, colour and price:
+  if(!picked.length)return vestiaireSoldBlock(r,item);
+  const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${Number.isFinite(x.likes)?` | ${x.likes} likes`:''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
+  return `\n\nNIL'S VESTIAIRE DATABASE — LISTINGS FOR SALE (PRIMARY EVIDENCE: Nil's own database of real Vestiaire Collective listings, kept up to date daily (status, likes); more likes = more demand; CURRENT asking prices; size inferred from the listed measurements). These are the closest matches to THIS listing by size, colour and price:
 ${rows}
-These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels.`;
+These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels.`+vestiaireSoldBlock(r,item);
+}
+// Ventas reales de la base de datos de Nil: el precio "Vendido a X €" de
+// Vestiaire. Es la mejor prueba de precio de reventa que tenemos.
+function vestiaireSoldBlock(r,item){
+  const sold=(r?.fichas||[]).filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>({...f,price_eur:f.sold_price_eur,excluded:false}));
+  if(!sold.length)return '';
+  const picked=vestiaireMatchFichas(sold,item).slice(0,10);
+  const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | SOLD for ${x.sold_price_eur} EUR | ${x.country}${x.vintage?' | vintage':''}${Number.isFinite(x.likes)?` | ${x.likes} likes`:''} | ${x.url}`).join('\n');
+  const st=r.sold_stats?.n?` (all recorded sales for this model: n=${r.sold_stats.n}, median ${r.sold_stats.median} €, range ${r.sold_stats.min}-${r.sold_stats.max} €)`:'';
+  return `\n\nNIL'S VESTIAIRE DATABASE — CONFIRMED SALES (real Vestiaire Collective sales recorded by Nil: the listing page shows "Vendido a X €")${st}. Closest matches to THIS listing:
+${rows}
+These are the STRONGEST resale evidence available. When one matches the target's size, material, colour family and condition, include it in your comparables with source "Vestiaire Collective", listing_status SOLD, its URL and the sold price, and anchor resale_low_eur on these sold prices rather than on asking prices.`;
 }
 function vestiaireSnapshotBlock(task,item){
   const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
@@ -3673,7 +3854,7 @@ function vestiaireSnapshotBlock(task,item){
   let out='';
   if(r.all?.n){
     const groups=Object.values(r.groups||{}).filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
-    out+=`\n\nVESTIAIRE MARKET SNAPSHOT (captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
+    out+=`\n\nVESTIAIRE MARKET SNAPSHOT (${r.source==='sheet'?`computed live from Nil's own Vestiaire database on ${r.captured_on}, listings still for sale`:`captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}`}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
 - All listings: ${fmt(r.all)}
 ${r.vintage?.n>=3?`- Tagged vintage: ${fmt(r.vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${r.discounted_share}% of listings already show a price reduction, so real sale prices are usually below asking.
 Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`;
@@ -5319,7 +5500,7 @@ CONDITION-BASED VALUATION RULES:
 - The final condition-adjusted resale must come from observed prices of condition-SIMILAR comparables.
 - If there is insufficient condition-matched evidence, report insufficient evidence instead of inventing a resale adjustment.
 
-SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task,item)}
+SOURCE ORDER (mandatory): (1) NIL'S VESTIAIRE DATABASE blocks below are the PRIMARY evidence: start from them, use its confirmed sales and current listings first. (2) Then your FIRST web search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>") and list Vestiaire comparables first. (3) Only after that, use the other approved sources and image-search (Google Lens) results to complete the evidence.${vestiaireSnapshotBlock(task,item)}
 
 Return ONLY JSON:
 {
@@ -5475,7 +5656,7 @@ Requirements:
 11. Return real URLs and evidence-backed prices whenever available.
 12. Do not invent comparables if a page cannot be grounded.
 
-SOURCE ORDER (mandatory): your FIRST search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>"), and list Vestiaire comparables first. Only after Vestiaire, search the other approved sources to complete the evidence.${vestiaireSnapshotBlock(task,item)}
+SOURCE ORDER (mandatory): (1) NIL'S VESTIAIRE DATABASE blocks below are the PRIMARY evidence: start from them, use its confirmed sales and current listings first. (2) Then your FIRST web search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>") and list Vestiaire comparables first. (3) Only after that, use the other approved sources and image-search (Google Lens) results to complete the evidence.${vestiaireSnapshotBlock(task,item)}
 
 This is a RECALL fallback. The goal is to find genuine listings that a visual Google search would reasonably surface even when their titles use different terminology.`;
 
@@ -8576,6 +8757,8 @@ async function reportRunHealth(status){
 }
 
 async function executeTask(taskId, runId=null) {
+  // Base de datos de Vestiaire de Nil al día antes de analizar (máx. 25 s).
+  await Promise.race([refreshVestiaireSheet().catch(()=>{}),sleep(25000)]);
   if(runId && runIsAborted(runId)){
     return abortedResult(runId);
   }
@@ -11049,6 +11232,8 @@ server.listen(PORT,'127.0.0.1',async()=>{
   try{applyAiMonthSpendReset();}catch(e){console.error('AI month reset:',e.message);}
   try{vetoUnverifiableXianyuAnalyses();}catch(e){console.error('Xianyu veto:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
+  if(vestiaireSheetConfigured())await refreshVestiaireSheet({force:true}).catch(()=>{});
+  else console.log('Hoja de Vestiaire no configurada (VESTIAIRE_SHEET_ID + GOOGLE_SHEETS_SA_JSON): se usa la copia fija.');
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();
   if(!['1','true','yes','on'].includes(schedulerDisabled)){
     setInterval(()=>schedulerTick().catch(e=>console.error('Scheduler:',e.message)),30000);

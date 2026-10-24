@@ -48,6 +48,10 @@ jobs:
       IMPORT_VAT_MODE: ${{ vars.IMPORT_VAT_MODE || 'cost' }}
       GOOGLE_CLOUD_VISION_API_KEY: ${{ secrets.GOOGLE_CLOUD_VISION_API_KEY }}
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+      # Base de datos de Vestiaire de Nil (Google Sheets), solo lectura con cuenta de servicio.
+      VESTIAIRE_SHEET_ID: ${{ secrets.VESTIAIRE_SHEET_ID }}
+      GOOGLE_SHEETS_SA_JSON: ${{ secrets.GOOGLE_SHEETS_SA_JSON }}
+      VESTIAIRE_SHEET_REFRESH_MIN: ${{ vars.VESTIAIRE_SHEET_REFRESH_MIN || '30' }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
