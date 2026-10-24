@@ -317,7 +317,7 @@ const DEFAULT_ECONOMICS = {
   lowValueThresholdEur: 150,
   lowValueDutyFlatEur: 3,
   sources: {
-    xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
+    xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0, paymentFeePercent:3, verificationFeeCny:80 },
     bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     rakuten: { label:'Rakuten / Japón', domesticShippingEur:6, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
@@ -349,7 +349,7 @@ function mergeEconomics(input={}){
   out.importVatMode=['cost','deductible'].includes(input.importVatMode)?input.importVatMode:out.importVatMode;
   for(const source of Object.keys(DEFAULT_ECONOMICS.sources)){
     const src=input.sources?.[source]||{};
-    for(const key of ['domesticShippingEur','agentFeePercent','agentFeeFixedEur','internationalShippingEur','customsDutyPercent','clearanceFeeEur','authenticationFeeEur','otherEur']){
+    for(const key of ['domesticShippingEur','agentFeePercent','agentFeeFixedEur','internationalShippingEur','customsDutyPercent','clearanceFeeEur','authenticationFeeEur','otherEur','paymentFeePercent','verificationFeeCny']){
       out.sources[source][key]=finiteOr(src[key],out.sources[source][key]);
     }
   }
@@ -407,7 +407,12 @@ function importEconomics(item, settings=getEconomics()){
   const clearance=finiteOr(cfg.clearanceFeeEur,0);
   const auth=finiteOr(cfg.authenticationFeeEur,0);
   const other=finiteOr(cfg.otherEur,0);
-  const imported=product+domestic+agent+intl+duty+vatCounted+clearance+auth+other;
+  // Pago con Alipay: se cobra sobre lo que se paga en origen (producto + envío interno).
+  const paymentFee=(product+domestic)*(finiteOr(cfg.paymentFeePercent,0)/100);
+  // Verificación 验货宝: cuota fija en yuanes, convertida al cambio del BCE.
+  const verifCny=finiteOr(cfg.verificationFeeCny,0);
+  const verificationFee=verifCny>0?(toEur(verifCny,'CNY')??verifCny/7.5):0;
+  const imported=product+domestic+agent+intl+duty+vatCounted+clearance+auth+other+paymentFee+verificationFee;
   return {
     source:sourceKey,
     productPriceEur:roundMoney(product),
@@ -427,6 +432,10 @@ function importEconomics(item, settings=getEconomics()){
     importVatEur:roundMoney(vat),
     clearanceFeeEur:roundMoney(clearance),
     authenticationFeeEur:roundMoney(auth),
+    paymentFeePercent:finiteOr(cfg.paymentFeePercent,0),
+    paymentFeeEur:roundMoney(paymentFee),
+    verificationFeeCny:verifCny,
+    verificationFeeEur:roundMoney(verificationFee),
     otherEur:roundMoney(other),
     importedTotalEur:roundMoney(imported),
     estimate:true
@@ -8261,6 +8270,26 @@ function eur0(n){
   return n==null||!Number.isFinite(Number(n))?'—':`${Math.round(Number(n))} €`;
 }
 
+// Desglose del coste puesto en España, partida a partida (solo las que suman).
+function importCostLines(x){
+  const c=importEconomics(x);
+  const vatShown=c.importVatMode==='deductible'?0:c.importVatEur;
+  const rows=[
+    ['Producto',c.productPriceEur],
+    ['Envío en origen',c.domesticShippingEur],
+    [`Comisión agente${c.agentFeePercent?` ${c.agentFeePercent} %`:''}`,c.agentFeeEur],
+    [`Pago Alipay ${c.paymentFeePercent} %`,c.paymentFeeEur],
+    ['Envío internacional',c.internationalShippingEur],
+    [`Arancel${c.customsDutyPercent?` ${c.customsDutyPercent} %`:''}${c.lowValueDutyApplied?' (valor bajo)':''}`,c.customsDutyEur],
+    [`IVA importación ${c.vatPercent} %${c.importVatMode==='deductible'?' (deducible)':''}`,vatShown],
+    ['Despacho aduanero',c.clearanceFeeEur],
+    [`Verificación 验货宝${c.verificationFeeCny?` (${c.verificationFeeCny} CNY)`:''}`,c.verificationFeeEur],
+    ['Autenticación',c.authenticationFeeEur],
+    ['Otros',c.otherEur]
+  ].filter(([,v])=>Number(v)>0);
+  return rows.map(([k,v])=>`   · ${k}: ${eur0(v)}`).concat([`   = Coste puesto: <b>${eur0(c.importedTotalEur)}</b>`]);
+}
+
 function instantAlertText(x){
   const profit=x.net_profit_low_eur!=null||x.net_profit_high_eur!=null
     ? `${eur0(x.net_profit_low_eur)} – ${eur0(x.net_profit_high_eur)}`
@@ -8276,6 +8305,7 @@ function instantAlertText(x){
     `🔥 <b>${htmlEsc(x.decision)}</b> · ${htmlEsc(x._task_name||'')}`,
     `<b>${htmlEsc(x.model||x.title||'')}</b>`,
     `${htmlEsc(x.source)} · precio ${eur0(x.price_eur)} · coste importado ${eur0(x.landed_cost_eur)}`,
+    ...importCostLines(x),
     `Reventa ${resale}`,
     `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
     String(x.source||'').startsWith('ebay-')?(()=>{let r={};try{r=JSON.parse(x.raw_json||'{}')}catch{};return r.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`;})():'',
