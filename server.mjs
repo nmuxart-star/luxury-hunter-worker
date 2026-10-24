@@ -1834,84 +1834,106 @@ function rakutenFullImage(url){
   return String(url||'').replace(/\?_ex=\d+x\d+$/,'');
 }
 
+// Exclusiones en la propia búsqueda: así las 30 plazas por página son para
+// bolsos y no para carteras o calzado de la misma línea. "ウォレット" no va
+// aquí porque excluiría los "chain wallet" (bolso pequeño).
+const RAKUTEN_NG_KEYWORDS='保存袋 ストラップのみ チャーム 財布 コインケース カードケース 名刺入れ 小銭入れ キーケース キーホルダー 腕時計 靴 シューズ ローファー パンプス サンダル ミュール スニーカー スカーフ ジュエリー 指輪 イヤリング ピアス ネックレス ブレスレット';
+const RAKUTEN_NG_KEYWORDS_LEGACY='保存袋 ストラップのみ チャーム';
+
+async function rakutenFetchPage(params){
+  // La API nueva valida el Origin contra los "Allowed websites" de la app
+  // (el Referer solo no basta) y admite ~1 petición por segundo.
+  const site=process.env.RAKUTEN_ORIGIN||'https://nmuxart-star.github.io';
+  let body={},ok=false,status=0;
+  try{
+    await rakutenThrottle();
+    const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{
+      headers:{origin:site,referer:`${site}/`},
+      signal:AbortSignal.timeout(20000)
+    });
+    status=r.status;
+    body=await r.json().catch(()=>({}));
+    ok=r.ok;
+  }catch(e){
+    body={error:e.message};
+  }
+  return {ok,status,body};
+}
+
 async function searchRakutenLive({queries,minEur=null,maxEur=null,sessionId}){
   if(!rakutenConfigured())return {ok:false,state:'not_configured',error:'Faltan RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY'};
-  const maxQueries=clampInt(process.env.RAKUTEN_MAX_QUERIES||2,2,1,5);
+  const maxQueries=clampInt(process.env.RAKUTEN_MAX_QUERIES||3,3,1,5);
+  const maxPages=clampInt(process.env.RAKUTEN_PAGES||2,2,1,5);
   const perQuery=[];
   let kept=0;
+  let ngKeywords=RAKUTEN_NG_KEYWORDS;
   for(const q0 of (queries||[]).slice(0,maxQueries)){
     const q=String(q0||'').trim();
     if(!q)continue;
-    const params=new URLSearchParams({
-      applicationId:process.env.RAKUTEN_APP_ID,
-      accessKey:process.env.RAKUTEN_ACCESS_KEY,
-      keyword:q,
-      sort:'-updateTimestamp',
-      hits:'30',
-      availability:'1',
-      formatVersion:'2',
-      format:'json',
-      // Piezas sueltas y artículos que no son bolsos (carteras, relojes, calzado, joyería).
-      NGKeyword:'保存袋 ストラップのみ チャーム 財布 ウォレット 折財布 コインケース カードケース 名刺入れ 小銭入れ キーケース キーホルダー 時計 靴 シューズ ローファー パンプス サンダル ミュール スカーフ ジュエリー リング イヤリング ネックレス ブレスレット'
-    });
-    const minJpy=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),'JPY')||0):0;
-    const maxJpy=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),'JPY')||0):0;
-    if(minJpy>0)params.set('minPrice',String(minJpy));
-    if(maxJpy>minJpy)params.set('maxPrice',String(maxJpy));
-    let body={};
-    let ok=false;
-    let status=0;
-    try{
-      // La API nueva valida el Origin contra los "Allowed websites" de la app
-      // (el Referer solo no basta) y admite ~1 petición por segundo.
-      const site=process.env.RAKUTEN_ORIGIN||'https://nmuxart-star.github.io';
-      await rakutenThrottle();
-      const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{
-        headers:{origin:site,referer:`${site}/`},
-        signal:AbortSignal.timeout(20000)
+    let count=0,total=null,error=null;
+    for(let page=1;page<=maxPages;page++){
+      const params=new URLSearchParams({
+        applicationId:process.env.RAKUTEN_APP_ID,
+        accessKey:process.env.RAKUTEN_ACCESS_KEY,
+        keyword:q,
+        sort:'-updateTimestamp',
+        hits:'30',
+        page:String(page),
+        availability:'1',
+        formatVersion:'2',
+        format:'json',
+        NGKeyword:ngKeywords
       });
-      status=r.status;
-      body=await r.json().catch(()=>({}));
-      ok=r.ok;
-    }catch(e){
-      body={error:e.message};
+      const minJpy=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),'JPY')||0):0;
+      const maxJpy=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),'JPY')||0):0;
+      if(minJpy>0)params.set('minPrice',String(minJpy));
+      if(maxJpy>minJpy)params.set('maxPrice',String(maxJpy));
+      let {ok,status,body}=await rakutenFetchPage(params);
+      // Si la API no acepta la lista larga de exclusiones, se vuelve a la
+      // corta de siempre (el pre-filtro por título descarta el resto gratis).
+      if(!ok&&status===400&&ngKeywords!==RAKUTEN_NG_KEYWORDS_LEGACY){
+        console.warn(`Rakuten: exclusiones rechazadas (${body?.error_description||body?.error||status}); uso la lista corta.`);
+        ngKeywords=RAKUTEN_NG_KEYWORDS_LEGACY;
+        params.set('NGKeyword',ngKeywords);
+        ({ok,status,body}=await rakutenFetchPage(params));
+      }
+      if(!ok){
+        error=body?.error_description||body?.error||`HTTP ${status}`;
+        break;
+      }
+      total=body?.count??total;
+      const items=Array.isArray(body?.Items)?body.Items:[];
+      for(const raw of items){
+        const it=raw?.Item||raw;
+        const price=Number(it.itemPrice);
+        const pe=toEur(price,'JPY');
+        if(!Number.isFinite(price)||pe==null)continue;
+        if(Number.isFinite(Number(minEur))&&pe<Number(minEur))continue;
+        if(Number.isFinite(Number(maxEur))&&pe>Number(maxEur))continue;
+        const images=(it.mediumImageUrls||[]).map(x=>rakutenFullImage(typeof x==='string'?x:x?.imageUrl)).filter(Boolean);
+        upsertListing({
+          source:'rakuten-jp',
+          source_id:it.itemCode,
+          url:it.itemUrl,
+          title:it.itemName,
+          description:String(it.itemCaption||'').slice(0,4000),
+          original_price:price,
+          currency:'JPY',
+          price_eur:pe,
+          seller_name:it.shopName||'',
+          image_url:images[0]||'',
+          status:'available',
+          purchase_via:'Rakuten (proxy/forwarder)',
+          // Sin las miniaturas originales: si no, se analizarían fotos duplicadas.
+          raw:{...it,mediumImageUrls:undefined,smallImageUrls:undefined,images,luxuryHunterSource:'rakuten-api'}
+        },sessionId,q);
+        count++;
+        kept++;
+      }
+      const pageCount=Number(body?.pageCount||0);
+      if(items.length<30||(pageCount&&page>=pageCount))break;
     }
-    if(!ok){
-      perQuery.push({query:q,count:0,error:body?.error_description||body?.error||`HTTP ${status}`});
-      await sleep(1200);
-      continue;
-    }
-    const items=Array.isArray(body?.Items)?body.Items:[];
-    let count=0;
-    for(const raw of items){
-      const it=raw?.Item||raw;
-      const price=Number(it.itemPrice);
-      const pe=toEur(price,'JPY');
-      if(!Number.isFinite(price)||pe==null)continue;
-      if(Number.isFinite(Number(minEur))&&pe<Number(minEur))continue;
-      if(Number.isFinite(Number(maxEur))&&pe>Number(maxEur))continue;
-      const images=(it.mediumImageUrls||[]).map(x=>rakutenFullImage(typeof x==='string'?x:x?.imageUrl)).filter(Boolean);
-      upsertListing({
-        source:'rakuten-jp',
-        source_id:it.itemCode,
-        url:it.itemUrl,
-        title:it.itemName,
-        description:String(it.itemCaption||'').slice(0,4000),
-        original_price:price,
-        currency:'JPY',
-        price_eur:pe,
-        seller_name:it.shopName||'',
-        image_url:images[0]||'',
-        status:'available',
-        purchase_via:'Rakuten (proxy/forwarder)',
-        // Sin las miniaturas originales: si no, se analizarían fotos duplicadas.
-        raw:{...it,mediumImageUrls:undefined,smallImageUrls:undefined,images,luxuryHunterSource:'rakuten-api'}
-      },sessionId,q);
-      count++;
-      kept++;
-    }
-    perQuery.push({query:q,count,total:body?.count??null});
-    await sleep(1200);
+    perQuery.push(error&&!count?{query:q,count:0,error}:{query:q,count,total,...(error?{error}:{})});
   }
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('rakuten','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
   const failed=perQuery.length>0&&perQuery.every(x=>x.error);
@@ -7623,6 +7645,32 @@ const PRESCREEN_ACCESSORY_ONLY_TERMS=[
   '只有防尘袋','仅防尘袋','空盒'
 ];
 
+// Corea y Japón (no Xianyu): las búsquedas por modelo traen muchas carteras,
+// calzado y joyería de la misma línea. Se descartan gratis por el título,
+// salvo que el título también diga que es un bolso.
+const PRESCREEN_NON_BAG_TERMS=[
+  'wallet','card holder','cardholder','card case','coin purse','coin case','key holder','keyring','key ring','keychain','key pouch','bag charm',
+  'loafer','sandal','sneaker','pumps','boots','mules','slides','necklace','earring','bracelet','brooch','scarf','twilly','sunglasses','belt','porta carte','portafoglio','cintura',
+  '지갑','카드홀더','카드케이스','키링','키홀더','열쇠고리','로퍼','샌들','뮬','슬리퍼','스니커즈','구두','펌프스','부츠',
+  '반지','목걸이','귀걸이','팔찌','브로치','시계','스카프','트윌리','머플러','선글라스','벨트','가방박스','뱃지','배지',
+  '財布','ウォレット','コインケース','カードケース','名刺入れ','小銭入れ','パスケース','定期入れ','キーケース','キーホルダー','キーリング','チャーム',
+  '時計','ローファー','パンプス','サンダル','スニーカー','ブーツ','ミュール','シューズ','指輪','ネックレス','ピアス','イヤリング','ブレスレット','バングル','ブローチ',
+  'スカーフ','ストール','マフラー','ツイリー','サングラス','ベルト','手帳','スマホケース','iphoneケース','保存袋'
+];
+// "Wallet on chain" es un bolso pequeño: no se descarta.
+const PRESCREEN_CHAIN_WALLET=/wallet on chain|chain wallet|\bwoc\b|チェーンウォレット|체인\s*지갑|체인\s*월렛/i;
+const PRESCREEN_BAG_WORD=/bag|tote|handbag|shoulder|crossbody|clutch|satchel|hobo|pochette|backpack|bolso|bandolera|riñonera|borsa|tasche|\bsac\b|バッグ|ショルダー|トート|クラッチ|ボストン|ポシェット|リュック|가방|숄더|토트|크로스|클러치|호보|(?<!쇼핑|더스트)백(?!화점)/i;
+function nonBagTitleTerm(item){
+  if(String(item?.source||'').toLowerCase()==='xianyu')return null;
+  const title=String(item?.title||'').toLowerCase();
+  if(!title||PRESCREEN_CHAIN_WALLET.test(title))return null;
+  const term=PRESCREEN_NON_BAG_TERMS.find(t=>title.includes(t));
+  if(!term)return null;
+  // "más bolso" en el título: lo decide la IA.
+  if(PRESCREEN_BAG_WORD.test(title.replaceAll(term,' ')))return null;
+  return term;
+}
+
 // Pieles exóticas (CITES): sin permiso de importación se requisan en aduana.
 // "Grabado/estampado cocodrilo" en piel de vaca sí se puede importar.
 const PRESCREEN_EXOTIC_TERMS=[
@@ -7694,6 +7742,14 @@ function deterministicPrescreen(item){
       code:'accessory_only',
       term:accessory,
       reasons:[`El título indica que solo se vende un accesorio ("${accessory}"), no el bolso.`]
+    };
+  }
+  const nonBag=nonBagTitleTerm(item);
+  if(nonBag){
+    return {
+      code:'not_a_bag',
+      term:nonBag,
+      reasons:[`El título indica un artículo que no es un bolso ("${nonBag}").`]
     };
   }
   return null;
