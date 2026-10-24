@@ -3652,7 +3652,8 @@ function vestiaireRefs(){
 // Se lee con la API de Google Sheets (cuenta de servicio con permiso de
 // lectura en la hoja) y se refresca cada VESTIAIRE_SHEET_REFRESH_MIN minutos.
 // Si falla, se sigue con la última lectura buena o con la copia fija.
-const VESTIAIRE_SHEET_TAB_TASK={'balenciaga fotos':'Balenciaga Le City'};
+const VESTIAIRE_SHEET_TAB_TASK={'balenciaga fotos':'Balenciaga Le City','balenciaga le city':'Balenciaga Le City'};
+const sheetKey=t=>String(t||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toLowerCase();
 const VESTIAIRE_SHEET_REFRESH_MS=Math.max(5,Number(process.env.VESTIAIRE_SHEET_REFRESH_MIN||30))*60e3;
 let vestiaireSheetCache=null;
 let vestiaireSheetPromise=null;
@@ -3757,10 +3758,10 @@ function vestiaireSheetTab(values,today){
   };
 }
 function vestiaireSheetTaskName(tab){
-  const key=String(tab||'').trim().toLowerCase();
+  const key=sheetKey(tab);
   if(VESTIAIRE_SHEET_TAB_TASK[key])return VESTIAIRE_SHEET_TAB_TASK[key];
   const names=db.prepare('SELECT task_name FROM tasks').all().map(t=>t.task_name);
-  return names.find(n=>n.toLowerCase()===key)||names.find(n=>n.toLowerCase().includes(key)||key.includes(n.toLowerCase()))||null;
+  return names.find(n=>sheetKey(n)===key)||names.find(n=>sheetKey(n).includes(key)||key.includes(sheetKey(n)))||null;
 }
 async function loadVestiaireSheet(){
   const id=String(process.env.VESTIAIRE_SHEET_ID||'').trim();
