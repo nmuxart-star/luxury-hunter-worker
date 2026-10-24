@@ -1851,8 +1851,8 @@ async function searchRakutenLive({queries,minEur=null,maxEur=null,sessionId}){
       availability:'1',
       formatVersion:'2',
       format:'json',
-      // Piezas sueltas que no son el bolso.
-      NGKeyword:'保存袋 ストラップのみ チャーム'
+      // Piezas sueltas y artículos que no son bolsos (carteras, relojes, calzado, joyería).
+      NGKeyword:'保存袋 ストラップのみ チャーム 財布 ウォレット 折財布 コインケース カードケース 名刺入れ 小銭入れ キーケース キーホルダー 時計 靴 シューズ ローファー パンプス サンダル ミュール スカーフ ジュエリー リング イヤリング ネックレス ブレスレット'
     });
     const minJpy=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),'JPY')||0):0;
     const maxJpy=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),'JPY')||0):0;
