@@ -9,6 +9,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
+import {apifyXianyuFeedConfig,fetchApifyXianyuFeed,selectRelevantApifyXianyuItems} from './scripts/apify-xianyu-feed.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
@@ -2272,13 +2273,115 @@ function xianyuMarkSearch(){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
-async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,accountStateFile=null,accountStrategy='auto'}){
+
+function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
+  if(!it?.id||!it?.title)return {kept:false,reason:'missingCoreFields'};
+  if(!Number.isFinite(Number(it.price))||Number(it.price)<=0)return {kept:false,reason:'invalidPrice'};
+  const pe=toEur(it.price,'CNY');
+  const lo=minEur===null||minEur===undefined||minEur===''?NaN:Number(minEur);
+  const hi=maxEur===null||maxEur===undefined||maxEur===''?NaN:Number(maxEur);
+  if(Number.isFinite(lo)&&pe!=null&&pe<lo)return {kept:false,reason:'belowMin'};
+  if(Number.isFinite(hi)&&hi>0&&pe!=null&&pe>hi)return {kept:false,reason:'aboveMax'};
+
+  // Si ya se abrió la ficha antes, no perder descripción, fotos ni vendedor.
+  const prev=db.prepare('SELECT description,raw_json,seller_sales,seller_items,seller_name FROM listings WHERE source=? AND source_id=?').get('xianyu',it.id);
+  let prevRaw={};
+  try{prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};}catch{}
+  const detail=prevRaw?.detailFetched?prevRaw:null;
+  const oldInfo=prevRaw?.['商品信息']||{};
+  const currentInfo={
+    ...(detail?.['商品信息']||{}),
+    '商品ID':it.id,
+    '商品标题':it.title,
+    '当前售价':it.price,
+    '商品链接':it.url,
+    '商品主图链接':it.image||oldInfo['商品主图链接']||'',
+    '发货地区':it.area,
+    '“想要”人数':it.wants,
+    '商品标签':it.tags,
+    '发布时间':it.publishedLocal||oldInfo['发布时间']||null
+  };
+  const raw={
+    ...(detail||{}),
+    '商品信息':currentInfo,
+    publishedAt:it.apifyFeed?(prevRaw.publishedAt||null):(it.publishedAt||null),
+    searchOnly:!detail,
+    ...(it.apifyFeed?{
+      apifyFeed:true,
+      apifyFeedCapturedAt:it.scrapedAt||null,
+      apifyFeedRecord:it.rawRecord||null
+    }:{})
+  };
+  upsertListing({
+    source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:detail?prev.description:'',
+    original_price:it.price,currency:'CNY',price_eur:pe,seller_name:it.seller||prev?.seller_name||'',
+    image_url:it.image||oldInfo['商品主图链接']||'',
+    seller_sales:detail?prev.seller_sales:null,seller_items:detail?prev.seller_items:null,
+    status:'',purchase_via:'China agent',raw
+  },sessionId,sourceQuery);
+  return {kept:true};
+}
+
+async function appendApifyXianyuFeed({queries,product,maxItems=30,minEur=null,maxEur=null,sessionId}={}){
+  const config=apifyXianyuFeedConfig();
+  if(!config.enabled)return {state:'disabled',found:0,matched:0,kept:0};
+  if(!config.configured)return {state:'missing_token',found:0,matched:0,kept:0};
+
+  const cache=getSetting('apify_xianyu_feed_cache',null);
+  const cacheItems=Array.isArray(cache?.items)?cache.items:[];
+  const ageMs=Date.now()-Date.parse(cache?.fetchedAt||'');
+  const hasCache=Array.isArray(cache?.items);
+  const cacheFresh=Array.isArray(cache?.items)&&Number.isFinite(ageMs)&&ageMs<config.intervalMin*60e3;
+  let records=cacheItems;
+  let state='cached';
+  let warning=null;
+  if(!cacheFresh){
+    try{
+      records=await fetchApifyXianyuFeed({
+        token:config.token,
+        maxItems:config.maxItems,
+        maxTotalChargeUsd:config.maxTotalChargeUsd
+      });
+      const fetchedAt=new Date().toISOString();
+      db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('apify_xianyu_feed_cache',?,?)
+        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+        .run(JSON.stringify({fetchedAt,items:records}),fetchedAt);
+      state='fetched';
+    }catch(e){
+      warning=e?.message||String(e);
+      if(hasCache){records=cacheItems;state='stale';}
+      else return {state:'error',found:0,matched:0,kept:0,error:warning};
+    }
+  }
+
+  const selected=selectRelevantApifyXianyuItems(records,{
+    queries,product,maxItems:Math.max(1,Number(maxItems)||30)
+  });
+  const rejected={belowMin:0,aboveMax:0,invalidPrice:0,missingCoreFields:0};
+  let kept=0;
+  for(const it of selected){
+    const result=saveXianyuCandidate(it,{
+      sessionId,
+      sourceQuery:queries?.find(q=>String(q||'').trim())||product||'Apify public feed',
+      minEur,maxEur
+    });
+    if(result.kept)kept++;
+    else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
+  }
+  return {
+    state,
+    found:records.length,
+    matched:selected.length,
+    kept,
+    ...(warning?{warning}:{}),
+    ...(Object.values(rejected).some(Boolean)?{rejected}:{})
+  };
+}
+
+async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto'}){
   // Como mucho una búsqueda de Xianyu cada XIANYU_MIN_INTERVAL_MIN minutos
   // (entre todas las tareas y ejecuciones). Menos peticiones = menos verificaciones.
   const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
-  if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
-    return {ok:true,state:'throttled',perQuery:[],kept:0};
-  }
   const files=xianyuKnownAccounts();
   if(xianyuPausedReason&&xianyuPauseCode==='login'&&
     availableXianyuAccounts(files,{failed:xianyuFailedAccounts}).length){
@@ -2287,6 +2390,10 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   if(xianyuPausedReason&&Date.now()-xianyuPausedAt>xianyuPauseLen){xianyuPausedReason=null;xianyuPauseCode=null;xianyuPauseLen=XIANYU_PAUSE_MS;}
   if(xianyuPausedReason){
     return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
+  }
+  if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+    const apifyFeed=await appendApifyXianyuFeed({queries,product,maxItems,minEur,maxEur,sessionId});
+    return {ok:true,state:'throttled',perQuery:[],kept:apifyFeed.kept||0,apifyFeed};
   }
   const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
   const perQuery=[];
@@ -2358,41 +2465,27 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     const rejected={missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
     let localKept=0;
     for(const it of res.items.slice(0,Math.max(1,Number(maxItems)))){
-      if(!it.id||!it.title){rejected.missingCoreFields++;continue;}
-      if(!Number.isFinite(Number(it.price))){rejected.invalidPrice++;continue;}
-      const pe=toEur(it.price,'CNY');
-      // Number(null) es 0: sin límite configurado no se filtra.
-      const lo=minEur===null||minEur===undefined||minEur===''?NaN:Number(minEur);
-      const hi=maxEur===null||maxEur===undefined||maxEur===''?NaN:Number(maxEur);
-      if(Number.isFinite(lo)&&pe!=null&&pe<lo){rejected.belowMin++;continue;}
-      if(Number.isFinite(hi)&&hi>0&&pe!=null&&pe>hi){rejected.aboveMax++;continue;}
-      // Si ya se abrió la ficha antes, no perder descripción, fotos ni vendedor.
-      const prev=db.prepare('SELECT description,raw_json,seller_sales,seller_items FROM listings WHERE source=? AND source_id=?').get('xianyu',it.id);
-      let prevRaw={};
-      try{prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};}catch{}
-      const detail=prevRaw?.detailFetched?prevRaw:null;
-      upsertListing({
-        source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:detail?prev.description:'',
-        original_price:it.price,currency:'CNY',price_eur:pe,seller_name:it.seller,image_url:it.image,
-        seller_sales:detail?prev.seller_sales:null,seller_items:detail?prev.seller_items:null,
-        status:'',purchase_via:'China agent',
-        raw:{
-          ...(detail||{}),
-          '商品信息':{...(detail?.['商品信息']||{}),'商品ID':it.id,'商品标题':it.title,'当前售价':it.price,'商品链接':it.url,'商品主图链接':it.image,'发货地区':it.area,'“想要”人数':it.wants,'商品标签':it.tags,'发布时间':it.publishedLocal},
-          publishedAt:it.publishedAt,searchOnly:!detail
-        }
-      },sessionId,keyword);
-      localKept++;kept++;
+      const result=saveXianyuCandidate(it,{sessionId,sourceQuery:keyword,minEur,maxEur});
+      if(result.kept){localKept++;kept++;}
+      else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
     }
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     await sleep(2500+Math.random()*2500);
   }
+  // La fuente de Apify solo complementa una búsqueda normal o limitada por
+  // frecuencia. Si Goofish pide login, no responde o muestra una verificación,
+  // Xianyu se pausa y no se usa Apify para continuar alrededor del bloqueo.
+  let apifyFeed=null;
+  if(!xianyuPausedReason){
+    apifyFeed=await appendApifyXianyuFeed({queries,product,maxItems,minEur,maxEur,sessionId});
+    kept+=apifyFeed.kept||0;
+  }
   if(perQuery.length)xianyuMarkSearch();
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}${apifyFeed?.kept?`; Apify public-feed kept ${apifyFeed.kept}`:''}`,new Date().toISOString());
   if(xianyuPausedReason&&!kept)return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery,kept};
   clearHealthIssue('xianyu-risk');
   clearHealthIssue('xianyu-search');
-  return {ok:true,mode:'direct',perQuery,kept};
+  return {ok:true,mode:'direct',perQuery,kept,...(apifyFeed?{apifyFeed}:{})};
 }
 
 // ── XIANYU DETAIL V1 ────────────────────────────────────────────────────
@@ -2437,6 +2530,9 @@ async function enrichXianyuDetails(items){
     let raw={};
     try{raw=JSON.parse(item.raw_json||'{}');}catch{}
     if(raw.detailFetched)continue;
+    // El actor devuelve anuncios del feed público sin enriquecer. No se abren
+    // sus fichas desde aquí, para conservar la separación con la sesión de Xianyu.
+    if(raw.apifyFeed){skipped++;continue;}
     if(xianyuDetailBudgetLeft()<=0){skipped++;continue;}
     xianyuDetailLog.push(Date.now());
     // Misma cola que las búsquedas: nunca dos páginas de Xianyu a la vez.
@@ -10950,9 +11046,11 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
 }
 
 function statusPayload() {
+  const apifyConfig=apifyXianyuFeedConfig();
   return {
     app:'Luxury Hunter v1.7.1', port:PORT, xianyuBaseUrl:XIANYU_BASE_URL,
     bunjangCliExists:fs.existsSync(bunjangCli), geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
+    apifyXianyuFeed:{enabled:apifyConfig.enabled&&apifyConfig.configured,configured:apifyConfig.configured,maxItems:apifyConfig.maxItems,intervalMin:apifyConfig.intervalMin},
     listingCount:db.prepare('SELECT COUNT(*) n FROM listings').get().n,
     taskCount:db.prepare('SELECT COUNT(*) n FROM tasks').get().n,
     runningTasks:[...runningTaskIds],

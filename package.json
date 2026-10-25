@@ -7,6 +7,7 @@
     "start": "node server.mjs",
     "check": "node scripts/check.mjs",
     "test:xianyu": "node --test tests/xianyu-account-pool.test.mjs",
+    "test:apify": "node --test tests/apify-xianyu-feed.test.mjs",
     "background:install": "bash scripts/install-background.sh",
     "background:status": "bash scripts/status-background.sh",
     "background:uninstall": "bash scripts/uninstall-background.sh",

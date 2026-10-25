@@ -48,6 +48,12 @@ jobs:
       IMPORT_VAT_MODE: ${{ vars.IMPORT_VAT_MODE || 'cost' }}
       GOOGLE_CLOUD_VISION_API_KEY: ${{ secrets.GOOGLE_CLOUD_VISION_API_KEY }}
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+      # Apify Xianyu public feed (optional, pay-per-listing).
+      APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+      APIFY_XIANYU_FEED_ENABLED: ${{ vars.APIFY_XIANYU_FEED_ENABLED || '0' }}
+      APIFY_XIANYU_FEED_MAX_ITEMS: ${{ vars.APIFY_XIANYU_FEED_MAX_ITEMS || '100' }}
+      APIFY_XIANYU_FEED_INTERVAL_MIN: ${{ vars.APIFY_XIANYU_FEED_INTERVAL_MIN || '360' }}
+      APIFY_XIANYU_FEED_MAX_CHARGE_USD: ${{ vars.APIFY_XIANYU_FEED_MAX_CHARGE_USD || '0.25' }}
       # Base de datos de Vestiaire de Nil (Google Sheets), solo lectura con cuenta de servicio.
       VESTIAIRE_SHEET_ID: ${{ secrets.VESTIAIRE_SHEET_ID }}
       GOOGLE_SHEETS_SA_JSON: ${{ secrets.GOOGLE_SHEETS_SA_JSON }}

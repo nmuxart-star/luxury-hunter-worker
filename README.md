@@ -86,6 +86,36 @@ demás fuentes continúan funcionando.
 `Configuración` muestra las cuentas detectadas sin mostrar cookies. La opción
 de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserva.
 
+### Apify: feed público de Xianyu
+
+Luxury Hunter puede complementar las búsquedas con el feed público del actor
+[Xianyu (Goofish) Listings Scraper](https://apify.com/piotrv1001/xianyu-goofish-listings-scraper).
+El actor funciona en modo `feed`, sin sesión, sin abrir fichas de producto y
+con un máximo predeterminado de 100 anuncios cada 6 horas. El bot solo añade
+anuncios cuyo título coincide con los términos de la tarea, evita duplicados y
+conserva la hora de captura separada de la fecha real de publicación.
+
+El feed no admite búsquedas anónimas por palabras clave: es una fuente
+complementaria, no sustituye la búsqueda específica de Xianyu ni garantiza ver
+todos los anuncios. Si Goofish presenta un desafío de seguridad, Luxury Hunter
+pausa Xianyu y no usa Apify para continuar alrededor de ese desafío.
+
+Para activarlo en GitHub, añade `APIFY_API_TOKEN` en **Settings → Secrets and
+variables → Actions → Secrets** y crea la variable `APIFY_XIANYU_FEED_ENABLED`
+con valor `1`. El feed queda desactivado si falta cualquiera de esos dos datos.
+Puedes ajustar estas variables de Actions:
+
+- `APIFY_XIANYU_FEED_ENABLED`: `1` o `0`.
+- `APIFY_XIANYU_FEED_MAX_ITEMS`: 100 por defecto, con máximo de 1.000.
+- `APIFY_XIANYU_FEED_INTERVAL_MIN`: 360 minutos por defecto.
+- `APIFY_XIANYU_FEED_MAX_CHARGE_USD`: tope por ejecución, 0,25 USD por defecto.
+
+El actor publica un precio de 0,002 USD por anuncio y 0,00005 USD por inicio de
+ejecución; con 100 anuncios cada 6 horas, el coste orientativo máximo es de unos
+0,80 USD al día si cada lote devuelve el máximo. La cuenta y el saldo de Apify
+son necesarios; el token se envía en el encabezado de autorización y nunca se
+guarda en la base de datos.
+
 ## v1.7 — Más mercados y costes por origen
 
 - **Rakuten Ichiba** (API oficial; secretos `RAKUTEN_APP_ID`, `RAKUTEN_ACCESS_KEY`): tiendas japonesas de lujo de segunda mano (Brand Off, Komehyo, Daikokuya, 2nd Street…). Usa las consultas en japonés de cada tarea.
