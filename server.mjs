@@ -1769,7 +1769,17 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
     if (Number.isFinite(Number(maxEur)) && pe != null && pe > Number(maxEur)) continue;
     const sourceQuery = unique.get(String(item.id)) || '';
 
-    const publication=await fetchBunjangPublication(item);
+    // Fecha de publicación: si el anuncio ya se vio en otra ejecución, se
+    // reutiliza la que se guardó y no se vuelve a abrir su página.
+    let publication=null;
+    try{
+      const prev=db.prepare("SELECT raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(String(item.id));
+      const pr=prev?JSON.parse(prev.raw_json||'{}'):null;
+      if(pr?.publishedAt&&pr?.luxuryHunterPublication?.status&&pr.luxuryHunterPublication.status!=='UNKNOWN'){
+        publication={publishedAt:pr.publishedAt||null,ageText:pr.luxuryHunterPublication.ageText||null,source:'cache',sourceValue:pr.luxuryHunterPublication.sourceValue||null,status:pr.luxuryHunterPublication.status};
+      }
+    }catch{}
+    if(!publication)publication=await fetchBunjangPublication(item);
 
     const rawWithPublication={
       ...item,
@@ -2716,7 +2726,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Buyee',
     mode:'browser',
     base:'https://buyee.jp',
-    cap:10,
+    cap:50,
     searchWaitMs:5000,
     detailWaitMs:1200,
     searchUrl:q=>`https://buyee.jp/item/search/query/${encodeURIComponent(q)}?lang=en`,
@@ -2728,7 +2738,8 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://jp.mercari.com',
-    cap:12,
+    scrollSteps:10,
+    cap:100,
     searchWaitMs:3500,
     detailWaitMs:4000,
     searchUrl:q=>`https://jp.mercari.com/search?keyword=${encodeURIComponent(q)}&sort=created_time&order=desc`,
@@ -2740,7 +2751,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'http',
     base:'https://fril.jp',
-    cap:12,
+    cap:60,
     searchUrl:q=>`https://fril.jp/s?query=${encodeURIComponent(q)}`,
     accepts:u=>u.hostname==='item.fril.jp'&&/^\/[a-f0-9]+\/?$/i.test(u.pathname)
   },
@@ -2750,7 +2761,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://paypayfleamarket.yahoo.co.jp',
-    cap:8,
+    cap:60,
     searchWaitMs:3000,
     detailWaitMs:1000,
     searchUrl:q=>`https://paypayfleamarket.yahoo.co.jp/search/${encodeURIComponent(q)}?withSpeller=0`,
@@ -2762,7 +2773,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://www.2ndstreet.jp',
-    cap:6,
+    cap:30,
     searchWaitMs:3000,
     detailWaitMs:1000,
     searchUrl:q=>`https://www.2ndstreet.jp/search?keyword=${encodeURIComponent(q)}`,
@@ -2774,7 +2785,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'http',
     base:'https://komehyo.jp',
-    cap:8,
+    cap:30,
     searchUrl:q=>`https://komehyo.jp/search/?q=${encodeURIComponent(q)}`,
     accepts:u=>/^\/product\/[^/]+\/?/i.test(u.pathname)
   }
@@ -3155,7 +3166,7 @@ async function japanHttpSnapshot(url){
   };
 }
 
-async function japanBrowserSnapshot(context,url,waitMs=1000){
+async function japanBrowserSnapshot(context,url,waitMs=1000,scrollSteps=0){
   const page=await context.newPage();
 
   try{
@@ -3165,6 +3176,12 @@ async function japanBrowserSnapshot(context,url,waitMs=1000){
     });
 
     await page.waitForTimeout(waitMs);
+    // Páginas que cargan más anuncios al bajar (Mercari): se baja por la
+    // lista de resultados para leer más que los primeros.
+    for(let i=0;i<scrollSteps;i++){
+      await page.mouse.wheel(0,2400).catch(()=>{});
+      await page.waitForTimeout(900);
+    }
 
     const html=await page.content();
 
@@ -3421,7 +3438,8 @@ async function searchJapanSource(
         ? await japanBrowserSnapshot(
             browserContext,
             searchUrl,
-            spec.searchWaitMs||2500
+            spec.searchWaitMs||2500,
+            spec.scrollSteps||0
           )
         : await japanHttpSnapshot(searchUrl);
 
