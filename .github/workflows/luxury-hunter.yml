@@ -31,6 +31,10 @@ jobs:
       AI_TRIAGE_MIN_SCORE: ${{ vars.AI_TRIAGE_MIN_SCORE || '50' }}
       # Tope de gasto diario en OpenAI (USD). Al alcanzarlo se deja de analizar hasta mañana.
       AI_DAILY_BUDGET_USD: ${{ vars.AI_DAILY_BUDGET_USD || '0.75' }}
+      # Límite de gasto por hora (todas las tareas juntas). 0 = sin límite por hora.
+      AI_HOURLY_BUDGET_USD: ${{ vars.AI_HOURLY_BUDGET_USD || '0.10' }}
+      # Tope de análisis por tarea y día: 0 = desactivado (se controla el coste por horas).
+      AI_MAX_ANALYSES_PER_TASK_DAY: ${{ vars.AI_MAX_ANALYSES_PER_TASK_DAY || '0' }}
       AI_VERIFY_DAILY_BUDGET_USD: ${{ vars.AI_VERIFY_DAILY_BUDGET_USD || '0.4' }}
       AI_SPEND_RESET: ${{ vars.AI_SPEND_RESET || '' }}
       AI_MONTHLY_BUDGET_USD: ${{ vars.AI_MONTHLY_BUDGET_USD || '20' }}

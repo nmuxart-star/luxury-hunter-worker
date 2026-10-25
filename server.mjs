@@ -860,6 +860,26 @@ const OPENAI_PRICES={
 };
 const OPENAI_WEB_SEARCH_USD=0.01;
 
+// Gasto por hora (zona horaria de Madrid): AI_HOURLY_BUDGET_USD limita lo que
+// se puede gastar en cada hora, para todas las tareas juntas.
+function aiHourKey(){
+  const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Madrid',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).map(x=>[x.type,x.value]));
+  return `${p.year}-${p.month}-${p.day} ${p.hour}`;
+}
+function getAiHourSpend(){
+  const st=getSetting('ai_spend_hour',{})||{};
+  return st.hour===aiHourKey()?st:{hour:aiHourKey(),usd:0};
+}
+function addAiHourSpend(usd){
+  const st=getAiHourSpend();
+  st.usd=Number((Number(st.usd||0)+usd).toFixed(6));
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_spend_hour',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify(st),new Date().toISOString());
+}
+function aiHourlyBudgetUsd(){
+  const n=Number(process.env.AI_HOURLY_BUDGET_USD||0);
+  return Number.isFinite(n)&&n>0?n:Infinity;
+}
 function aiSpendDay(){
   return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Madrid',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 }
@@ -949,6 +969,7 @@ function recordAiSpend(model,purpose,body){
   bp.calls++;
   state.byPurpose[purpose]=bp;
   addAiMonthSpend(usd);
+  addAiHourSpend(usd);
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_spend',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
     .run(JSON.stringify(state),new Date().toISOString());
@@ -965,6 +986,17 @@ function aiPaceShare(){
   return Math.min(1,start+(1-start)*hours/24);
 }
 function assertAiBudget(){
+  const hourCap=aiHourlyBudgetUsd();
+  if(Number.isFinite(hourCap)){
+    const hour=getAiHourSpend();
+    if(hour.usd>=hourCap){
+      const err=new Error(`Límite de gasto de IA de esta hora alcanzado (${hour.usd.toFixed(3)} $ de ${hourCap.toFixed(2)} $). Se sigue en la próxima hora.`);
+      err.geminiCapacity=true;
+      err.aiBudget=true;
+      err.aiHour=true;
+      throw err;
+    }
+  }
   const budget=aiDailyBudgetUsd();
   const spend=getAiSpend();
   const paced=budget*aiPaceShare();
@@ -9364,7 +9396,7 @@ async function executeTask(taskId, runId=null) {
 
       // Tope diario de análisis completos por modelo: cuando se llega, solo
       // pasan los que el triaje puntúa muy alto (los mejores).
-      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY||12);
+      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY??0);
       const dayKey=aiSpendDay();
       const dayCounts=(()=>{const st=getSetting('ai_task_day',{})||{};return st.day===dayKey?st:{day:dayKey,counts:{}};})();
       if(Number.isFinite(dayCap)&&dayCap>0){
