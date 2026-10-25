@@ -2314,6 +2314,17 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     res=attempt.result;
     const failedLabels=attempt.expired;
     for(const label of failedLabels)console.log(`Xianyu: sesión ${label} caducada; probando la siguiente cuenta.`);
+    let publicFallback=false;
+    if(res.login&&files.length&&accountStrategy!=='fixed'){
+      console.log('Xianyu: todas las sesiones disponibles caducaron; probando resultados públicos sin sesión.');
+      try{
+        res=await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile:null});
+        if(!res.login&&!res.noResponse&&!res.risk){
+          publicFallback=true;
+          xianyuActiveAccount=null;
+        }
+      }catch(e){res={noResponse:true,where:e.message};}
+    }
     if(!res.login&&!res.noResponse&&!res.risk)xianyuActiveAccount=attempt.usedFile;
     if(res.login&&accountStrategy==='fixed'){
       const warning=`La cuenta fija ${accountLabel(fixed||accountStateFile)} necesita renovar su sesión.`;
@@ -2373,7 +2384,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       },sessionId,keyword);
       localKept++;kept++;
     }
-    perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
+    perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     await sleep(2500+Math.random()*2500);
   }
   if(perQuery.length)xianyuMarkSearch();
@@ -2469,7 +2480,7 @@ function searchXianyuLive(opts){
   // Si la sesión no es válida ya se avisa una vez (xianyu-login); no repetir
   // un error por cada tarea.
   const ss=String(process.env.XIANYU_SESSION_STATUS||'').trim();
-  if(xianyuDirectMode()&&['risk_control','expired','missing','error'].includes(ss)){
+  if(xianyuDirectMode()&&['risk_control','error'].includes(ss)){
     const warning=ss==='risk_control'
       ?'Xianyu ha pedido verificación de seguridad. Se espera a que la cuenta se revise manualmente.'
       :'No hay ninguna sesión válida de Xianyu. Renueva una de las cuentas.';

@@ -76,9 +76,13 @@ un perfil y un fichero de sesión separados. El script guarda el estado local en
 
 En modo directo, Luxury Hunter usa la cuenta activa mientras funcione. Si la
 sesión caduca, prueba la siguiente cuenta disponible una sola vez y conserva
-la que responde. Si todas caducan, pausa Xianyu y pide renovar una sesión.
-Una verificación de seguridad de Xianyu pausa las búsquedas de todas las cuentas;
-no activa una reserva para eludir esa verificación. Las demás fuentes siguen.
+la que responde. En tareas `Automática`, si todas las sesiones caducan, intenta
+la búsqueda pública de Goofish sin sesión; solo devuelve los anuncios que la web
+muestre públicamente y no garantiza acceso a todos los anuncios. Si la búsqueda
+pública exige iniciar sesión, Xianyu se pausa y pide renovar una cuenta. Una
+verificación de seguridad pausa las búsquedas de Xianyu; no activa una reserva
+para eludirla. Las tareas con cuenta fija siguen usando solo esa cuenta. Las
+demás fuentes continúan funcionando.
 `Configuración` muestra las cuentas detectadas sin mostrar cookies. La opción
 de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserva.
 

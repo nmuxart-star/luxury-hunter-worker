@@ -179,7 +179,7 @@ jobs:
           shopt -s nullglob
           ACCOUNT_ENC=(cloud/xianyu-state.enc cloud/xianyu-accounts/*.enc)
           if [ ${#ACCOUNT_ENC[@]} -eq 0 ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
-            echo "Xianyu cloud state not configured; Xianyu connector will be unavailable in this run."
+            echo "No Xianyu session configured; direct mode will attempt public search without login."
             echo "XIANYU_SESSION_STATUS=missing" >> "$GITHUB_ENV"
             exit 0
           fi
