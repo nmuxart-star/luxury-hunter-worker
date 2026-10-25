@@ -9364,7 +9364,7 @@ async function executeTask(taskId, runId=null) {
 
       // Tope diario de análisis completos por modelo: cuando se llega, solo
       // pasan los que el triaje puntúa muy alto (los mejores).
-      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY||12);
+      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY??0); // 0 = sin tope por tarea (el coste se controla por horas y por día)
       const dayKey=aiSpendDay();
       const dayCounts=(()=>{const st=getSetting('ai_task_day',{})||{};return st.day===dayKey?st:{day:dayKey,counts:{}};})();
       if(Number.isFinite(dayCap)&&dayCap>0){
