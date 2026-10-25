@@ -2395,7 +2395,7 @@ let xianyuDetailPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuDetailBudgetLeft(){
   if(xianyuPausedReason)return 0;
-  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR??0,0,0,20);
+  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR||4,4,0,20);
   const now=Date.now();
   while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
   if(now-xianyuDetailPausedAt<xianyuDetailPauseLen)return 0;
