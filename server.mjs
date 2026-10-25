@@ -2087,6 +2087,10 @@ let xianyuPausedReason=null;
 let xianyuPausedAt=0;
 // En un servidor que no se reinicia (Mac), la pausa caduca sola.
 const XIANYU_PAUSE_MS=2*3600e3;
+// Tras una verificación anti-bot no se reintenta hasta pasadas 12 h: insistir
+// en cada ejecución es lo que mantiene la cuenta marcada.
+const XIANYU_RISK_PAUSE_MS=12*3600e3;
+let xianyuPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuStateFile(){
   const f=String(process.env.XIANYU_STATE_FILE||'').trim();
@@ -2239,7 +2243,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
 }
 
 async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
-  if(xianyuPausedReason&&Date.now()-xianyuPausedAt>XIANYU_PAUSE_MS)xianyuPausedReason=null;
+  if(xianyuPausedReason&&Date.now()-xianyuPausedAt>xianyuPauseLen){xianyuPausedReason=null;xianyuPauseLen=XIANYU_PAUSE_MS;}
   if(xianyuPausedReason){
     return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
   }
@@ -2276,6 +2280,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     }
     if(res.risk){
       xianyuPausedAt=Date.now();
+      xianyuPauseLen=XIANYU_RISK_PAUSE_MS;
       xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa el resto de esta ejecución para proteger tu cuenta.';
       await reportHealthIssue('xianyu-risk',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad. Se reintentará en la próxima ejecución.').catch(()=>{});
       try{fs.writeFileSync(path.join(__dirname,'.xianyu-needs-login'),xianyuPausedReason);}catch{}
@@ -2328,12 +2333,13 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
 const XIANYU_DETAIL_API='h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/';
 const xianyuDetailLog=[];
 let xianyuDetailPausedAt=0;
+let xianyuDetailPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuDetailBudgetLeft(){
   const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR||4,4,0,20);
   const now=Date.now();
   while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
-  if(now-xianyuDetailPausedAt<XIANYU_PAUSE_MS)return 0;
+  if(now-xianyuDetailPausedAt<xianyuDetailPauseLen)return 0;
   return Math.max(0,perHour-xianyuDetailLog.length);
 }
 
@@ -2369,6 +2375,7 @@ async function enrichXianyuDetails(items){
     const res=await run.catch(e=>({error:e.message}));
     if(res?.risk){
       xianyuDetailPausedAt=Date.now();
+      xianyuDetailPauseLen=XIANYU_RISK_PAUSE_MS;
       console.log('Xianyu detail: verificación anti-bot; no se abren más fichas durante 2 h (la búsqueda sigue).');
       break;
     }

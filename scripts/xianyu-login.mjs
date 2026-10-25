@@ -11,6 +11,7 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {chromium} from 'playwright';
+import readline from 'node:readline/promises';
 import {readState,cookieSummary,isLoggedIn,mergeState,visitGoofish} from './xianyu-session.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -42,7 +43,16 @@ if(!isLoggedIn(cookies)){
   process.exit(1);
 }
 
-console.log('Sesión detectada. Renovando cookies...');
+console.log('Sesión detectada.');
+// Búsqueda real en la misma ventana: si Xianyu pide verificación (deslizador),
+// la resuelve Nil a mano aquí y la sesión del bot queda verificada.
+await page.goto('https://www.goofish.com/search?q='+encodeURIComponent('迪奥 马鞍包'),{waitUntil:'domcontentloaded'}).catch(()=>{});
+console.log('\nHe abierto una búsqueda en Xianyu en la ventana de Chromium.');
+console.log('Si aparece una verificación (deslizador o similar), complétala tú en esa ventana.');
+const rl=readline.createInterface({input:process.stdin,output:process.stdout});
+await rl.question('Cuando veas la lista de anuncios, vuelve aquí y pulsa Enter... ');
+rl.close();
+console.log('Renovando cookies...');
 await visitGoofish(context,{waitMs:4000});
 const fresh=await context.storageState();
 await context.close();
