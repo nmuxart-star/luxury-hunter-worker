@@ -2086,6 +2086,7 @@ const XIANYU_RISK_RE=/FAIL_SYS_USER_VALIDATE|RGV587|FAIL_SYS_ILLEGAL_ACCESS|puni
 const XIANYU_AUTH_RE=/FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED|FAIL_SYS_TOKEN_EMPTY|未登录/i;
 let xianyuDirectPromise=null;
 let xianyuContextFile=null;
+let xianyuContextMtime=null;
 let xianyuActiveAccount=null;
 let xianyuPauseCode=null;
 const xianyuFailedAccounts=new Map();
@@ -2111,12 +2112,14 @@ function xianyuDirectMode(){
 }
 
 async function getXianyuDirect(file=xianyuActiveAccount){
-  if(xianyuDirectPromise&&xianyuContextFile!==file){
+  const mtime=file?fs.statSync(file).mtimeMs:null;
+  if(xianyuDirectPromise&&(xianyuContextFile!==file||xianyuContextMtime!==mtime)){
     const previous=await xianyuDirectPromise.catch(()=>null);
     await previous?.context.close().catch(()=>{});
     xianyuDirectPromise=null;
   }
   xianyuContextFile=file;
+  xianyuContextMtime=mtime;
   if(!xianyuDirectPromise){
     xianyuDirectPromise=(async()=>{
       let state={};
@@ -2137,7 +2140,7 @@ async function getXianyuDirect(file=xianyuActiveAccount){
         deviceScaleFactor:Number(scr.devicePixelRatio)||1
       });
       return {context,warmed:false};
-    })().catch(e=>{xianyuDirectPromise=null;xianyuContextFile=null;throw e;});
+    })().catch(e=>{xianyuDirectPromise=null;xianyuContextFile=null;xianyuContextMtime=null;throw e;});
   }
   return xianyuDirectPromise;
 }
