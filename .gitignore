@@ -10,6 +10,7 @@ cloud/*.tmp
 
 *.bak
 .xianyu-profile/
+.xianyu-profile-*/
 .xianyu-tmp/
 .upload/
 lh-upload/

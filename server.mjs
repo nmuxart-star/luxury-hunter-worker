@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
+import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
@@ -2081,8 +2082,13 @@ async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
 // (FAIL_SYS_USER_VALIDATE). Si aun así Xianyu pide verificación, se pausa
 // Xianyu el resto de la ejecución: nunca se intenta resolver ni esquivar.
 const XIANYU_SEARCH_API='h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/'; // con '/' final: excluye .shade y .activate
-const XIANYU_RISK_RE=/FAIL_SYS_USER_VALIDATE|RGV587|FAIL_SYS_ILLEGAL_ACCESS|FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED|punish|baxia|_____tmd_____/i;
+const XIANYU_RISK_RE=/FAIL_SYS_USER_VALIDATE|RGV587|FAIL_SYS_ILLEGAL_ACCESS|punish|baxia|_____tmd_____/i;
+const XIANYU_AUTH_RE=/FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED|FAIL_SYS_TOKEN_EMPTY|未登录/i;
 let xianyuDirectPromise=null;
+let xianyuContextFile=null;
+let xianyuActiveAccount=null;
+let xianyuPauseCode=null;
+const xianyuFailedAccounts=new Map();
 let xianyuPausedReason=null;
 let xianyuPausedAt=0;
 // En un servidor que no se reinicia (Mac), la pausa caduca sola.
@@ -2092,9 +2098,11 @@ const XIANYU_PAUSE_MS=2*3600e3;
 const XIANYU_RISK_PAUSE_MS=4*3600e3;
 let xianyuPauseLen=XIANYU_PAUSE_MS;
 
-function xianyuStateFile(){
-  const f=String(process.env.XIANYU_STATE_FILE||'').trim();
-  return f&&fs.existsSync(f)?f:null;
+function xianyuKnownAccounts(){
+  const primary=String(process.env.XIANYU_STATE_FILE||'').trim();
+  const dir=String(process.env.XIANYU_STATE_DIR||'').trim()||
+    (primary?path.dirname(primary):path.join(process.env.HOME||'', 'ai-goofish-monitor-wangdaguo','state'));
+  return xianyuAccountFiles({primaryFile:primary,accountDir:dir});
 }
 function xianyuDirectMode(){
   // Por defecto: búsqueda directa. La sesión es opcional (la búsqueda de
@@ -2102,10 +2110,15 @@ function xianyuDirectMode(){
   return String(process.env.XIANYU_MODE||'direct').toLowerCase()!=='connector';
 }
 
-async function getXianyuDirect(){
+async function getXianyuDirect(file=xianyuActiveAccount){
+  if(xianyuDirectPromise&&xianyuContextFile!==file){
+    const previous=await xianyuDirectPromise.catch(()=>null);
+    await previous?.context.close().catch(()=>{});
+    xianyuDirectPromise=null;
+  }
+  xianyuContextFile=file;
   if(!xianyuDirectPromise){
     xianyuDirectPromise=(async()=>{
-      const file=xianyuStateFile();
       let state={};
       try{state=file?JSON.parse(fs.readFileSync(file,'utf8')):{};}catch{state={};}
       const browser=await getBunjangPublicationBrowser();
@@ -2124,13 +2137,16 @@ async function getXianyuDirect(){
         deviceScaleFactor:Number(scr.devicePixelRatio)||1
       });
       return {context,warmed:false};
-    })().catch(e=>{xianyuDirectPromise=null;throw e;});
+    })().catch(e=>{xianyuDirectPromise=null;xianyuContextFile=null;throw e;});
   }
   return xianyuDirectPromise;
 }
 
 function xianyuRiskIn(json){
   return XIANYU_RISK_RE.test(JSON.stringify(json?.ret||''));
+}
+function xianyuAuthIn(json){
+  return XIANYU_AUTH_RE.test(JSON.stringify(json?.ret||''));
 }
 
 function parseXianyuSearchJson(json){
@@ -2173,8 +2189,8 @@ function parseXianyuSearchJson(json){
   return out;
 }
 
-async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
-  const x=await getXianyuDirect();
+async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile=null}={}){
+  const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
   try{
     if(!x.warmed){
@@ -2194,6 +2210,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
       return {noResponse:true,where};
     }
     let json=await resp.json().catch(()=>null);
+    if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
     if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
     // Ordenar por "más nuevos" para enterarse antes. Si la web cambia y no
     // se puede, se usan los resultados por relevancia.
@@ -2214,6 +2231,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
         const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
         await page.getByText('最新',{exact:true}).first().click({timeout:6000});
         const j2=await (await next).json().catch(()=>null);
+        if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
         if(xianyuRiskIn(j2))return {risk:true};
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
@@ -2231,6 +2249,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
           const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
           await page.keyboard.press('Tab');
           const j3=await (await next).json().catch(()=>null);
+          if(xianyuAuthIn(j3))return {login:true,where:'sesión caducada'};
           if(xianyuRiskIn(j3))return {risk:true};
           if(j3?.data?.resultList){json=j3;priced=true;}
         }
@@ -2242,8 +2261,13 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null}={}){
   }
 }
 
-async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
-  if(xianyuPausedReason&&Date.now()-xianyuPausedAt>xianyuPauseLen){xianyuPausedReason=null;xianyuPauseLen=XIANYU_PAUSE_MS;}
+async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,accountStateFile=null,accountStrategy='auto'}){
+  const files=xianyuKnownAccounts();
+  if(xianyuPausedReason&&xianyuPauseCode==='login'&&
+    availableXianyuAccounts(files,{failed:xianyuFailedAccounts}).length){
+    xianyuPausedReason=null;
+  }
+  if(xianyuPausedReason&&Date.now()-xianyuPausedAt>xianyuPauseLen){xianyuPausedReason=null;xianyuPauseCode=null;xianyuPauseLen=XIANYU_PAUSE_MS;}
   if(xianyuPausedReason){
     return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
   }
@@ -2257,33 +2281,49 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     if(done>=maxQueries&&kept>0)break;
     done++;
     let res;
-    try{
-      const minCny=Number.isFinite(Number(minEur))&&Number(minEur)>0?Math.floor(eurTo(Number(minEur),'CNY')||0)||null:null;
-      const maxCny=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Math.ceil(eurTo(Number(maxEur),'CNY')||0)||null:null;
-      res=await xianyuDirectSearchOnce(keyword,{minCny,maxCny});
-    }catch(e){
-      res={noResponse:true,where:e.message};
+    const minCny=Number.isFinite(Number(minEur))&&Number(minEur)>0?Math.floor(eurTo(Number(minEur),'CNY')||0)||null:null;
+    const maxCny=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Math.ceil(eurTo(Number(maxEur),'CNY')||0)||null:null;
+    const fixed=accountStrategy==='fixed'
+      ?files.find(file=>path.basename(file)===path.basename(String(accountStateFile||'')))||null
+      :null;
+    const attempt=await tryXianyuAccounts({
+      files,preferred:xianyuActiveAccount,failed:xianyuFailedAccounts,
+      fixed:accountStrategy==='fixed'?fixed||'missing':null,
+      search:async stateFile=>{
+        try{return await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile});}
+        catch(e){return {noResponse:true,where:e.message};}
+      }
+    });
+    res=attempt.result;
+    const failedLabels=attempt.expired;
+    for(const label of failedLabels)console.log(`Xianyu: sesión ${label} caducada; probando la siguiente cuenta.`);
+    if(!res.login&&!res.noResponse&&!res.risk)xianyuActiveAccount=attempt.usedFile;
+    if(res.login&&accountStrategy==='fixed'){
+      const warning=`La cuenta fija ${accountLabel(fixed||accountStateFile)} necesita renovar su sesión.`;
+      perQuery.push({query:keyword,login:true,account:accountLabel(fixed||accountStateFile),accountsExpired:failedLabels});
+      return {ok:true,state:'paused',warning,perQuery,kept};
     }
     if(res.login||res.noResponse){
       // Un fallo de carga no debe generar un error por cada tarea: se pausa
       // Xianyu en esta ejecución y se avisa una sola vez (con detalle).
       xianyuPausedAt=Date.now();
+      xianyuPauseCode=res.login?'login':'search';
       xianyuPausedReason=res.login
-        ? 'Xianyu pide iniciar sesión de nuevo; Xianyu queda en pausa en esta ejecución.'
+        ? 'Todas las cuentas de Xianyu necesitan renovar la sesión; Xianyu queda en pausa.'
         : 'Xianyu no ha devuelto resultados de búsqueda; Xianyu queda en pausa en esta ejecución.';
       console.log(`Xianyu direct: ${xianyuPausedReason} (${res.where||''})`);
       // Señal para el workflow: al terminar, pedir a Nil un QR por Telegram.
-      try{fs.writeFileSync(path.join(__dirname,'.xianyu-needs-login'),xianyuPausedReason);}catch{}
+      if(res.login){try{fs.writeFileSync(path.join(__dirname,'.xianyu-needs-login'),xianyuPausedReason);}catch{}}
       await reportHealthIssue(res.login?'xianyu-login':'xianyu-search',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad.').catch(()=>{});
-      perQuery.push({query:keyword,login:!!res.login,noResponse:!!res.noResponse,where:res.where||null});
+      perQuery.push({query:keyword,login:!!res.login,noResponse:!!res.noResponse,where:res.where||null,accountsExpired:failedLabels});
       break;
     }
     if(res.risk){
       xianyuPausedAt=Date.now();
+      xianyuPauseCode='risk';
       xianyuPauseLen=XIANYU_RISK_PAUSE_MS;
       xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa el resto de esta ejecución para proteger tu cuenta.';
       await reportHealthIssue('xianyu-risk',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad. Se reintentará en la próxima ejecución.').catch(()=>{});
-      try{fs.writeFileSync(path.join(__dirname,'.xianyu-needs-login'),xianyuPausedReason);}catch{}
       perQuery.push({query:keyword,risk:true});
       break;
     }
@@ -2316,7 +2356,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       },sessionId,keyword);
       localKept++;kept++;
     }
-    perQuery.push({query:keyword,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
+    perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     await sleep(2500+Math.random()*2500);
   }
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
@@ -2336,6 +2376,7 @@ let xianyuDetailPausedAt=0;
 let xianyuDetailPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuDetailBudgetLeft(){
+  if(xianyuPausedReason)return 0;
   const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR||4,4,0,20);
   const now=Date.now();
   while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
@@ -2410,6 +2451,12 @@ function searchXianyuLive(opts){
   // Si la sesión no es válida ya se avisa una vez (xianyu-login); no repetir
   // un error por cada tarea.
   const ss=String(process.env.XIANYU_SESSION_STATUS||'').trim();
+  if(xianyuDirectMode()&&['risk_control','expired','missing','error'].includes(ss)){
+    const warning=ss==='risk_control'
+      ?'Xianyu ha pedido verificación de seguridad. Se espera a que la cuenta se revise manualmente.'
+      :'No hay ninguna sesión válida de Xianyu. Renueva una de las cuentas.';
+    return Promise.resolve({ok:true,state:'paused',warning,perQuery:[],kept:0});
+  }
   if(ss&&ss!=='ok'&&!xianyuDirectMode()){
     return Promise.resolve({ok:true,state:'paused',warning:`Sesión de Xianyu no disponible (${ss}).`,perQuery:[],kept:0});
   }
@@ -10993,6 +11040,14 @@ const server=http.createServer(async(req,res)=>{
       return json(res,200,{economics});
     }
     if(req.method==='GET'&&u.pathname==='/api/xianyu/accounts'){
+      if(xianyuDirectMode()){
+        const accounts=xianyuKnownAccounts().map(file=>({
+          name:accountLabel(file),path:file,
+          status:availableXianyuAccounts([file],{failed:xianyuFailedAccounts}).length
+            ?(file===xianyuActiveAccount?'activa':'disponible'):'sesión caducada'
+        }));
+        return json(res,200,{accounts});
+      }
       try{return json(res,200,{accounts:await xianyuFetch('/api/accounts',{timeoutMs:7000})});}catch(e){return json(res,200,{accounts:[],error:e.message});}
     }
     if(req.method==='POST'&&u.pathname==='/api/telegram/test-alert'){

@@ -2,10 +2,10 @@
 // 1. Abre una ventana de Chromium en goofish.com (perfil propio en .xianyu-profile,
 //    así la próxima vez suele bastar con un clic o un escaneo).
 // 2. Inicias sesión tú (QR con la app de Xianyu/Taobao). El script espera.
-// 3. Guarda la sesión para el conector local y la cifra en cloud/xianyu-state.enc
+// 3. Guarda una sesión independiente para esa cuenta y la cifra para la nube.
 //    (openssl te pide la contraseña; debe coincidir con el secreto de GitHub
 //    XIANYU_STATE_PASSWORD).
-// Uso: npm run xianyu:login
+// Uso: npm run xianyu:login -- cuenta-02  (sin argumento: cuenta Nil actual)
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -15,10 +15,17 @@ import readline from 'node:readline/promises';
 import {readState,cookieSummary,isLoggedIn,mergeState,visitGoofish} from './xianyu-session.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const localState=process.env.XIANYU_LOCAL_STATE||path.join(process.env.HOME,'ai-goofish-monitor-wangdaguo','state','Nil.json');
-const encOut=path.join(root,'cloud','xianyu-state.enc');
+const label=process.argv[2]||'Nil';
+if(!/^[A-Za-z0-9_-]{1,32}$/.test(label)){
+  console.error('Usa un nombre de cuenta de 1 a 32 letras, números, guiones o guiones bajos.');
+  process.exit(2);
+}
+const localState=process.env.XIANYU_LOCAL_STATE||path.join(process.env.HOME,'ai-goofish-monitor-wangdaguo','state',`${label}.json`);
+const encOut=label==='Nil'
+  ?path.join(root,'cloud','xianyu-state.enc')
+  :path.join(root,'cloud','xianyu-accounts',`${label}.enc`);
 
-const profileDir=path.join(root,'.xianyu-profile');
+const profileDir=path.join(root,label==='Nil'?'.xianyu-profile':`.xianyu-profile-${label}`);
 const context=await chromium.launchPersistentContext(profileDir,{
   headless:false,
   viewport:{width:1280,height:860},
@@ -62,15 +69,16 @@ let previous={};
 try{previous=readState(localState);}catch{}
 fs.mkdirSync(path.dirname(localState),{recursive:true});
 fs.writeFileSync(localState,JSON.stringify(mergeState(previous,fresh),null,2),{mode:0o600});
-console.log(`OK: sesión local guardada en ${localState}`);
+console.log(`OK: sesión local ${label} guardada en ${localState}`);
 
 console.log('\nAhora se cifra para la nube. Escribe la contraseña de XIANYU_STATE_PASSWORD');
 console.log('(la misma que tienes en GitHub; si no la recuerdas, inventa una nueva y luego');
 console.log('actualiza el secreto con: gh secret set XIANYU_STATE_PASSWORD --repo nmuxart-star/luxury-hunter-worker).\n');
+fs.mkdirSync(path.dirname(encOut),{recursive:true});
 const enc=spawnSync('openssl',['enc','-aes-256-cbc','-salt','-pbkdf2','-in',localState,'-out',encOut],{stdio:'inherit'});
 if(enc.status!==0){
   console.error('No se pudo cifrar la sesión.');
   process.exit(1);
 }
 fs.chmodSync(encOut,0o600);
-console.log(`\nOK: sesión cifrada en ${encOut}. Avisa a Claude para subirla al repo.`);
+console.log(`\nOK: sesión ${label} cifrada en ${encOut}. Sube únicamente el archivo .enc al repositorio.`);

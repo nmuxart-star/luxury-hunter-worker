@@ -64,6 +64,24 @@ Stop Luxury Hunter, copy the update over `~/luxury-hunter`, then run `npm instal
 - **Nube más rápida**: `TASK_CONCURRENCY` (por defecto 3) ejecuta varias tareas a la vez. `LOOP_MINUTES` repite ciclos dentro de una misma ejecución (cada `CYCLE_MIN_MINUTES`, por defecto 20) y `SELF_CHAIN=true` encadena la siguiente ejecución al terminar. Se configuran como *variables* del repositorio en GitHub.
 - **Sesión de Xianyu que se renueva sola**: `npm run xianyu:login` abre Chromium para iniciar sesión una vez en Goofish y cifra la sesión en `cloud/xianyu-state.enc`. En cada ejecución en la nube, `scripts/xianyu-keepalive.mjs` visita Goofish con la sesión, guarda las cookies renovadas (cifradas) en el estado persistente y la siguiente ejecución usa la más reciente. Si caduca o Goofish pide verificación anti-bot, llega una alerta "⚠️ Luxury Hunter necesita atención" con el comando para renovarla.
 
+### Varias cuentas de Xianyu
+
+La cuenta actual `Nil` sigue siendo la principal. Para añadir otra cuenta, ejecuta
+`npm run xianyu:login -- cuenta-02` en tu Mac y completa tú mismo el inicio de
+sesión en la ventana de Chromium. Repite con `cuenta-03`, etc. Cada nombre usa
+un perfil y un fichero de sesión separados. El script guarda el estado local en
+`~/ai-goofish-monitor-wangdaguo/state/<nombre>.json` y cifra una copia en
+`cloud/xianyu-accounts/<nombre>.enc`. Usa la misma contraseña de cifrado que
+`XIANYU_STATE_PASSWORD` de GitHub y sube solo los ficheros `.enc`.
+
+En modo directo, Luxury Hunter usa la cuenta activa mientras funcione. Si la
+sesión caduca, prueba la siguiente cuenta disponible una sola vez y conserva
+la que responde. Si todas caducan, pausa Xianyu y pide renovar una sesión.
+Una verificación de seguridad de Xianyu pausa las búsquedas de todas las cuentas;
+no activa una reserva para eludir esa verificación. Las demás fuentes siguen.
+`Configuración` muestra las cuentas detectadas sin mostrar cookies. La opción
+de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserva.
+
 ## v1.7 — Más mercados y costes por origen
 
 - **Rakuten Ichiba** (API oficial; secretos `RAKUTEN_APP_ID`, `RAKUTEN_ACCESS_KEY`): tiendas japonesas de lujo de segunda mano (Brand Off, Komehyo, Daikokuya, 2nd Street…). Usa las consultas en japonés de cada tarea.

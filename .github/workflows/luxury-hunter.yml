@@ -176,27 +176,54 @@ jobs:
           XIANYU_MODE: ${{ vars.XIANYU_MODE }}
         shell: bash
         run: |
-          if [ ! -f cloud/xianyu-state.enc ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
+          shopt -s nullglob
+          ACCOUNT_ENC=(cloud/xianyu-state.enc cloud/xianyu-accounts/*.enc)
+          if [ ${#ACCOUNT_ENC[@]} -eq 0 ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
             echo "Xianyu cloud state not configured; Xianyu connector will be unavailable in this run."
             echo "XIANYU_SESSION_STATUS=missing" >> "$GITHUB_ENV"
             exit 0
           fi
           git clone --depth 1 https://github.com/wangdaguo/ai-goofish-monitor.git .xianyu || mkdir -p .xianyu
           mkdir -p .xianyu/state .xianyu/data .xianyu/logs .xianyu/images .xianyu/jsonl .xianyu/price_history .xianyu-tmp
-          # Candidatas: la del repo (último login manual) y la renovada en la ejecución anterior.
-          openssl enc -d -aes-256-cbc -pbkdf2 -in cloud/xianyu-state.enc -out .xianyu-tmp/repo.json -pass env:XIANYU_STATE_PASSWORD || true
-          if [ -f .state/xianyu-state.enc ]; then
-            openssl enc -d -aes-256-cbc -pbkdf2 -in .state/xianyu-state.enc -out .xianyu-tmp/rolling.json -pass env:XIANYU_STATE_PASSWORD || true
+          # Cada cuenta conserva su propio state. Para Nil se mantiene el formato
+          # antiguo y así no se pierden los inicios de sesión ya configurados.
+          for ENC in "${ACCOUNT_ENC[@]}"; do
+            NAME="$(basename "$ENC" .enc)"
+            [ "$ENC" = cloud/xianyu-state.enc ] && NAME=Nil
+            [[ "$NAME" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || continue
+            REPO_TMP=".xianyu-tmp/$NAME-repo.json"
+            ROLL_TMP=".xianyu-tmp/$NAME-rolling.json"
+            openssl enc -d -aes-256-cbc -pbkdf2 -in "$ENC" -out "$REPO_TMP" -pass env:XIANYU_STATE_PASSWORD || true
+            ROLL_ENC=".state/xianyu-accounts/$NAME.enc"
+            [ "$NAME" = Nil ] && [ -f .state/xianyu-state.enc ] && ROLL_ENC=.state/xianyu-state.enc
+            if [ -f "$ROLL_ENC" ]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -in "$ROLL_ENC" -out "$ROLL_TMP" -pass env:XIANYU_STATE_PASSWORD || true
+            fi
+            node scripts/xianyu-pick-state.mjs ".xianyu/state/$NAME.json" "$REPO_TMP" "$ROLL_TMP" || true
+          done
+          mkdir -p lh-upload/xianyu-accounts
+          VALID=0
+          RISK=0
+          for STATE in .xianyu/state/*.json; do
+            NAME="$(basename "$STATE" .json)"
+            STATUS_FILE=".xianyu-tmp/$NAME.status"
+            GITHUB_ENV= XIANYU_STATUS_FILE="$STATUS_FILE" node scripts/xianyu-keepalive.mjs "$STATE" || true
+            STATUS="$(cat "$STATUS_FILE" 2>/dev/null || echo error)"
+            [ "$STATUS" = ok ] && VALID=$((VALID+1))
+            [ "$STATUS" = risk_control ] && RISK=1
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in "$STATE" -out "lh-upload/xianyu-accounts/$NAME.enc" -pass env:XIANYU_STATE_PASSWORD
+            [ "$NAME" = Nil ] && cp "lh-upload/xianyu-accounts/$NAME.enc" lh-upload/xianyu-state.enc
+            echo "Xianyu account $NAME: $STATUS"
+          done
+          if [ "$RISK" -eq 1 ]; then
+            echo "XIANYU_SESSION_STATUS=risk_control" >> "$GITHUB_ENV"
+          elif [ "$VALID" -gt 0 ]; then
+            echo "XIANYU_SESSION_STATUS=ok" >> "$GITHUB_ENV"
+          else
+            echo "XIANYU_SESSION_STATUS=expired" >> "$GITHUB_ENV"
           fi
-          node scripts/xianyu-pick-state.mjs .xianyu/state/Nil.json .xianyu-tmp/repo.json .xianyu-tmp/rolling.json || true
+          echo "XIANYU_STATE_DIR=$PWD/.xianyu/state" >> "$GITHUB_ENV"
           rm -rf .xianyu-tmp
-          # Renueva cookies visitando Goofish con la sesión guardada.
-          XS=0
-          node scripts/xianyu-keepalive.mjs .xianyu/state/Nil.json || XS=$?
-          if [ -f .xianyu/state/Nil.json ]; then
-            mkdir -p lh-upload
-            openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out lh-upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
-          fi
           # Modo directo (por defecto): Luxury Hunter lee solo la página de
           # resultados con las cookies guardadas; no hace falta el conector
           # Docker, que abría cada ficha y provocaba la verificación anti-bot.
@@ -204,10 +231,10 @@ jobs:
             if [ -f .xianyu/state/Nil.json ]; then
               echo "XIANYU_STATE_FILE=$PWD/.xianyu/state/Nil.json" >> "$GITHUB_ENV"
             fi
-            echo "Xianyu direct mode ready (session check exit $XS)"
+            echo "Xianyu direct mode ready ($VALID available accounts)"
             exit 0
           fi
-          if [ "$XS" != "0" ]; then
+          if [ "$VALID" -eq 0 ]; then
             echo "Xianyu session is not valid; skipping Xianyu in this run."
             exit 0
           fi
@@ -270,6 +297,8 @@ jobs:
           echo "$NOW" > lh-upload/xianyu-qr-last
           if node scripts/xianyu-qr-login.mjs .xianyu/state/Nil.json 4; then
             openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out lh-upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
+            mkdir -p lh-upload/xianyu-accounts
+            cp lh-upload/xianyu-state.enc lh-upload/xianyu-accounts/Nil.enc
             echo "New Xianyu session saved."
           fi
 
@@ -287,6 +316,11 @@ jobs:
           if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
             cp .state/xianyu-state.enc lh-upload/
           fi
+          mkdir -p lh-upload/xianyu-accounts
+          for ENC in .state/xianyu-accounts/*.enc; do
+            [ -f "$ENC" ] || continue
+            [ -f "lh-upload/xianyu-accounts/$(basename "$ENC")" ] || cp "$ENC" lh-upload/xianyu-accounts/
+          done
           if [ ! -f lh-upload/xianyu-qr-last ] && [ -f .state/xianyu-qr-last ]; then
             cp .state/xianyu-qr-last lh-upload/
           fi

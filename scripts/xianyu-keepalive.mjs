@@ -10,6 +10,9 @@ import {readState,cookieSummary,isLoggedIn,mergeState,visitGoofish} from './xian
 const file=process.argv[2];
 function report(status,detail){
   console.log(`Xianyu session: ${status}${detail?` · ${detail}`:''}`);
+  if(process.env.XIANYU_STATUS_FILE){
+    fs.writeFileSync(process.env.XIANYU_STATUS_FILE,`${status}\n`);
+  }
   if(process.env.GITHUB_ENV){
     fs.appendFileSync(process.env.GITHUB_ENV,`XIANYU_SESSION_STATUS=${status}\n`);
   }

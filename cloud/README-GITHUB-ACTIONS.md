@@ -5,8 +5,9 @@ This mode runs the worker every 3 hours without depending on your Mac.
 Important limitations:
 - GitHub-hosted runners are ephemeral. SQLite is restored from the previous workflow artifact and uploaded again at the end.
 - The local web UI is not hosted by GitHub Actions. Use it to edit tasks, then export `cloud/config.json` and push that file.
-- Xianyu is optional and requires `cloud/xianyu-state.enc` plus the GitHub secret `XIANYU_STATE_PASSWORD`. Never commit the raw Xianyu state JSON.
+- Xianyu is optional and requires `cloud/xianyu-state.enc` or encrypted files in `cloud/xianyu-accounts/`, plus the GitHub secret `XIANYU_STATE_PASSWORD`. Never commit raw Xianyu state JSON.
 - Datacenter IPs can trigger Xianyu risk controls. If Xianyu blocks a GitHub runner, the workflow should continue with other sources; do not attempt to bypass CAPTCHA/risk controls.
+- Multiple Xianyu accounts are kept separate in the rolling workflow artifact. A failed login can use the next account; any security verification pauses Xianyu for the run.
 - The Japan/Buyee connector is still experimental and can return parser warnings.
 
 ## Zero-cost recommendation
