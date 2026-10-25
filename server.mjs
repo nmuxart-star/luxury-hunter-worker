@@ -2087,9 +2087,9 @@ let xianyuPausedReason=null;
 let xianyuPausedAt=0;
 // En un servidor que no se reinicia (Mac), la pausa caduca sola.
 const XIANYU_PAUSE_MS=2*3600e3;
-// Tras una verificación anti-bot no se reintenta hasta pasadas 12 h: insistir
+// Tras una verificación anti-bot no se reintenta hasta pasadas 4 h: insistir
 // en cada ejecución es lo que mantiene la cuenta marcada.
-const XIANYU_RISK_PAUSE_MS=12*3600e3;
+const XIANYU_RISK_PAUSE_MS=4*3600e3;
 let xianyuPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuStateFile(){
