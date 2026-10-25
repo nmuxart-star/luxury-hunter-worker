@@ -2264,7 +2264,21 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
   }
 }
 
+function xianyuLastSearchAt(){
+  const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_search'").get();
+  return Number(row?.value_json||0)||0;
+}
+function xianyuMarkSearch(){
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
+}
 async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,accountStateFile=null,accountStrategy='auto'}){
+  // Como mucho una búsqueda de Xianyu cada XIANYU_MIN_INTERVAL_MIN minutos
+  // (entre todas las tareas y ejecuciones). Menos peticiones = menos verificaciones.
+  const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
+  if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+    return {ok:true,state:'throttled',perQuery:[],kept:0};
+  }
   const files=xianyuKnownAccounts();
   if(xianyuPausedReason&&xianyuPauseCode==='login'&&
     availableXianyuAccounts(files,{failed:xianyuFailedAccounts}).length){
@@ -2362,6 +2376,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     await sleep(2500+Math.random()*2500);
   }
+  if(perQuery.length)xianyuMarkSearch();
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
   if(xianyuPausedReason&&!kept)return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery,kept};
   clearHealthIssue('xianyu-risk');
@@ -2380,7 +2395,7 @@ let xianyuDetailPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuDetailBudgetLeft(){
   if(xianyuPausedReason)return 0;
-  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR||4,4,0,20);
+  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR??0,0,0,20);
   const now=Date.now();
   while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
   if(now-xianyuDetailPausedAt<xianyuDetailPauseLen)return 0;
@@ -3716,11 +3731,20 @@ let vestiaireSheetCache=null;
 let vestiaireSheetPromise=null;
 let googleSheetsToken=null;
 
+// Clave de la cuenta de servicio: en la nube va en el secreto; en el Mac, en
+// un archivo (GOOGLE_SHEETS_SA_FILE, carpeta private/ que no se sube a git).
+function googleSheetsSaRaw(){
+  const inline=String(process.env.GOOGLE_SHEETS_SA_JSON||'').trim();
+  if(inline)return inline;
+  const file=String(process.env.GOOGLE_SHEETS_SA_FILE||'').trim();
+  if(file){try{return fs.readFileSync(file,'utf8').trim();}catch{}}
+  return '';
+}
 function vestiaireSheetConfigured(){
-  return !!(String(process.env.VESTIAIRE_SHEET_ID||'').trim()&&(String(process.env.GOOGLE_SHEETS_SA_JSON||'').trim()||String(process.env.GOOGLE_SHEETS_API_KEY||'').trim()));
+  return !!(String(process.env.VESTIAIRE_SHEET_ID||'').trim()&&(googleSheetsSaRaw()||String(process.env.GOOGLE_SHEETS_API_KEY||'').trim()));
 }
 async function googleSheetsAuth(){
-  const raw=String(process.env.GOOGLE_SHEETS_SA_JSON||'').trim();
+  const raw=googleSheetsSaRaw();
   if(!raw)return {query:`key=${encodeURIComponent(String(process.env.GOOGLE_SHEETS_API_KEY||'').trim())}`,headers:{}};
   if(googleSheetsToken&&googleSheetsToken.exp>Date.now()+60e3)return {query:'',headers:{authorization:`Bearer ${googleSheetsToken.token}`}};
   const sa=JSON.parse(raw);
@@ -11299,7 +11323,7 @@ server.listen(PORT,'127.0.0.1',async()=>{
   try{vetoUnverifiableXianyuAnalyses();}catch(e){console.error('Xianyu veto:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
   if(vestiaireSheetConfigured())await refreshVestiaireSheet({force:true}).catch(()=>{});
-  else console.log('Hoja de Vestiaire no configurada (VESTIAIRE_SHEET_ID + GOOGLE_SHEETS_SA_JSON): se usa la copia fija.');
+  else console.log('Hoja de Vestiaire no configurada (VESTIAIRE_SHEET_ID + GOOGLE_SHEETS_SA_JSON o GOOGLE_SHEETS_SA_FILE): se usa la copia fija.');
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();
   if(!['1','true','yes','on'].includes(schedulerDisabled)){
     setInterval(()=>schedulerTick().catch(e=>console.error('Scheduler:',e.message)),30000);
