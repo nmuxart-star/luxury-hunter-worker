@@ -1846,7 +1846,7 @@ function rakutenFullImage(url){
 // Exclusiones en la propia búsqueda: así las 30 plazas por página son para
 // bolsos y no para carteras o calzado de la misma línea. "ウォレット" no va
 // aquí porque excluiría los "chain wallet" (bolso pequeño).
-const RAKUTEN_NG_KEYWORDS='保存袋 ストラップのみ チャーム 財布 コインケース カードケース 名刺入れ 小銭入れ キーケース キーホルダー 腕時計 靴 シューズ ローファー パンプス サンダル ミュール スニーカー スカーフ ジュエリー 指輪 イヤリング ピアス ネックレス ブレスレット';
+const RAKUTEN_NG_KEYWORDS='財布 コインケース カードケース 名刺入れ 小銭入れ キーケース キーホルダー 腕時計 靴 シューズ ローファー パンプス サンダル スニーカー ネックレス ピアス イヤリング ブレスレット 指輪 スカーフ 保存袋 ストラップのみ チャーム'; // la API admite menos de 128 caracteres
 const RAKUTEN_NG_KEYWORDS_LEGACY='保存袋 ストラップのみ チャーム';
 
 async function rakutenFetchPage(params){
