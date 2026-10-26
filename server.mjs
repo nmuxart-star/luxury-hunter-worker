@@ -1741,6 +1741,31 @@ async function fetchBunjangPublication(item){
 }
 
 
+// Confianza en Bunjang: si el anuncio tiene 번개케어 (verificación de
+// autenticidad de Bunjang) y la nota/reseñas/ventas de la tienda. Una sola
+// petición a la API pública de la ficha; no se guarda el nombre del vendedor.
+async function fetchBunjangTrust(id){
+  try{
+    const r=await fetch(`https://api.bunjang.co.kr/api/pms/v3/products-detail/${encodeURIComponent(id)}?viewerUid=-1`,{
+      headers:{'user-agent':'Mozilla/5.0','accept':'application/json'},
+      signal:AbortSignal.timeout(15000)
+    });
+    if(!r.ok)return null;
+    const d=(await r.json())?.data||{};
+    const p=d.product||{}, sh=d.shop||{};
+    return {
+      care:p.care===true,
+      inspectionStatus:p.inspectionStatus||null,
+      rating:Number.isFinite(Number(sh.reviewRating))?Number(sh.reviewRating):null,
+      reviewCount:Number.isFinite(Number(sh.reviewCount))?Number(sh.reviewCount):null,
+      salesCount:Number.isFinite(Number(sh.salesCount))?Number(sh.salesCount):null,
+      proshop:sh.proshop?.isProshop===true,
+      description:String(p.description||'').slice(0,4000),
+      checkedAt:new Date().toISOString()
+    };
+  }catch{return null;}
+}
+
 async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, maxEur=null, sessionId }) {
   const maxQueries = clampInt(process.env.BUNJANG_MAX_QUERIES || 2, 2, 1, 5);
   const selectedQueries = (queries || []).slice(0, maxQueries);
@@ -1769,10 +1794,30 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
     if (Number.isFinite(Number(maxEur)) && pe != null && pe > Number(maxEur)) continue;
     const sourceQuery = unique.get(String(item.id)) || '';
 
-    const publication=await fetchBunjangPublication(item);
+    // Fecha de publicación: si el anuncio ya se vio en otra ejecución, se
+    // reutiliza la que se guardó y no se vuelve a abrir su página.
+    let publication=null;
+    try{
+      const prev=db.prepare("SELECT raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(String(item.id));
+      const pr=prev?JSON.parse(prev.raw_json||'{}'):null;
+      if(pr?.publishedAt&&pr?.luxuryHunterPublication?.status&&pr.luxuryHunterPublication.status!=='UNKNOWN'){
+        publication={publishedAt:pr.publishedAt||null,ageText:pr.luxuryHunterPublication.ageText||null,source:'cache',sourceValue:pr.luxuryHunterPublication.sourceValue||null,status:pr.luxuryHunterPublication.status};
+      }
+    }catch{}
+    if(!publication)publication=await fetchBunjangPublication(item);
+
+    // Care y valoraciones: se reutilizan si se comprobaron en los últimos 3 días.
+    let trust=null;
+    try{
+      const prev=db.prepare("SELECT raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(String(item.id));
+      const pt=prev?JSON.parse(prev.raw_json||'{}').luxuryHunterTrust:null;
+      if(pt?.checkedAt&&Date.now()-Date.parse(pt.checkedAt)<3*86400e3)trust=pt;
+    }catch{}
+    if(!trust){trust=await fetchBunjangTrust(item.id);await sleep(250);}
 
     const rawWithPublication={
       ...item,
+      luxuryHunterTrust:trust?{...trust,description:undefined}:null,
       publishedAt:publication.publishedAt,
       luxuryHunterPublication:{
         marketplace:'bunjang',
@@ -1785,9 +1830,9 @@ async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, m
     };
 
     upsertListing({
-      source:'bunjang', source_id:item.id, url:item.url, title:item.title, description:item.description,
-      original_price:p, currency:'KRW', price_eur:pe, seller_name:item.sellerName,
-      seller_items:item.sellerItemCount, seller_sales:item.sellerSalesCount, seller_reviews:item.sellerReviewCount,
+      source:'bunjang', source_id:item.id, url:item.url, title:item.title, description:item.description||trust?.description||'',
+      original_price:p, currency:'KRW', price_eur:pe, seller_name:null,
+      seller_items:item.sellerItemCount, seller_sales:trust?.salesCount??item.sellerSalesCount, seller_reviews:trust?.reviewCount??item.sellerReviewCount,
       image_url:item.imageUrl, status:item.status, purchase_via:'Korea proxy', raw:rawWithPublication
     }, sessionId, sourceQuery);
 
@@ -2728,7 +2773,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Buyee',
     mode:'browser',
     base:'https://buyee.jp',
-    cap:10,
+    cap:50,
     searchWaitMs:5000,
     detailWaitMs:1200,
     searchUrl:q=>`https://buyee.jp/item/search/query/${encodeURIComponent(q)}?lang=en`,
@@ -2740,7 +2785,8 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://jp.mercari.com',
-    cap:12,
+    scrollSteps:10,
+    cap:100,
     searchWaitMs:3500,
     detailWaitMs:4000,
     searchUrl:q=>`https://jp.mercari.com/search?keyword=${encodeURIComponent(q)}&sort=created_time&order=desc`,
@@ -2752,7 +2798,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'http',
     base:'https://fril.jp',
-    cap:12,
+    cap:60,
     searchUrl:q=>`https://fril.jp/s?query=${encodeURIComponent(q)}`,
     accepts:u=>u.hostname==='item.fril.jp'&&/^\/[a-f0-9]+\/?$/i.test(u.pathname)
   },
@@ -2762,7 +2808,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://paypayfleamarket.yahoo.co.jp',
-    cap:8,
+    cap:60,
     searchWaitMs:3000,
     detailWaitMs:1000,
     searchUrl:q=>`https://paypayfleamarket.yahoo.co.jp/search/${encodeURIComponent(q)}?withSpeller=0`,
@@ -2774,7 +2820,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://www.2ndstreet.jp',
-    cap:6,
+    cap:30,
     searchWaitMs:3000,
     detailWaitMs:1000,
     searchUrl:q=>`https://www.2ndstreet.jp/search?keyword=${encodeURIComponent(q)}`,
@@ -2786,7 +2832,7 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'http',
     base:'https://komehyo.jp',
-    cap:8,
+    cap:30,
     searchUrl:q=>`https://komehyo.jp/search/?q=${encodeURIComponent(q)}`,
     accepts:u=>/^\/product\/[^/]+\/?/i.test(u.pathname)
   }
@@ -3167,7 +3213,7 @@ async function japanHttpSnapshot(url){
   };
 }
 
-async function japanBrowserSnapshot(context,url,waitMs=1000){
+async function japanBrowserSnapshot(context,url,waitMs=1000,scrollSteps=0){
   const page=await context.newPage();
 
   try{
@@ -3177,6 +3223,12 @@ async function japanBrowserSnapshot(context,url,waitMs=1000){
     });
 
     await page.waitForTimeout(waitMs);
+    // Páginas que cargan más anuncios al bajar (Mercari): se baja por la
+    // lista de resultados para leer más que los primeros.
+    for(let i=0;i<scrollSteps;i++){
+      await page.mouse.wheel(0,2400).catch(()=>{});
+      await page.waitForTimeout(900);
+    }
 
     const html=await page.content();
 
@@ -3433,7 +3485,8 @@ async function searchJapanSource(
         ? await japanBrowserSnapshot(
             browserContext,
             searchUrl,
-            spec.searchWaitMs||2500
+            spec.searchWaitMs||2500,
+            spec.scrollSteps||0
           )
         : await japanHttpSnapshot(searchUrl);
 
@@ -8107,9 +8160,100 @@ function xianyuVerificationVeto(item){
     reasons:['El anuncio de Xianyu no permite la verificación de autenticidad de la plataforma (验货宝). Descartado por política.']
   };
 }
+// Bunjang (regla de Nil): solo anuncios con 번개케어 o de vendedores con buena
+// nota y suficientes reseñas. Si no se pudo comprobar, decide la IA.
+function bunjangTrustVeto(item){
+  if(String(item?.source||'').toLowerCase()!=='bunjang')return null;
+  let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
+  const t=raw.luxuryHunterTrust;
+  if(!t)return null;
+  if(t.care===true)return null;
+  const minRating=Number(process.env.BUNJANG_MIN_RATING||4.5);
+  const minReviews=Number(process.env.BUNJANG_MIN_REVIEWS||20);
+  if(Number(t.rating)>=minRating&&Number(t.reviewCount)>=minReviews)return null;
+  return {
+    code:'bunjang_untrusted',
+    term:`care no · nota ${t.rating??'—'} · ${t.reviewCount??0} reseñas`,
+    reasons:[`Bunjang sin 번개케어 y vendedor sin buenas valoraciones (nota ${t.rating??'—'}, ${t.reviewCount??0} reseñas; mínimo ${minRating} y ${minReviews}). Descartado por política.`]
+  };
+}
+// ── VENDEDORES DE JAPÓN (regla de Nil) ──────────────────────────────────
+// Mercari y Rakuma: solo vendedores con al menos JAPAN_MIN_POSITIVE_PCT % de
+// valoraciones positivas y JAPAN_MIN_REVIEWS reseñas. Se comprueba solo en los
+// candidatos que pasan el triaje (se abre su ficha una vez y se guarda 3 días).
+const JAPAN_SELLER_SOURCES=new Set(['mercari-jp','rakuma-jp']);
+async function fetchJapanSeller(item,ctx){
+  if(item.source==='rakuma-jp'){
+    const r=await fetch(item.url,{headers:{'user-agent':'Mozilla/5.0'},signal:AbortSignal.timeout(20000)});
+    if(!r.ok)return null;
+    const plain=String(await r.text()).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ');
+    const m=plain.match(/取引の評価\s*(\d+)\s+(\d+)\s+(\d+)/);
+    return m?{good:+m[1],normal:+m[2],bad:+m[3]}:null;
+  }
+  if(item.source==='mercari-jp'&&ctx){
+    const page=await ctx.newPage();
+    try{
+      const respP=page.waitForResponse(r=>r.url().includes('api.mercari.jp/items/get'),{timeout:30000});
+      await page.goto(item.url,{waitUntil:'domcontentloaded',timeout:40000});
+      const j=await (await respP).json();
+      const rt=j?.data?.seller?.ratings;
+      return rt?{good:Number(rt.good)||0,normal:Number(rt.normal)||0,bad:Number(rt.bad)||0}:null;
+    }finally{await page.close().catch(()=>{});}
+  }
+  return null;
+}
+async function checkJapanSellers(items){
+  const out=new Map();
+  const todo=[];
+  for(const it of items){
+    let raw={};try{raw=JSON.parse(it.raw_json||'{}')}catch{}
+    const prev=raw.luxuryHunterSeller;
+    if(prev?.checkedAt&&Date.now()-Date.parse(prev.checkedAt)<3*86400e3)out.set(it.id,prev);
+    else todo.push(it);
+  }
+  let browser=null,ctx=null;
+  try{
+    if(todo.some(x=>x.source==='mercari-jp')){
+      const {chromium}=await import('playwright');
+      browser=await chromium.launch();
+      ctx=await browser.newContext({locale:'ja-JP'});
+    }
+    for(const it of todo){
+      let seller=null;
+      try{seller=await fetchJapanSeller(it,ctx);}catch{}
+      if(seller){
+        const total=seller.good+seller.normal+seller.bad;
+        seller={...seller,total,positivePct:total?Math.round(seller.good/total*1000)/10:null,checkedAt:new Date().toISOString()};
+        let raw={};try{raw=JSON.parse(it.raw_json||'{}')}catch{}
+        raw.luxuryHunterSeller=seller;
+        db.prepare('UPDATE listings SET raw_json=?, seller_reviews=? WHERE id=?').run(JSON.stringify(raw),total,it.id);
+        it.raw_json=JSON.stringify(raw);
+        out.set(it.id,seller);
+      }
+      await sleep(1200);
+    }
+  }finally{
+    if(browser)await browser.close().catch(()=>{});
+  }
+  return out;
+}
+function japanSellerVeto(seller){
+  if(!seller)return null; // no se pudo comprobar: decide la IA
+  const minPct=Number(process.env.JAPAN_MIN_POSITIVE_PCT||92);
+  const minReviews=Number(process.env.JAPAN_MIN_REVIEWS||20);
+  if(seller.total>=minReviews&&Number(seller.positivePct)>=minPct)return null;
+  return {
+    code:'japan_seller_untrusted',
+    term:`${seller.total} reseñas · ${seller.positivePct??'—'} %`,
+    reasons:[`Vendedor con pocas reseñas o valoraciones bajas (${seller.total} reseñas, ${seller.positivePct??'—'} % positivas; mínimo ${minReviews} y ${minPct} %). Descartado por política.`]
+  };
+}
+
 function deterministicPrescreen(item){
   const veto=xianyuVerificationVeto(item);
   if(veto)return veto;
+  const bj=bunjangTrustVeto(item);
+  if(bj)return bj;
   const title=String(item?.title||'').toLowerCase();
   const exotic=exoticSkinTerm(item);
   if(exotic){
@@ -9209,9 +9353,30 @@ async function executeTask(taskId, runId=null) {
         }
       }
 
+      // Japón: vendedor de Mercari/Rakuma con buenas valoraciones (regla de Nil).
+      const jpCandidates=pendingItems.filter(x=>!x._needsVerification&&JAPAN_SELLER_SOURCES.has(String(x.source)));
+      if(jpCandidates.length){
+        try{
+          const sellers=await checkJapanSellers(jpCandidates);
+          let vetoed=0;
+          pendingItems=pendingItems.filter(x=>{
+            if(!JAPAN_SELLER_SOURCES.has(String(x.source))||x._needsVerification)return true;
+            const veto=japanSellerVeto(sellers.get(x.id));
+            if(!veto)return true;
+            storePrescreenReject(taskId,x,veto);
+            db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,x.id);
+            vetoed++;
+            return false;
+          });
+          if(vetoed)console.log(`Task ${taskId}: ${vetoed} anuncios de Japón descartados por valoraciones del vendedor.`);
+        }catch(e){
+          console.error(`Task ${taskId}: valoraciones de Japón no disponibles:`,e.message);
+        }
+      }
+
       // Tope diario de análisis completos por modelo: cuando se llega, solo
       // pasan los que el triaje puntúa muy alto (los mejores).
-      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY||12);
+      const dayCap=Number(process.env.AI_MAX_ANALYSES_PER_TASK_DAY??0); // 0 = sin tope por tarea (el coste se controla por horas y por día)
       const dayKey=aiSpendDay();
       const dayCounts=(()=>{const st=getSetting('ai_task_day',{})||{};return st.day===dayKey?st:{day:dayKey,counts:{}};})();
       if(Number.isFinite(dayCap)&&dayCap>0){

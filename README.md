@@ -105,8 +105,9 @@ XIANYU_PROVIDER=justoneapi
 JUSTONEAPI_TOKEN=tu_token
 ```
 
-Por defecto, Luxury Hunter hace como máximo una búsqueda de Xianyu cada seis
-horas y abre hasta cuatro fichas por hora. Ajusta `XIANYU_MIN_INTERVAL_MIN`,
+Con Just One API, Luxury Hunter hace por defecto una consulta cada seis horas
+y abre hasta cuatro fichas por hora. El modo directo en la nube conserva su
+ritmo anterior de dos consultas cada tres horas. Ajusta `XIANYU_MIN_INTERVAL_MIN`,
 `XIANYU_MAX_QUERIES`, `XIANYU_DETAIL_PER_HOUR` y `XIANYU_JUSTONE_SORT` según tu
 plan. Just One API es un proveedor externo: consulta sus cuotas y cargos antes
 de activarlo. Los errores se registran sin detener las demás fuentes.

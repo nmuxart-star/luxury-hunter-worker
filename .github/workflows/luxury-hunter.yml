@@ -63,9 +63,10 @@ jobs:
       XIANYU_BASE_URL: http://127.0.0.1:8000
       XIANYU_PROVIDER: ${{ vars.XIANYU_PROVIDER == 'direct' && 'direct' || 'justoneapi' }}
       XIANYU_JUSTONE_SORT: ${{ vars.XIANYU_JUSTONE_SORT || 'active' }}
-      XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || '360' }}
       XIANYU_DETAIL_PER_HOUR: ${{ vars.XIANYU_DETAIL_PER_HOUR || '4' }}
-      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '1' }}
+      # Just One API: 1 consulta cada 6 h. Modo directo: 2 consultas cada 3 h.
+      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || (vars.XIANYU_PROVIDER == 'direct' && '2' || '1') }}
+      XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || (vars.XIANYU_PROVIDER == 'direct' && '180' || '360') }}
       XIANYU_QUERY_TIMEOUT_SEC: ${{ vars.XIANYU_QUERY_TIMEOUT_SEC || '180' }}
       BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
