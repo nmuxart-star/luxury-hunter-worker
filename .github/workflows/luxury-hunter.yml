@@ -48,12 +48,6 @@ jobs:
       IMPORT_VAT_MODE: ${{ vars.IMPORT_VAT_MODE || 'cost' }}
       GOOGLE_CLOUD_VISION_API_KEY: ${{ secrets.GOOGLE_CLOUD_VISION_API_KEY }}
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-      # Apify Xianyu public feed (optional, pay-per-listing).
-      APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
-      APIFY_XIANYU_FEED_ENABLED: ${{ vars.APIFY_XIANYU_FEED_ENABLED || '0' }}
-      APIFY_XIANYU_FEED_MAX_ITEMS: ${{ vars.APIFY_XIANYU_FEED_MAX_ITEMS || '100' }}
-      APIFY_XIANYU_FEED_INTERVAL_MIN: ${{ vars.APIFY_XIANYU_FEED_INTERVAL_MIN || '360' }}
-      APIFY_XIANYU_FEED_MAX_CHARGE_USD: ${{ vars.APIFY_XIANYU_FEED_MAX_CHARGE_USD || '0.25' }}
       # Base de datos de Vestiaire de Nil (Google Sheets), solo lectura con cuenta de servicio.
       VESTIAIRE_SHEET_ID: ${{ secrets.VESTIAIRE_SHEET_ID }}
       GOOGLE_SHEETS_SA_JSON: ${{ secrets.GOOGLE_SHEETS_SA_JSON }}
@@ -65,10 +59,14 @@ jobs:
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      JUSTONEAPI_TOKEN: ${{ secrets.JUSTONEAPI_TOKEN }}
       XIANYU_BASE_URL: http://127.0.0.1:8000
-      # Xianyu: una comprobación cada 3 h con 2 consultas (~30 anuncios cada una).
-      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '2' }}
-      XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || '180' }}
+      XIANYU_PROVIDER: ${{ vars.XIANYU_PROVIDER == 'direct' && 'direct' || 'justoneapi' }}
+      XIANYU_JUSTONE_SORT: ${{ vars.XIANYU_JUSTONE_SORT || 'active' }}
+      XIANYU_DETAIL_PER_HOUR: ${{ vars.XIANYU_DETAIL_PER_HOUR || '4' }}
+      # Just One API: 1 consulta cada 6 h. Modo directo: 2 consultas cada 3 h.
+      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || (vars.XIANYU_PROVIDER == 'direct' && '2' || '1') }}
+      XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || (vars.XIANYU_PROVIDER == 'direct' && '180' || '360') }}
       XIANYU_QUERY_TIMEOUT_SEC: ${{ vars.XIANYU_QUERY_TIMEOUT_SEC || '180' }}
       BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
@@ -182,8 +180,14 @@ jobs:
         env:
           XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
           XIANYU_MODE: ${{ vars.XIANYU_MODE }}
+          XIANYU_PROVIDER: ${{ vars.XIANYU_PROVIDER == 'direct' && 'direct' || 'justoneapi' }}
         shell: bash
         run: |
+          if [ "${XIANYU_PROVIDER:-justoneapi}" != "direct" ]; then
+            echo "XIANYU_SESSION_STATUS=not_required" >> "$GITHUB_ENV"
+            echo "Just One API selected; skipping Xianyu browser sessions and connector."
+            exit 0
+          fi
           shopt -s nullglob
           ACCOUNT_ENC=(cloud/xianyu-state.enc cloud/xianyu-accounts/*.enc)
           if [ ${#ACCOUNT_ENC[@]} -eq 0 ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
