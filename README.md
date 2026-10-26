@@ -86,35 +86,30 @@ demás fuentes continúan funcionando.
 `Configuración` muestra las cuentas detectadas sin mostrar cookies. La opción
 de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserva.
 
-### Apify: feed público de Xianyu
+### Just One API para Xianyu
 
-Luxury Hunter puede complementar las búsquedas con el feed público del actor
-[Xianyu (Goofish) Listings Scraper](https://apify.com/piotrv1001/xianyu-goofish-listings-scraper).
-El actor funciona en modo `feed`, sin sesión, sin abrir fichas de producto y
-con un máximo predeterminado de 100 anuncios cada 6 horas. El bot solo añade
-anuncios cuyo título coincide con los términos de la tarea, evita duplicados y
-conserva la hora de captura separada de la fecha real de publicación.
+Luxury Hunter usa [Product Search V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-search-v1)
+y [Product Details V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-details-v1)
+de Just One API para buscar anuncios y consultar sus fichas. La búsqueda envía
+`keyword`, `page` y `sort`; la ficha envía `itemId`. Ambas usan un token privado.
 
-El feed no admite búsquedas anónimas por palabras clave: es una fuente
-complementaria, no sustituye la búsqueda específica de Xianyu ni garantiza ver
-todos los anuncios. Si Goofish presenta un desafío de seguridad, Luxury Hunter
-pausa Xianyu y no usa Apify para continuar alrededor de ese desafío.
+En GitHub, crea el secreto de Actions `JUSTONEAPI_TOKEN` con el token de tu cuenta.
+El workflow selecciona Just One API por defecto y no inicia las sesiones de
+navegador de Xianyu. Si ya existe una variable `XIANYU_PROVIDER`, ponla en
+`justoneapi`. Para usar el flujo local con sesión, establece `XIANYU_PROVIDER=direct`.
 
-Para activarlo en GitHub, añade `APIFY_API_TOKEN` en **Settings → Secrets and
-variables → Actions → Secrets** y crea la variable `APIFY_XIANYU_FEED_ENABLED`
-con valor `1`. El feed queda desactivado si falta cualquiera de esos dos datos.
-Puedes ajustar estas variables de Actions:
+En una instalación local, añade a `.env`:
 
-- `APIFY_XIANYU_FEED_ENABLED`: `1` o `0`.
-- `APIFY_XIANYU_FEED_MAX_ITEMS`: 100 por defecto, con máximo de 1.000.
-- `APIFY_XIANYU_FEED_INTERVAL_MIN`: 360 minutos por defecto.
-- `APIFY_XIANYU_FEED_MAX_CHARGE_USD`: tope por ejecución, 0,25 USD por defecto.
+```dotenv
+XIANYU_PROVIDER=justoneapi
+JUSTONEAPI_TOKEN=tu_token
+```
 
-El actor publica un precio de 0,002 USD por anuncio y 0,00005 USD por inicio de
-ejecución; con 100 anuncios cada 6 horas, el coste orientativo máximo es de unos
-0,80 USD al día si cada lote devuelve el máximo. La cuenta y el saldo de Apify
-son necesarios; el token se envía en el encabezado de autorización y nunca se
-guarda en la base de datos.
+Por defecto, Luxury Hunter hace como máximo una búsqueda de Xianyu cada seis
+horas y abre hasta cuatro fichas por hora. Ajusta `XIANYU_MIN_INTERVAL_MIN`,
+`XIANYU_MAX_QUERIES`, `XIANYU_DETAIL_PER_HOUR` y `XIANYU_JUSTONE_SORT` según tu
+plan. Just One API es un proveedor externo: consulta sus cuotas y cargos antes
+de activarlo. Los errores se registran sin detener las demás fuentes.
 
 ## v1.7 — Más mercados y costes por origen
 

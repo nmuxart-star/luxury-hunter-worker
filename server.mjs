@@ -9,7 +9,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
-import {apifyXianyuFeedConfig,fetchApifyXianyuFeed,selectRelevantApifyXianyuItems} from './scripts/apify-xianyu-feed.mjs';
+import {getJustOneXianyuDetail,searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
@@ -2111,6 +2111,9 @@ function xianyuDirectMode(){
   // Goofish es pública); XIANYU_MODE=connector vuelve al conector Docker.
   return String(process.env.XIANYU_MODE||'direct').toLowerCase()!=='connector';
 }
+function xianyuProvider(){
+  return String(process.env.XIANYU_PROVIDER||'justoneapi').trim().toLowerCase()==='direct'?'direct':'justoneapi';
+}
 
 async function getXianyuDirect(file=xianyuActiveAccount){
   const mtime=file?fs.statSync(file).mtimeMs:null;
@@ -2304,78 +2307,61 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   const raw={
     ...(detail||{}),
     '商品信息':currentInfo,
-    publishedAt:it.apifyFeed?(prevRaw.publishedAt||null):(it.publishedAt||null),
+    publishedAt:it.publishedAt||null,
     searchOnly:!detail,
-    ...(it.apifyFeed?{
-      apifyFeed:true,
-      apifyFeedCapturedAt:it.scrapedAt||null,
-      apifyFeedRecord:it.rawRecord||null
-    }:{})
+    ...(it.provider?{dataProvider:it.provider}:prevRaw.dataProvider?{dataProvider:prevRaw.dataProvider}:{})
   };
   upsertListing({
-    source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:detail?prev.description:'',
+    source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:detail?prev.description:(it.description||''),
     original_price:it.price,currency:'CNY',price_eur:pe,seller_name:it.seller||prev?.seller_name||'',
     image_url:it.image||oldInfo['商品主图链接']||'',
-    seller_sales:detail?prev.seller_sales:null,seller_items:detail?prev.seller_items:null,
+    seller_sales:detail?prev.seller_sales:(Number(it.sellerSales)||null),seller_items:detail?prev.seller_items:(Number(it.sellerItems)||null),
     status:'',purchase_via:'China agent',raw
   },sessionId,sourceQuery);
   return {kept:true};
 }
 
-async function appendApifyXianyuFeed({queries,product,maxItems=30,minEur=null,maxEur=null,sessionId}={}){
-  const config=apifyXianyuFeedConfig();
-  if(!config.enabled)return {state:'disabled',found:0,matched:0,kept:0};
-  if(!config.configured)return {state:'missing_token',found:0,matched:0,kept:0};
-
-  const cache=getSetting('apify_xianyu_feed_cache',null);
-  const cacheItems=Array.isArray(cache?.items)?cache.items:[];
-  const ageMs=Date.now()-Date.parse(cache?.fetchedAt||'');
-  const hasCache=Array.isArray(cache?.items);
-  const cacheFresh=Array.isArray(cache?.items)&&Number.isFinite(ageMs)&&ageMs<config.intervalMin*60e3;
-  let records=cacheItems;
-  let state='cached';
-  let warning=null;
-  if(!cacheFresh){
+async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
+  const token=String(process.env.JUSTONEAPI_TOKEN||'').trim();
+  if(!token){
+    const warning='Just One API está seleccionado, pero falta configurar el secreto JUSTONEAPI_TOKEN.';
+    await reportHealthIssue('xianyu-search',warning+' Las demás plataformas continúan funcionando.').catch(()=>{});
+    return {ok:false,state:'unconfigured',warning,perQuery:[],kept:0};
+  }
+  const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
+  if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+    return {ok:true,state:'throttled',mode:'justoneapi',perQuery:[],kept:0};
+  }
+  const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
+  const selected=(queries||[]).map(q=>String(q||'').trim()).filter(Boolean).slice(0,maxQueries);
+  const perQuery=[];
+  let kept=0,attempted=false;
+  const min=Number.isFinite(Number(minEur))&&Number(minEur)>0?Number(minEur):null;
+  const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
+  for(const keyword of selected){
+    attempted=true;
     try{
-      records=await fetchApifyXianyuFeed({
-        token:config.token,
-        maxItems:config.maxItems,
-        maxTotalChargeUsd:config.maxTotalChargeUsd
-      });
-      const fetchedAt=new Date().toISOString();
-      db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('apify_xianyu_feed_cache',?,?)
-        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
-        .run(JSON.stringify({fetchedAt,items:records}),fetchedAt);
-      state='fetched';
-    }catch(e){
-      warning=e?.message||String(e);
-      if(hasCache){records=cacheItems;state='stale';}
-      else return {state:'error',found:0,matched:0,kept:0,error:warning};
+      const result=await searchJustOneXianyu({keyword,page:1,sort:String(process.env.XIANYU_JUSTONE_SORT||'active')});
+      const rejected={missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
+      let localKept=0;
+      for(const it of result.items.slice(0,Math.max(1,Number(maxItems)))){
+        const saved=saveXianyuCandidate({...it,provider:'justoneapi'},{sessionId,sourceQuery:keyword,minEur:min,maxEur:max});
+        if(saved.kept){localKept++;kept++;}
+        else if(rejected[saved.reason]!==undefined)rejected[saved.reason]++;
+      }
+      perQuery.push({query:keyword,provider:'Just One API',requestId:result.requestId,found:result.items.length,kept:localKept,rejected});
+      await sleep(1200);
+    }catch(error){
+      const message=String(error?.message||'Error de proveedor').slice(0,240);
+      perQuery.push({query:keyword,provider:'Just One API',errorCode:error?.code??null,error:message});
+      await reportHealthIssue('xianyu-search',`Just One API no pudo completar la búsqueda de Xianyu: ${message}. Las demás plataformas continúan funcionando.`).catch(()=>{});
+      break;
     }
   }
-
-  const selected=selectRelevantApifyXianyuItems(records,{
-    queries,product,maxItems:Math.max(1,Number(maxItems)||30)
-  });
-  const rejected={belowMin:0,aboveMax:0,invalidPrice:0,missingCoreFields:0};
-  let kept=0;
-  for(const it of selected){
-    const result=saveXianyuCandidate(it,{
-      sessionId,
-      sourceQuery:queries?.find(q=>String(q||'').trim())||product||'Apify public feed',
-      minEur,maxEur
-    });
-    if(result.kept)kept++;
-    else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
-  }
-  return {
-    state,
-    found:records.length,
-    matched:selected.length,
-    kept,
-    ...(warning?{warning}:{}),
-    ...(Object.values(rejected).some(Boolean)?{rejected}:{})
-  };
+  if(attempted)xianyuMarkSearch();
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-justoneapi',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
+  if(perQuery.length&&perQuery.every(query=>!query.error))clearHealthIssue('xianyu-search');
+  return {ok:!perQuery.some(query=>query.error),mode:'justoneapi',perQuery,kept};
 }
 
 async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto'}){
@@ -2392,8 +2378,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
   }
   if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
-    const apifyFeed=await appendApifyXianyuFeed({queries,product,maxItems,minEur,maxEur,sessionId});
-    return {ok:true,state:'throttled',perQuery:[],kept:apifyFeed.kept||0,apifyFeed};
+    return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
   const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
   const perQuery=[];
@@ -2472,20 +2457,12 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     await sleep(2500+Math.random()*2500);
   }
-  // La fuente de Apify solo complementa una búsqueda normal o limitada por
-  // frecuencia. Si Goofish pide login, no responde o muestra una verificación,
-  // Xianyu se pausa y no se usa Apify para continuar alrededor del bloqueo.
-  let apifyFeed=null;
-  if(!xianyuPausedReason){
-    apifyFeed=await appendApifyXianyuFeed({queries,product,maxItems,minEur,maxEur,sessionId});
-    kept+=apifyFeed.kept||0;
-  }
   if(perQuery.length)xianyuMarkSearch();
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}${apifyFeed?.kept?`; Apify public-feed kept ${apifyFeed.kept}`:''}`,new Date().toISOString());
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
   if(xianyuPausedReason&&!kept)return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery,kept};
   clearHealthIssue('xianyu-risk');
   clearHealthIssue('xianyu-search');
-  return {ok:true,mode:'direct',perQuery,kept,...(apifyFeed?{apifyFeed}:{})};
+  return {ok:true,mode:'direct',perQuery,kept};
 }
 
 // ── XIANYU DETAIL V1 ────────────────────────────────────────────────────
@@ -2498,8 +2475,8 @@ let xianyuDetailPausedAt=0;
 let xianyuDetailPauseLen=XIANYU_PAUSE_MS;
 
 function xianyuDetailBudgetLeft(){
-  if(xianyuPausedReason)return 0;
-  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR||4,4,0,20);
+  if(xianyuPausedReason&&xianyuProvider()==='direct')return 0;
+  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR??4,4,0,20);
   const now=Date.now();
   while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
   if(now-xianyuDetailPausedAt<xianyuDetailPauseLen)return 0;
@@ -2522,23 +2499,32 @@ async function fetchXianyuDetailOnce(sourceId){
   }
 }
 
+async function fetchJustOneXianyuDetailOnce(sourceId){
+  const result=await getJustOneXianyuDetail({itemId:sourceId});
+  return result.item?{ok:true,item:result.item}:{missing:true};
+}
+
 async function enrichXianyuDetails(items){
-  if(!xianyuDirectMode())return {fetched:0};
+  if(!xianyuDirectMode()&&xianyuProvider()!=='justoneapi')return {fetched:0};
   let fetched=0,skipped=0;
   for(const item of items||[]){
     if(item.source!=='xianyu')continue;
     let raw={};
     try{raw=JSON.parse(item.raw_json||'{}');}catch{}
     if(raw.detailFetched)continue;
-    // El actor devuelve anuncios del feed público sin enriquecer. No se abren
-    // sus fichas desde aquí, para conservar la separación con la sesión de Xianyu.
-    if(raw.apifyFeed){skipped++;continue;}
     if(xianyuDetailBudgetLeft()<=0){skipped++;continue;}
     xianyuDetailLog.push(Date.now());
     // Misma cola que las búsquedas: nunca dos páginas de Xianyu a la vez.
-    const run=xianyuQueue.then(()=>fetchXianyuDetailOnce(item.source_id));
+    const useJustOneApi=xianyuProvider()==='justoneapi';
+    const run=xianyuQueue.then(()=>useJustOneApi?fetchJustOneXianyuDetailOnce(item.source_id):fetchXianyuDetailOnce(item.source_id));
     xianyuQueue=run.catch(()=>{});
     const res=await run.catch(e=>({error:e.message}));
+    if(res?.error){
+      const message=String(res.error).slice(0,240);
+      console.error(`Xianyu detail ${useJustOneApi?'Just One API':'direct'}: ${message}`);
+      if(useJustOneApi)await reportHealthIssue('xianyu-detail',`Just One API no pudo cargar una ficha de Xianyu: ${message}.`).catch(()=>{});
+      continue;
+    }
     if(res?.risk){
       xianyuDetailPausedAt=Date.now();
       xianyuDetailPauseLen=XIANYU_RISK_PAUSE_MS;
@@ -2546,10 +2532,28 @@ async function enrichXianyuDetails(items){
       break;
     }
     if(!res?.ok)continue;
-    const ido=res.item, sdo=res.seller;
-    const images=(ido.imageInfos||[]).map(i=>String(i?.url||'').replace(/^\/\//,'https://')).filter(Boolean);
-    const info={...(raw['商品信息']||{}),'商品图片列表':images,'“想要”人数':ido.wantCnt??raw?.['商品信息']?.['“想要”人数'],'浏览量':ido.browseCnt??null};
-    const sellerInfo={
+    const ido=res.item, sdo=res.seller||{};
+    let images=useJustOneApi
+      ?(ido.images||[]).map(image=>String(image||'').replace(/^\/\//,'https://')).filter(Boolean)
+      :(ido.imageInfos||[]).map(i=>String(i?.url||'').replace(/^\/\//,'https://')).filter(Boolean);
+    if(!images.length){
+      const oldImage=String(raw?.['商品信息']?.['商品主图链接']||item.image_url||'').trim();
+      if(oldImage)images=[oldImage];
+    }
+    const info={
+      ...(raw['商品信息']||{}),
+      ...(useJustOneApi&&ido.description?{'商品描述':ido.description}:{}),
+      '商品图片列表':images,
+      '“想要”人数':(useJustOneApi?ido.wants:ido.wantCnt)??raw?.['商品信息']?.['“想要”人数'],
+      '浏览量':useJustOneApi?ido.browseCount??null:ido.browseCnt??null
+    };
+    const sellerInfo=useJustOneApi?{
+      '卖家注册天数':ido.sellerRegDays??null,
+      '芝麻信用':ido.sellerCredit??null,
+      '卖家已售':ido.sellerSales??null,
+      '卖家在售':ido.sellerItems??null,
+      '好评率':ido.sellerReviews??null
+    }:{
       '卖家注册天数':sdo.userRegDay??null,
       '芝麻信用':sdo?.zhimaLevelInfo?.levelName||null,
       '卖家已售':sdo.hasSoldNumInteger??null,
@@ -2557,13 +2561,16 @@ async function enrichXianyuDetails(items){
       '好评率':sdo.newGoodRatioRate??null
     };
     const newRaw={...raw,'商品信息':info,'卖家信息':sellerInfo,detailFetched:new Date().toISOString(),searchOnly:false};
-    const desc=String(ido.desc||'').trim();
+    const desc=String((useJustOneApi?ido.description:ido.desc)||'').trim();
+    const sellerSales=useJustOneApi?Number(ido.sellerSales):Number(sdo.hasSoldNumInteger);
+    const sellerItems=useJustOneApi?Number(ido.sellerItems):Number(sdo.itemCount);
     db.prepare('UPDATE listings SET description=?,raw_json=?,image_url=COALESCE(NULLIF(?,\'\'),image_url),seller_sales=?,seller_items=? WHERE id=?')
-      .run(desc,JSON.stringify(newRaw),images[0]||'',Number(sdo.hasSoldNumInteger)||null,Number(sdo.itemCount)||null,Number(item.id));
-    item.description=desc;
+      .run(desc||item.description||'',JSON.stringify(newRaw),images[0]||'',sellerSales||null,sellerItems||null,Number(item.id));
+    item.description=desc||item.description||'';
     item.raw_json=JSON.stringify(newRaw);
     if(images[0])item.image_url=images[0];
     fetched++;
+    if(useJustOneApi)clearHealthIssue('xianyu-detail');
     await sleep(3000+Math.random()*3000);
   }
   if(fetched||skipped)console.log(`Xianyu detail: ${fetched} fichas abiertas${skipped?`, ${skipped} sin abrir por límite horario`:''}.`);
@@ -2575,6 +2582,11 @@ function searchXianyuLive(opts){
   // Una búsqueda de Xianyu a la vez (misma sesión, ritmo humano).
   // Si la sesión no es válida ya se avisa una vez (xianyu-login); no repetir
   // un error por cada tarea.
+  if(xianyuProvider()==='justoneapi'){
+    const run=xianyuQueue.then(()=>searchXianyuJustOneApi(opts));
+    xianyuQueue=run.catch(()=>{});
+    return run;
+  }
   const ss=String(process.env.XIANYU_SESSION_STATUS||'').trim();
   if(xianyuDirectMode()&&['risk_control','error'].includes(ss)){
     const warning=ss==='risk_control'
@@ -11046,11 +11058,10 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
 }
 
 function statusPayload() {
-  const apifyConfig=apifyXianyuFeedConfig();
   return {
     app:'Luxury Hunter v1.7.1', port:PORT, xianyuBaseUrl:XIANYU_BASE_URL,
+    xianyuProvider:xianyuProvider(),justOneApiConfigured:!!String(process.env.JUSTONEAPI_TOKEN||'').trim(),
     bunjangCliExists:fs.existsSync(bunjangCli), geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
-    apifyXianyuFeed:{enabled:apifyConfig.enabled&&apifyConfig.configured,configured:apifyConfig.configured,maxItems:apifyConfig.maxItems,intervalMin:apifyConfig.intervalMin},
     listingCount:db.prepare('SELECT COUNT(*) n FROM listings').get().n,
     taskCount:db.prepare('SELECT COUNT(*) n FROM tasks').get().n,
     runningTasks:[...runningTaskIds],
