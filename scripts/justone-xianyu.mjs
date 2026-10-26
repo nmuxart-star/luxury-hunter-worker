@@ -1,3 +1,5 @@
+import { extractXianyuTags, hasXianyuVerificationTag } from './xianyu-verification.mjs';
+
 const BASE_URL = 'https://api.justoneapi.com';
 const SEARCH_PATH = '/api/xianyu/search-item-list/v1';
 const DETAIL_PATH = '/api/xianyu/get-item-detail/v1';
@@ -74,7 +76,12 @@ function scalar(value, keys = ['value', 'amount', 'text', 'name', 'url', 'src'])
 }
 
 function parsePrice(value) {
-  const raw = scalar(value, ['value', 'amount', 'price', 'text', 'currentPrice']);
+  // La respuesta real de Xianyu separa el precio en fragmentos, por ejemplo
+  // [{text:'¥'},{text:'39,800'}]. Leer solo el primero descartaría la ficha
+  // que contiene las etiquetas oficiales del anuncio.
+  const raw = Array.isArray(value)
+    ? value.map(part => scalar(part, ['text', 'value', 'amount', 'price', 'currentPrice']) ?? '').join('')
+    : scalar(value, ['value', 'amount', 'price', 'text', 'currentPrice']);
   if (raw === null || raw === undefined) return null;
   const text = String(raw).trim().replaceAll(',', '');
   const number = Number(text.replace(/[^\d.\-]/g, ''));
@@ -111,7 +118,9 @@ function imageList(object) {
 }
 
 function normalizeCandidate(object) {
-  const id = scalar(deepValue(object, FIELD_KEYS.id));
+  // Solo una ficha con ID propio: un contenedor de resultados puede tener
+  // etiquetas de otros anuncios y no sirve como evidencia de verificación.
+  const id = scalar(firstOwn(object, FIELD_KEYS.id));
   const title = scalar(deepValue(object, FIELD_KEYS.title));
   const price = parsePrice(deepValue(object, FIELD_KEYS.price));
   if (id === null || !title || !Number.isFinite(price) || price <= 0) return null;
@@ -138,7 +147,8 @@ function normalizeCandidate(object) {
     sellerItems: scalar(deepValue(object, FIELD_KEYS.sellerItems)),
     sellerReviews: scalar(deepValue(object, FIELD_KEYS.sellerReviews)),
     sellerCredit: scalar(deepValue(object, FIELD_KEYS.sellerCredit)),
-    sellerRegDays: scalar(deepValue(object, FIELD_KEYS.sellerRegDays))
+    sellerRegDays: scalar(deepValue(object, FIELD_KEYS.sellerRegDays)),
+    tags: extractXianyuTags(object)
   };
 }
 
@@ -161,6 +171,10 @@ export function normalizeJustOneXianyuItems(payload) {
     if (!old) byId.set(item.id, item);
     else {
       for (const [key, value] of Object.entries(item)) {
+        if (key === 'tags') {
+          old.tags = [...new Set([...old.tags, ...value])];
+          continue;
+        }
         if ((old[key] === '' || old[key] === null || old[key] === undefined || (Array.isArray(old[key]) && !old[key].length)) && value !== null && value !== '') old[key] = value;
       }
     }
@@ -212,7 +226,9 @@ async function callJustOne(path, params, { env = process.env, fetchImpl = global
 export async function searchJustOneXianyu({ keyword, page = 1, sort = 'active', ...options }) {
   if (!String(keyword || '').trim()) throw new JustOneApiError('La búsqueda de Just One API necesita una palabra clave.');
   const payload = await callJustOne(SEARCH_PATH, { keyword: String(keyword).trim(), page, sort }, options);
-  return { items: normalizeJustOneXianyuItems(payload), requestId: payload?.requestId || null };
+  const all = normalizeJustOneXianyuItems(payload);
+  const items = all.filter(item => hasXianyuVerificationTag(item.tags));
+  return { items, totalFound: all.length, missingVerificationTag: all.length - items.length, requestId: payload?.requestId || null };
 }
 
 export async function getJustOneXianyuDetail({ itemId, ...options }) {

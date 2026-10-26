@@ -917,21 +917,32 @@ function parseVerification(i){try{return JSON.parse(i.verification_json||'{}')}c
 function verificationBadge(i){const v=parseVerification(i);if(v.status==='verified')return'<span class="pill purple">Market check</span>';if(v.status==='error'||v.status==='legacy_pending')return'<span class="pill yellow">Verification pending</span>';return''}
 
 function marketplaceVerificationFromItem(i){const v=parseVerification(i);return v?.marketplace_verification||{}}
+function xianyuHasVerificationTag(i){
+  if(String(i?.source||'').toLowerCase()!=='xianyu')return false;
+  try{
+    const tags=JSON.parse(i?.raw_json||'{}')?.['商品信息']?.['商品标签'];
+    return (Array.isArray(tags)?tags:[tags]).some(tag=>String(tag||'').trim()==='验货宝');
+  }catch{return false;}
+}
 function marketplaceVerificationBadge(i){
   const m=marketplaceVerificationFromItem(i),s=String(m.status||'').toUpperCase();
   const source=String(i?.source||'').toLowerCase();
+  const badgeName=xianyuHasVerificationTag(i)?'验货宝':'Control autenticidad';
 
   if(s==='PASSED')
-    return `<span class="pill green">Control autenticidad: SUPERADO</span>`;
+    return `<span class="pill green">${badgeName}: SUPERADO</span>`;
 
   if(s==='AVAILABLE')
-    return `<span class="pill blue">Control autenticidad: DISPONIBLE</span>`;
+    return `<span class="pill blue">${badgeName}: DISPONIBLE</span>`;
 
   if(s==='FAILED')
-    return `<span class="pill red">Control autenticidad: FALLIDO</span>`;
+    return `<span class="pill red">${badgeName}: FALLIDO</span>`;
 
   if(s==='UNAVAILABLE')
-    return `<span class="pill">Control autenticidad: NO DISPONIBLE</span>`;
+    return `<span class="pill">${badgeName}: NO DISPONIBLE</span>`;
+
+  if(xianyuHasVerificationTag(i))
+    return '<span class="pill blue">验货宝: ETIQUETA PRESENTE</span>';
 
   if(source==='xianyu'||source==='bunjang'){
     return `<span class="pill">Control autenticidad: NO DETECTADO</span>`;
@@ -960,6 +971,10 @@ function marketplaceVerificationHtml(i){
   }else if(s==='UNAVAILABLE'){
     title=`${m.service||'Control de autenticidad'} - NO DISPONIBLE`;
     expl='El anuncio indica explicitamente que no puede utilizar este servicio. Esto es neutral: no implica que el articulo sea falso.';
+  }else if(xianyuHasVerificationTag(i)){
+    title='验货宝 - ETIQUETA PRESENTE';
+    expl='La etiqueta de 验货宝 figura en este anuncio. Indica que el servicio está disponible; no confirma que el artículo haya superado la verificación.';
+    state='AVAILABLE';
   }else if(source==='xianyu'||source==='bunjang'){
     const service=source==='xianyu'?'Xianyu Verification':'Bunjang Care';
     title=`${service} - NO DETECTADO`;
