@@ -92,6 +92,11 @@ Luxury Hunter usa [Product Search V1](https://docs.justoneapi.com/en/api/xianyu-
 y [Product Details V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-details-v1)
 de Just One API para buscar anuncios y consultar sus fichas. La búsqueda envía
 `keyword`, `page` y `sort`; la ficha envía `itemId`. Ambas usan un token privado.
+La API no documenta un filtro de servidor para `验货宝`: Luxury Hunter comprueba
+la etiqueta dentro de cada anuncio devuelto y solo guarda o muestra anuncios
+de Xianyu que la llevan. Tampoco muestra anuncios antiguos sin esa etiqueta
+en resultados, informes ni alertas. El texto libre del vendedor no cuenta
+como prueba de la etiqueta.
 
 En GitHub, crea el secreto de Actions `JUSTONEAPI_TOKEN` con el token de tu cuenta.
 El workflow selecciona Just One API por defecto y no inicia las sesiones de

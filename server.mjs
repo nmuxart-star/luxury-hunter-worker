@@ -10,6 +10,7 @@ import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {getJustOneXianyuDetail,searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
+import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
@@ -2218,11 +2219,8 @@ function parseXianyuSearchJson(json){
     const id=String(ex.itemId||click.item_id||click.id||'').trim();
     const link=String(main.targetUrl||'').replace('fleamarket://','https://www.goofish.com/');
     const pub=Number(click.publishTime);
-    const tags=[];
-    if(click.tag==='freeship')tags.push('包邮');
-    for(const t of ex?.fishTags?.r1?.tagList||[]){
-      if(String(t?.data?.content||'').includes('验货宝'))tags.push('验货宝');
-    }
+    const tags=extractXianyuTags(ex);
+    if(click.tag==='freeship'&&!tags.includes('包邮'))tags.push('包邮');
     out.push({
       tags,
       // Mismo formato que el conector: hora de China "YYYY-MM-DD HH:mm".
@@ -2324,6 +2322,7 @@ function xianyuMarkSearch(){
 
 function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   if(!it?.id||!it?.title)return {kept:false,reason:'missingCoreFields'};
+  if(!hasXianyuVerificationTag(it.tags))return {kept:false,reason:'noVerificationTag'};
   if(!Number.isFinite(Number(it.price))||Number(it.price)<=0)return {kept:false,reason:'invalidPrice'};
   const pe=toEur(it.price,'CNY');
   const lo=minEur===null||minEur===undefined||minEur===''?NaN:Number(minEur);
@@ -2387,14 +2386,14 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
     attempted=true;
     try{
       const result=await searchJustOneXianyu({keyword,page:1,sort:String(process.env.XIANYU_JUSTONE_SORT||'active')});
-      const rejected={missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
+      const rejected={noVerificationTag:result.missingVerificationTag,missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
       let localKept=0;
       for(const it of result.items.slice(0,Math.max(1,Number(maxItems)))){
         const saved=saveXianyuCandidate({...it,provider:'justoneapi'},{sessionId,sourceQuery:keyword,minEur:min,maxEur:max});
         if(saved.kept){localKept++;kept++;}
         else if(rejected[saved.reason]!==undefined)rejected[saved.reason]++;
       }
-      perQuery.push({query:keyword,provider:'Just One API',requestId:result.requestId,found:result.items.length,kept:localKept,rejected});
+      perQuery.push({query:keyword,provider:'Just One API',requestId:result.requestId,found:result.totalFound,kept:localKept,rejected});
       await sleep(1200);
     }catch(error){
       const message=String(error?.message||'Error de proveedor').slice(0,240);
@@ -7434,7 +7433,7 @@ function sessionListings(sessionId) {
       LEFT JOIN task_analyses a ON a.listing_id=l.id AND a.task_id=?
       WHERE ssi.session_id=?
       ORDER BY CASE a.decision WHEN 'STRONG BUY' THEN 1 WHEN 'BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'REVIEW' THEN 4 WHEN 'REJECT' THEN 6 ELSE 5 END,
-        COALESCE(a.opportunity_score,-1) DESC, l.price_eur ASC, l.last_seen DESC`).all(session.task_id,sessionId));
+        COALESCE(a.opportunity_score,-1) DESC, l.price_eur ASC, l.last_seen DESC`).all(session.task_id,sessionId).filter(xianyuListingHasVerificationTag));
   }
   return enrichCosts(db.prepare(`SELECT l.*, ssi.source_query, a.brand, a.model, a.authenticity_risk, a.liquidity, a.decision, a.opportunity_score,
     a.resale_low_eur,a.resale_high_eur,a.landed_cost_eur,a.net_profit_low_eur,a.net_profit_high_eur,a.notes,a.decision_reasons_es_json,a.preliminary_decision,a.verification_json
@@ -7443,7 +7442,7 @@ function sessionListings(sessionId) {
     LEFT JOIN analyses a ON a.listing_id=l.id
     WHERE ssi.session_id=?
     ORDER BY CASE a.decision WHEN 'STRONG BUY' THEN 1 WHEN 'BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'REVIEW' THEN 4 WHEN 'REJECT' THEN 6 ELSE 5 END,
-      COALESCE(a.opportunity_score,-1) DESC, l.price_eur ASC, l.last_seen DESC`).all(sessionId));
+      COALESCE(a.opportunity_score,-1) DESC, l.price_eur ASC, l.last_seen DESC`).all(sessionId).filter(xianyuListingHasVerificationTag));
 }
 
 function safeTaskSnapshot(task) {
@@ -7625,7 +7624,7 @@ function taskResults(taskId) {
     WHERE ss.task_id=?
     GROUP BY l.id
     ORDER BY CASE a.decision WHEN 'STRONG BUY' THEN 1 WHEN 'BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'REVIEW' THEN 4 WHEN 'REJECT' THEN 6 ELSE 5 END,
-      COALESCE(a.opportunity_score,-1) DESC, task_last_seen DESC`).all(Number(taskId),Number(taskId)));
+      COALESCE(a.opportunity_score,-1) DESC, task_last_seen DESC`).all(Number(taskId),Number(taskId)).filter(xianyuListingHasVerificationTag));
 }
 function createTaskRecord(body) {
   const t=validateTaskInput(body);
@@ -8152,12 +8151,11 @@ function xianyuVerificationVeto(item){
     };
   }
   if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
-  const v=detectMarketplaceVerification(item);
-  if(['AVAILABLE','PASSED'].includes(v.status))return null;
+  if(xianyuListingHasVerificationTag(item))return null;
   return {
     code:'no_xianyu_verification',
-    term:v.status,
-    reasons:['El anuncio de Xianyu no permite la verificación de autenticidad de la plataforma (验货宝). Descartado por política.']
+    term:'etiqueta ausente',
+    reasons:['El anuncio de Xianyu no muestra la etiqueta oficial 验货宝. Descartado por política.']
   };
 }
 // Bunjang (regla de Nil): solo anuncios con 번개케어 o de vendedores con buena
@@ -11569,7 +11567,7 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='GET'&&u.pathname==='/api/results'){
       const taskId=u.searchParams.get('taskId');
       if(taskId)return json(res,200,{items:taskResults(Number(taskId))});
-      const items=enrichCosts(db.prepare(`SELECT l.*,a.brand,a.model,a.authenticity_risk,a.liquidity,a.decision,a.opportunity_score,a.resale_low_eur,a.resale_high_eur,a.landed_cost_eur,a.net_profit_low_eur,a.net_profit_high_eur,a.notes,a.decision_reasons_es_json,a.preliminary_decision,a.verification_json FROM listings l LEFT JOIN analyses a ON a.listing_id=l.id ORDER BY l.last_seen DESC LIMIT 300`).all());
+      const items=enrichCosts(db.prepare(`SELECT l.*,a.brand,a.model,a.authenticity_risk,a.liquidity,a.decision,a.opportunity_score,a.resale_low_eur,a.resale_high_eur,a.landed_cost_eur,a.net_profit_low_eur,a.net_profit_high_eur,a.notes,a.decision_reasons_es_json,a.preliminary_decision,a.verification_json FROM listings l LEFT JOIN analyses a ON a.listing_id=l.id ORDER BY l.last_seen DESC LIMIT 300`).all().filter(xianyuListingHasVerificationTag));
       return json(res,200,{items});
     }
     const am=u.pathname.match(/^\/api\/listings\/(\d+)\/analyze$/);

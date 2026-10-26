@@ -6,13 +6,18 @@ import {
   JustOneApiError,
   searchJustOneXianyu
 } from '../scripts/justone-xianyu.mjs';
+import {
+  extractXianyuTags,
+  hasXianyuVerificationTag,
+  xianyuListingHasVerificationTag
+} from '../scripts/xianyu-verification.mjs';
 
 const env={JUSTONEAPI_TOKEN:'test-key'};
 
 test('normalizes nested listing data and deduplicates repeated item IDs',()=>{
   const items=normalizeJustOneXianyuItems({code:0,data:{items:[
     {itemId:'123',title:'Bolso preloved',price:'¥1,200',seller:{nickName:'Seller'},images:[{url:'//img.example/a.jpg'}],publishTime:1700000000},
-    {item:{itemId:'123',title:'Bolso preloved',price:1200},seller:{nickName:'Seller'}}
+    {item:{itemId:'123',title:'Bolso preloved',price:1200,tags:['验货宝']},seller:{nickName:'Seller'}}
   ]}});
   assert.equal(items.length,1);
   assert.equal(items[0].id,'123');
@@ -21,13 +26,14 @@ test('normalizes nested listing data and deduplicates repeated item IDs',()=>{
   assert.equal(items[0].image,'https://img.example/a.jpg');
   assert.equal(items[0].url,'https://www.goofish.com/item?id=123');
   assert.equal(items[0].publishedAt,'2023-11-14T22:13:20.000Z');
+  assert.deepEqual(items[0].tags,['验货宝']);
 });
 
 test('search uses the documented Just One API host, route, and parameters',async()=>{
   let requested;
   const fetchImpl=async(url,options)=>{
     requested={url:new URL(url),options};
-    return new Response(JSON.stringify({code:0,requestId:'req-1',data:{items:[{itemId:'45',title:'Chaqueta vintage',price:'2.5万'}]}}),{status:200,headers:{'content-type':'application/json'}});
+    return new Response(JSON.stringify({code:0,requestId:'req-1',data:{items:[{itemId:'45',title:'Chaqueta vintage',price:'2.5万',fishTags:{r5:{tagList:[{data:{content:'验货宝'}}]}}}]}}),{status:200,headers:{'content-type':'application/json'}});
   };
   const result=await searchJustOneXianyu({keyword:'Chanel bag',page:2,env,fetchImpl});
   assert.equal(requested.url.origin,'https://api.justoneapi.com');
@@ -38,7 +44,37 @@ test('search uses the documented Just One API host, route, and parameters',async
   assert.equal(requested.url.searchParams.get('sort'),'active');
   assert.equal(requested.options.method,'GET');
   assert.equal(result.items[0].price,25000);
+  assert.deepEqual(result.items[0].tags,['验货宝']);
   assert.equal(result.requestId,'req-1');
+});
+
+test('search keeps only listings with their own 验货宝 badge, including the r5 tag group',async()=>{
+  const data={
+    code:0,
+    data:{
+      filterPanelDO:[{cardData:{value:[{valueName:'验货宝'}]}}],
+      resultList:[
+        {data:{item:{main:{exContent:{itemId:'verified',title:'Bolso verificado',price:[{text:'¥'},{text:'1,200'}],fishTags:{r5:{tagList:[{data:{content:'验货宝'}},{data:{content:'包邮'}}]}}}}}}},
+        {data:{item:{main:{exContent:{itemId:'unverified',title:'Bolso 验货宝 según vendedor',price:900,description:'支持验货宝',fishTags:{r5:{tagList:[{data:{content:'包邮'}}]}}}}}}}
+      ]
+    }
+  };
+  const fetchImpl=async()=>new Response(JSON.stringify(data),{status:200});
+  const result=await searchJustOneXianyu({keyword:'bolso',env,fetchImpl});
+  assert.deepEqual(result.items.map(item=>item.id),['verified']);
+  assert.equal(result.items[0].price,1200);
+  assert.deepEqual(result.items[0].tags,['验货宝','包邮']);
+  assert.equal(result.totalFound,2);
+  assert.equal(result.missingVerificationTag,1);
+});
+
+test('verification requires an exact listing tag, not a seller claim or a search filter option',()=>{
+  assert.deepEqual(extractXianyuTags({fishTags:{r2:{tagList:[{data:{content:'验货宝'}}]}}}),['验货宝']);
+  assert.equal(hasXianyuVerificationTag(['包邮','验货宝']),true);
+  assert.equal(hasXianyuVerificationTag(['不支持验货宝']),false);
+  assert.equal(xianyuListingHasVerificationTag({source:'xianyu',title:'支持验货宝',raw_json:'{}'}),false);
+  assert.equal(xianyuListingHasVerificationTag({source:'xianyu',raw_json:JSON.stringify({'商品信息':{'商品标签':['包邮','验货宝']}})}),true);
+  assert.equal(xianyuListingHasVerificationTag({source:'bunjang',raw_json:'{}'}),true);
 });
 
 test('detail lookup uses the documented v1 route and itemId parameter',async()=>{
