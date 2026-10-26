@@ -2491,7 +2491,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       perQuery.push({query:keyword,risk:true});
       break;
     }
-    const rejected={missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
+    const rejected={noVerificationTag:0,missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
     let localKept=0;
     for(const it of res.items.slice(0,Math.max(1,Number(maxItems)))){
       const result=saveXianyuCandidate(it,{sessionId,sourceQuery:keyword,minEur,maxEur});
