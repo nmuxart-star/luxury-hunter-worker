@@ -9405,7 +9405,7 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
     if(listingFeedback(x.id)==='not_interested')return false;
     return !already.get(Number(x.id));
   }).sort((a,b)=>Number(b.net_profit_low_eur)-Number(a.net_profit_low_eur));
-  const picksLimited=limitTaskAlerts(task,picks,{kinds:['instant','soft'],max:Number(process.env.SOFT_ALERT_TASK_DAILY_MAX||3),mustBeatWorst:true});
+  const picksLimited=limitTaskAlerts(task,picks,{kinds:['instant','soft'],max:Number(process.env.SOFT_ALERT_TASK_DAILY_MAX||3)});
   picks.splice(0,picks.length,...picksLimited);
   if(!picks.length)return {sent:0};
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'soft','telegram',?)`);
