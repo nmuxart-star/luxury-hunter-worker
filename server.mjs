@@ -831,6 +831,8 @@ const OPENAI_IMAGE_TYPES=new Set(['image/jpeg','image/png','image/webp','image/g
 // Verificación "ligera": los WATCH se verifican con el modelo barato y solo
 // los BUY / STRONG BUY (posible compra real) con el modelo potente.
 const verifyTierStore=new AsyncLocalStorage();
+// Análisis que Nil pide a mano por Telegram (enlace + precio negociado).
+const manualAiStore=new AsyncLocalStorage();
 
 function openaiPurposeConfig(purpose,requestedModel){
   const cheap=process.env.OPENAI_TRIAGE_MODEL||'gpt-6-luna';
@@ -968,6 +970,17 @@ function aiPaceShare(){
 function assertAiBudget(){
   const budget=aiDailyBudgetUsd();
   const spend=getAiSpend();
+  // Lo que Nil pide a mano no espera al reparto por horas ni al tope diario:
+  // cuenta en el gasto y solo se para con el tope mensual.
+  if(manualAiStore.getStore()){
+    if(spend.usd>=aiMonthlyAllowanceTodayUsd()){
+      const err=new Error('Presupuesto mensual de IA alcanzado.');
+      err.geminiCapacity=true;
+      err.aiBudget=true;
+      throw err;
+    }
+    return;
+  }
   const paced=budget*aiPaceShare();
   if(spend.usd<budget&&spend.usd>=paced){
     const err=new Error(`Ritmo de gasto de IA: ${spend.usd.toFixed(2)} $ usados de ${paced.toFixed(2)} $ disponibles a esta hora (${budget.toFixed(2)} $ en todo el día). Los anuncios pendientes se analizan más tarde.`);
@@ -988,6 +1001,7 @@ function assertAiBudget(){
 // tienen su propio tope diario para que nunca dejen sin presupuesto al
 // triaje y al análisis, que son los que encuentran oportunidades nuevas.
 function verifyBudgetLeftUsd(){
+  if(manualAiStore.getStore())return Infinity;
   let budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
   if(!Number.isFinite(budget)||budget<=0)return Infinity;
   // Con tope mensual, la verificación nunca pasa de la mitad del día.
@@ -7128,7 +7142,7 @@ function storeStandaloneAnalysis(item,a,now){
     ON CONFLICT(listing_id) DO UPDATE SET brand=excluded.brand,model=excluded.model,authenticity_risk=excluded.authenticity_risk,liquidity=excluded.liquidity,decision=excluded.decision,opportunity_score=excluded.opportunity_score,resale_low_eur=excluded.resale_low_eur,resale_high_eur=excluded.resale_high_eur,landed_cost_eur=excluded.landed_cost_eur,net_profit_low_eur=excluded.net_profit_low_eur,net_profit_high_eur=excluded.net_profit_high_eur,notes=excluded.notes,decision_reasons_es_json=excluded.decision_reasons_es_json,raw_json=excluded.raw_json,updated_at=excluded.updated_at,preliminary_decision=excluded.preliminary_decision,verification_json=excluded.verification_json`)
     .run(item.id,a.brand||'',a.model||'',a.authenticity_risk||'',a.liquidity||'',a.decision||'',numberOrNull(a.opportunity_score),numberOrNull(a.resale_low_eur),numberOrNull(a.resale_high_eur),numberOrNull(a.landed_cost_eur),numberOrNull(a.net_profit_low_eur),numberOrNull(a.net_profit_high_eur),a.notes||'',JSON.stringify(reasons),JSON.stringify(a),now,a.decision||'',JSON.stringify({status:'not_applicable',reason:'no_task_context'}));
 }
-async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProgress=null){
+async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProgress=null,opts={}){
   const reportProgress=(pct,stage,detail='')=>{
     try{
       if(typeof onProgress==='function'){
@@ -7146,13 +7160,20 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const key=aiApiKey();
   if(!key)throw new Error(`${aiProvider()==='openai'?'OPENAI_API_KEY':'GEMINI_API_KEY'} is empty in .env`);
   const model=aiModel();
-  const item=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
-  if(!item)throw new Error('Listing not found');
+  const row=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
+  if(!row)throw new Error('Listing not found');
+  // Análisis manual por Telegram: todo se calcula con el precio de compra
+  // que Nil ha negociado con el vendedor, no con el anunciado.
+  const negotiatedEur=Number(opts?.priceEur);
+  const negotiated=opts?.priceEur!=null&&Number.isFinite(negotiatedEur)&&negotiatedEur>0;
+  const item=negotiated
+    ?{...row,price_eur:negotiatedEur,original_price:eurTo(negotiatedEur,row.currency||'EUR')??row.original_price}
+    :row;
   const task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
   const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task,item)}`:'';
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
-  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
+  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}${negotiated?`\nPRICE NOTE: ITEM PRICE EUR is the purchase price the reseller has already negotiated with the seller (the listing shows ${row.price_eur} EUR). Use the negotiated price as the purchase price.`:''}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
   reportProgress(
     8,
     'Cargando imágenes',
@@ -8485,7 +8506,7 @@ async function telegramApi(method,body={},timeoutMs=20000){
   return data;
 }
 
-async function telegramSend(text,photoUrl=null,{buttons=null}={}){
+async function telegramSend(text,photoUrl=null,{buttons=null,previewUrl=null,noPreview=false}={}){
   if(!telegramConfigured())return {sent:false,reason:'telegram-not-configured'};
   const chat_id=process.env.TELEGRAM_CHAT_ID;
   const extra=buttons?{reply_markup:{inline_keyboard:buttons}}:{};
@@ -8497,7 +8518,11 @@ async function telegramSend(text,photoUrl=null,{buttons=null}={}){
       console.error('Telegram photo failed, sending text:',e.message);
     }
   }
-  await telegramApi('sendMessage',{chat_id,text:text.slice(0,4096),parse_mode:'HTML',disable_web_page_preview:false,...extra});
+  // La vista previa, del anuncio (no del primer enlace del texto, que puede ser de Vestiaire).
+  const preview=noPreview?{link_preview_options:{is_disabled:true}}
+    :previewUrl?{link_preview_options:{url:previewUrl}}
+    :{disable_web_page_preview:false};
+  await telegramApi('sendMessage',{chat_id,text:text.slice(0,4096),parse_mode:'HTML',...preview,...extra});
   return {sent:true};
 }
 
@@ -8588,13 +8613,18 @@ async function telegramSendListing(text,x){
   if(!telegramConfigured())return {sent:false};
   const images=listingTelegramImages(x,4);
   let album={sent:false};
-  if(images.length&&text.length<=1024){
-    album=await telegramSendAlbum(images,text).catch(()=>({sent:false}));
+  // Al pie de las fotos caben 1024 caracteres: si el aviso es más largo, las
+  // fotos van con el titular y el texto completo justo después.
+  const caption=text.length<=1024?text:text.split('\n').slice(0,2).join('\n');
+  if(images.length){
+    album=await telegramSendAlbum(images,caption).catch(()=>({sent:false}));
   }
-  if(album.sent){
+  if(album.sent&&caption!==text){
+    await telegramSend(text,null,{buttons:alertButtons(x.id),noPreview:true});
+  }else if(album.sent){
     await telegramApi('sendMessage',{chat_id:process.env.TELEGRAM_CHAT_ID,text:'¿Te interesa este anuncio?',reply_markup:{inline_keyboard:alertButtons(x.id)}});
   }else{
-    await telegramSend(text,null,{buttons:alertButtons(x.id)});
+    await telegramSend(text,null,{buttons:alertButtons(x.id),previewUrl:x.url||null});
   }
   return {sent:true};
 }
@@ -8680,36 +8710,242 @@ function fmtMoney(n,cur){
   const sym={CNY:'¥',JPY:'¥',KRW:'₩',EUR:'€',USD:'$'}[cur]||cur;
   return `${Math.round(Number(n)).toLocaleString('es-ES')} ${sym}`;
 }
-async function handleTelegramNegotiation(msg){
-  const chat_id=msg.chat.id;
-  const reply=(text)=>telegramApi('sendMessage',{chat_id,text,parse_mode:'HTML',reply_to_message_id:msg.message_id,disable_web_page_preview:true}).catch(e=>console.error('Telegram reply failed:',e.message));
-  const text=`${msg.text||''} ${msg.caption||''}`.trim();
-  if(/^\/(start|help|ayuda)/i.test(text)||(!msg.photo&&!msg.reply_to_message&&!parseNegotiatedPrice(text)&&!listingIdFromTelegramMessage(msg))){
-    return reply('Para recalcular un anuncio con el precio que has negociado:\n• Responde al aviso con el precio (p. ej. <b>3200¥</b> o <b>450€</b>), o\n• mándame la captura del anuncio o del chat con el vendedor, con el precio si no se ve.');
+// ── ANÁLISIS MANUAL POR TELEGRAM ─────────────────────────────────────────
+// Nil pega el enlace de un anuncio (o el texto de compartir de Xianyu) con el
+// precio de compra que ha pactado con el vendedor. Si el bot ya tiene una
+// reventa estimada de ese anuncio, solo recalcula; si no, lee el anuncio,
+// elige la tarea del modelo y hace el análisis completo con ese precio.
+const MANUAL_SOURCES_TEXT='Xianyu, Bunjang, Mercari, Rakuma, Yahoo! Auctions (o Buyee), Yahoo! Flea Market, 2nd STREET y KOMEHYO';
+
+function telegramMessageUrls(m){
+  if(!m)return [];
+  const text=`${m.text||''}\n${m.caption||''}`;
+  const fromEntities=[...(m.entities||[]),...(m.caption_entities||[])].map(e=>e.url).filter(Boolean);
+  const fromText=text.match(/https?:\/\/[^\s<>"'，。、）)】」]+/gi)||[];
+  return [...new Set([...fromEntities,...fromText].map(u=>String(u).replace(/[.,;:!?]+$/,'')))];
+}
+// El precio se busca sin enlaces ni el texto de compartir de Xianyu
+// (「…」, 【…】, códigos como CZ3457), para no confundirlo con otros números.
+function priceTextOnly(text){
+  return String(text||'')
+    .replace(/https?:\/\/\S+/gi,' ')
+    .replace(/[「【《][^」】》]*[」】》]/g,' ')
+    .replace(/\b[A-Z]{2,}\d{3,}\b/g,' ');
+}
+
+// Enlace → {source, sourceId}. Japón usa las mismas fichas que el radar.
+function manualListingRef(href){
+  let u;try{u=new URL(href);}catch{return null;}
+  // Enlaces del puente del bot (app=…&web=…): se mira el enlace web de dentro.
+  const inner=u.searchParams.get('web');
+  if(inner&&inner!==href)return manualListingRef(inner);
+  const host=u.hostname.toLowerCase().replace(/^www\./,'');
+  const xianyuId=u.href.match(/[?&](?:id|itemId)=(\d{6,})/i)?.[1]||null;
+  if(/(^|\.)goofish\.com$/.test(host)||host==='2.taobao.com'||(/(^|\.)taobao\.com$/.test(host)&&/idle|fleamarket|xianyu/i.test(u.href))){
+    return xianyuId?{source:'xianyu',sourceId:xianyuId}:null;
   }
-  let listingId=listingIdFromTelegramMessage(msg.reply_to_message)||listingIdFromTelegramMessage(msg);
-  let price=parseNegotiatedPrice(text);
-  const photo=(msg.photo||[]).slice(-1)[0];
-  if((!listingId||!price)&&photo){
-    try{
-      const ai=await identifyListingFromScreenshot(photo.file_id);
-      if(!listingId&&Number(ai.listing_id))listingId=Number(ai.listing_id);
-      if(!price&&Number(ai.agreed_price)>0)price={amount:Number(ai.agreed_price),currency:ai.currency||null};
-    }catch(e){
-      return reply(`No he podido leer la captura (${htmlEsc(e.message)}). Responde al aviso del anuncio con el precio, por ejemplo <b>3200¥</b>.`);
+  if(/(^|\.)tb\.cn$/.test(host))return {source:'xianyu',shortUrl:u.href};
+  if(/(^|\.)bunjang\.co\.kr$/.test(host)){
+    const id=u.pathname.match(/\/products\/(\d+)/)?.[1];
+    return id?{source:'bunjang',sourceId:id}:null;
+  }
+  // Yahoo! Auctions y Mercari por Buyee: se abre la misma ficha que lee el radar.
+  const auction=/(^|\.)auctions\.yahoo\.co\.jp$/.test(host)?u.pathname.match(/\/auction\/([a-z]?\d+)/i)?.[1]:null;
+  if(auction)u=new URL(`https://buyee.jp/item/jdirectitems/auction/${auction}?lang=en`);
+  const mercari=['buyee.jp','mercari.com'].includes(host)?u.pathname.match(/\/(?:mercari\/item|jp\/items)\/(m\d+)/i)?.[1]:null;
+  if(mercari)u=new URL(`https://jp.mercari.com/item/${mercari}`);
+  const h=u.hostname.toLowerCase().replace(/^www\./,'');
+  const spec=JAPAN_RADAR_SPECS.find(s=>{
+    const b=new URL(s.base).hostname.replace(/^www\./,'');
+    return (h===b||h.endsWith(`.${b}`))&&s.accepts(u);
+  });
+  return spec?{source:spec.id,spec,url:u.href,sourceId:String(japanSourceId(spec.id,u.href))}:null;
+}
+
+// m.tb.cn (compartir de Xianyu) redirige al anuncio, a veces por JavaScript.
+async function resolveXianyuShortLink(href){
+  const idIn=s=>String(s||'').replace(/&amp;/g,'&').match(/[?&](?:id|itemId)=(\d{6,})/)?.[1]||null;
+  let url=href;
+  for(let hop=0;hop<4;hop++){
+    const r=await fetch(url,{
+      redirect:'manual',
+      headers:{'user-agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148'},
+      signal:AbortSignal.timeout(15000)
+    });
+    const loc=r.headers.get('location');
+    if(loc){
+      const next=new URL(loc,url).href;
+      if(idIn(next))return idIn(next);
+      url=next;
+      continue;
+    }
+    const body=await r.text().catch(()=>'');
+    let decoded=body;try{decoded=decodeURIComponent(body);}catch{}
+    const target=[body,decoded].flatMap(s=>s.match(/https?:\/\/[^'"\s<>\\]+/g)||[])
+      .find(x=>/goofish|idle|fleamarket|2\.taobao/i.test(x)&&idIn(x));
+    return idIn(target);
+  }
+  return null;
+}
+
+async function importManualXianyu(sourceId){
+  let it=null;
+  if(xianyuProvider()==='justoneapi'){
+    const d=(await getJustOneXianyuDetail({itemId:sourceId})).item;
+    if(d)it={
+      title:d.title,price:Number(d.price),description:d.description,images:d.images||[],tags:d.tags||[],
+      area:d.area,wants:d.wants,browse:d.browseCount,publishedAt:d.publishedAt||null,publishedLocal:d.publishedLocal||null,
+      sales:Number(d.sellerSales)||null,items:Number(d.sellerItems)||null,
+      seller:{'卖家注册天数':d.sellerRegDays??null,'芝麻信用':d.sellerCredit??null,'卖家已售':d.sellerSales??null,'卖家在售':d.sellerItems??null,'好评率':d.sellerReviews??null}
+    };
+  }else{
+    if((xianyuPausedReason&&xianyuPauseCode==='risk')||Date.now()-xianyuDetailPausedAt<xianyuDetailPauseLen){
+      throw new Error('Xianyu está en pausa por una verificación anti-bot. Vuelve a probar en unas horas.');
+    }
+    const run=xianyuQueue.then(()=>fetchXianyuDetailOnce(sourceId));
+    xianyuQueue=run.catch(()=>{});
+    const res=await run;
+    if(res?.risk){
+      xianyuDetailPausedAt=Date.now();
+      xianyuDetailPauseLen=XIANYU_RISK_PAUSE_MS;
+      throw new Error('Xianyu ha pedido una verificación anti-bot al abrir la ficha. Vuelve a probar en unas horas.');
+    }
+    if(res?.ok){
+      const ido=res.item, sdo=res.seller||{};
+      it={
+        title:ido.title,price:Number(ido.soldPrice??ido.price??ido.defaultPrice),description:ido.desc,
+        images:(ido.imageInfos||[]).map(i=>String(i?.url||'').replace(/^\/\//,'https://')).filter(Boolean),
+        tags:extractXianyuTags(ido),wants:ido.wantCnt,browse:ido.browseCnt,
+        sales:Number(sdo.hasSoldNumInteger)||null,items:Number(sdo.itemCount)||null,
+        seller:{'卖家注册天数':sdo.userRegDay??null,'芝麻信用':sdo?.zhimaLevelInfo?.levelName||null,'卖家已售':sdo.hasSoldNumInteger??null,'卖家在售':sdo.itemCount??null,'好评率':sdo.newGoodRatioRate??null}
+      };
     }
   }
-  if(!listingId)return reply('No sé de qué anuncio se trata. Responde directamente al aviso que te envié (mantén pulsado → Responder) con el precio negociado, o pégame el enlace del anuncio.');
-  const listing=db.prepare('SELECT * FROM listings WHERE id=?').get(listingId);
-  if(!listing)return reply('No encuentro ese anuncio en la base de datos del bot.');
-  if(!price)return reply(`Es el anuncio <b>${htmlEsc(listing.title.slice(0,80))}</b>. ¿A qué precio lo has dejado? Respóndeme con el número y la moneda, por ejemplo <b>3200¥</b>.`);
+  if(!it?.title||!Number.isFinite(it.price)||it.price<=0)throw new Error('No he podido leer ese anuncio de Xianyu (puede que esté vendido o retirado).');
+  const url=`https://www.goofish.com/item?id=${sourceId}`;
+  return upsertListing({
+    source:'xianyu',source_id:sourceId,url,title:it.title,description:String(it.description||'').trim(),
+    original_price:it.price,currency:'CNY',price_eur:toEur(it.price,'CNY'),seller_name:'',
+    seller_sales:it.sales,seller_items:it.items,image_url:it.images[0]||'',status:'',purchase_via:'China agent',
+    raw:{
+      '商品信息':{'商品ID':sourceId,'商品标题':it.title,'当前售价':it.price,'商品链接':url,'商品主图链接':it.images[0]||'',
+        '发货地区':it.area||null,'“想要”人数':it.wants??null,'商品标签':it.tags,'发布时间':it.publishedLocal||null,
+        '商品图片列表':it.images,'浏览量':it.browse??null},
+      '卖家信息':it.seller,publishedAt:it.publishedAt||null,detailFetched:new Date().toISOString(),searchOnly:false,
+      dataProvider:xianyuProvider(),addedBy:'telegram'
+    }
+  });
+}
+
+async function importManualBunjang(sourceId){
+  const d=await runBunjangCli(['--json','item','list','--ids',String(sourceId)]);
+  const item=(d.items||[]).find(x=>String(x.id)===String(sourceId))||(d.items||[])[0];
+  const p=Number(item?.price);
+  if(!item?.title||!Number.isFinite(p)||p<=0)throw new Error('No he podido leer ese anuncio de Bunjang (puede que esté vendido o retirado).');
+  const trust=await fetchBunjangTrust(sourceId);
+  return upsertListing({
+    source:'bunjang',source_id:item.id,url:item.url,title:item.title,description:item.description||trust?.description||'',
+    original_price:p,currency:'KRW',price_eur:toEur(p,'KRW'),seller_name:null,
+    seller_items:item.sellerItemCount,seller_sales:trust?.salesCount??item.sellerSalesCount,seller_reviews:trust?.reviewCount??item.sellerReviewCount,
+    image_url:item.imageUrl,status:item.status,purchase_via:'Korea proxy',
+    raw:{...item,luxuryHunterTrust:trust?{...trust,description:undefined}:null,addedBy:'telegram'}
+  });
+}
+
+async function importManualJapan(ref){
+  let browser=null;
+  try{
+    let ctx=null;
+    if(ref.spec.mode==='browser'){
+      const {chromium}=await import('playwright');
+      browser=await chromium.launch({headless:true});
+      ctx=await browser.newContext({locale:'ja-JP',userAgent:JAPAN_HTTP_HEADERS['user-agent']});
+    }
+    let x;
+    try{x=await japanEnrichCandidate(ref.spec,{href:ref.url},{query:'telegram',searchUrl:null},ctx);}
+    catch(e){throw new Error(`No he podido abrir el anuncio de ${ref.spec.label} (${e.message}).`);}
+    if(!x?.title||!(Number(x.original_price)>0))throw new Error(`No he podido leer ese anuncio de ${ref.spec.label} (puede que esté vendido o retirado).`);
+    return upsertListing({...x,raw:{...x.raw,addedBy:'telegram'}});
+  }finally{
+    await browser?.close().catch(()=>{});
+  }
+}
+
+async function manualListingFromRef(ref){
+  if(ref.shortUrl){
+    const id=await resolveXianyuShortLink(ref.shortUrl).catch(()=>null);
+    if(!id)throw new Error('No he podido abrir el enlace de compartir de Xianyu. Pégame el enlace del anuncio (goofish.com/item?id=…).');
+    ref={source:'xianyu',sourceId:id};
+  }
+  let row=db.prepare('SELECT * FROM listings WHERE source=? AND source_id=?').get(ref.source,String(ref.sourceId));
+  if(!row){
+    const id=ref.source==='xianyu'?await importManualXianyu(ref.sourceId)
+      :ref.source==='bunjang'?await importManualBunjang(ref.sourceId)
+      :await importManualJapan(ref);
+    row=id?db.prepare('SELECT * FROM listings WHERE id=?').get(id):null;
+  }
+  // Mercari y Rakuma: valoraciones del vendedor (se guardan 3 días).
+  if(row&&JAPAN_SELLER_SOURCES.has(row.source)){
+    try{await checkJapanSellers([row]);}catch{}
+    row=db.prepare('SELECT * FROM listings WHERE id=?').get(row.id);
+  }
+  return row||null;
+}
+
+// Tarea (modelo) del anuncio: la de un análisis anterior o la que elija la IA barata.
+async function manualTaskFor(listing){
+  const prev=db.prepare('SELECT task_id FROM task_analyses WHERE listing_id=? ORDER BY updated_at DESC LIMIT 1').get(listing.id);
+  if(prev)return Number(prev.task_id);
+  const tasks=db.prepare('SELECT id,task_name,product_query,description FROM tasks WHERE enabled=1 ORDER BY id').all();
+  if(!tasks.length)return null;
+  const list=tasks.map(t=>({id:t.id,name:t.task_name,target:t.product_query,brief:String(t.description||'').replace(/\s+/g,' ').slice(0,260)}));
+  const prompt=`A luxury handbag reseller sent one marketplace listing. Decide which ONE of the reseller's tasks (bag models) it belongs to, using the title, description and photo. Answer null if it is none of these models.
+TASKS (JSON): ${JSON.stringify(list)}
+LISTING (JSON): ${JSON.stringify({source:listing.source,title:listing.title,description:String(listing.description||'').slice(0,1200)})}
+Return ONLY JSON: {"task_id": <task id or null>}`;
+  const imageParts=await fetchGeminiImageParts(listing,1).catch(()=>[]);
+  const {data}=await geminiJsonRequest({key:aiApiKey(),model:aiTriageModel(),parts:[{text:prompt},...imageParts],purpose:'telegram'});
+  const id=Number(data?.task_id);
+  return tasks.some(t=>Number(t.id)===id)?id:null;
+}
+
+// Último análisis con reventa estimada (de una tarea o suelto).
+function negotiationAnalysisFor(listingId){
+  return db.prepare('SELECT * FROM task_analyses WHERE listing_id=? ORDER BY (resale_low_eur IS NULL), updated_at DESC LIMIT 1').get(listingId)
+    ||db.prepare('SELECT * FROM analyses WHERE listing_id=?').get(listingId)
+    ||null;
+}
+
+// Comprobaciones de confianza del anuncio, en una línea cada una.
+function manualTrustLines(listing){
+  let raw={};try{raw=JSON.parse(listing.raw_json||'{}');}catch{}
+  const lines=[];
+  if(listing.source==='xianyu'){
+    lines.push(hasXianyuVerificationTag(raw?.['商品信息']?.['商品标签'])
+      ?'✅ Admite verificación 验货宝.'
+      :'⚠️ No aparece la etiqueta 验货宝 en el anuncio.');
+  }
+  if(listing.source==='bunjang'){
+    const t=raw.luxuryHunterTrust;
+    if(t?.care===true)lines.push('✅ Tiene 번개케어 (Care).');
+    else if(t)lines.push(`${bunjangTrustVeto(listing)?'⚠️':'✅'} Vendedor: nota ${t.rating??'—'} · ${t.reviewCount??0} reseñas · sin Care.`);
+  }
+  if(JAPAN_SELLER_SOURCES.has(listing.source)){
+    const s=raw.luxuryHunterSeller;
+    if(s)lines.push(`${japanSellerVeto(s)?'⚠️':'✅'} Vendedor: ${s.positivePct??'—'} % positivas · ${s.total} valoraciones.`);
+  }
+  if(String(listing.status||'').toLowerCase()==='sold')lines.push('⚠️ El anuncio aparece como vendido.');
+  return lines;
+}
+
+// Respuesta con el precio pactado. null si aún no hay reventa estimada.
+function negotiationReplyText({listing,price,fresh=false}){
   const cur=price.currency||listing.currency||'EUR';
   const newEur=toEur(price.amount,cur);
-  if(!Number.isFinite(newEur))return reply(`No tengo el cambio de ${cur} a euros ahora mismo.`);
-  const a=db.prepare('SELECT * FROM task_analyses WHERE listing_id=? ORDER BY updated_at DESC LIMIT 1').get(listingId);
-  const task=a?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(a.task_id))):null;
+  const a=negotiationAnalysisFor(listing.id);
   const low=Number(a?.resale_low_eur), high=Number(a?.resale_high_eur);
-  if(!a||!Number.isFinite(low))return reply('Ese anuncio todavía no tiene una reventa estimada, así que no puedo recalcular el beneficio.');
+  if(!a||!Number.isFinite(low)||!Number.isFinite(newEur))return null;
+  const task=a.task_id?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(a.task_id))):null;
   const before=importEconomics(listing);
   const after=importEconomics({...listing,price_eur:newEur});
   const landed=after.importedTotalEur;
@@ -8720,23 +8956,159 @@ async function handleTelegramNegotiation(msg){
   const softProfit=Math.max(150,Math.round(strongProfit*0.6)), softMargin=Number(process.env.SOFT_ALERT_MIN_MARGIN_PCT||20);
   const risky=String(a.authenticity_risk||'').toUpperCase()==='HIGH';
   const verdict=risky?'⚠️ Riesgo de autenticidad alto: aunque salgan los números, no lo compraría sin verificación.'
-    : pLow>=strongProfit&&margin>=strongMargin?'🔥 <b>Ahora sí es una oportunidad clara.</b>'
+    : pLow>=strongProfit&&margin>=strongMargin?`🔥 <b>${fresh?'Es':'Ahora sí es'} una oportunidad clara.</b>`
     : pLow>=softProfit&&margin>=softMargin?'👀 <b>Interesante, revísalo.</b>'
-    : '❌ <b>Sigue sin compensar</b> con este precio.';
+    : `❌ <b>${fresh?'No compensa':'Sigue sin compensar'}</b> con este precio.`;
   const maxEur=telegramMaxPriceFor(listing,low,strongProfit,strongMargin);
   const maxLocal=maxEur!=null?eurTo(maxEur,listing.currency||'EUR'):null;
-  const lines=[
+  let reasons=[];try{reasons=JSON.parse(a.decision_reasons_es_json||'[]');}catch{}
+  let verification={};try{verification=JSON.parse(a.verification_json||'{}');}catch{}
+  const verificationLine={
+    verified:'Verificación de modelo y mercado: hecha.',
+    skipped_cost:'Sin verificación de mercado (puntuación baja).',
+    error:'⚠️ La verificación de modelo y mercado ha fallado.'
+  }[verification.status]||'';
+  const lines=fresh?[
+    `🧾 <b>Analizado con tu precio pactado</b>${task?` · ${htmlEsc(task.task_name)}`:' · no encaja en ninguna tarea'}`,
+    `<b>${htmlEsc(a.model||listing.title||'')}</b>`,
+    `Decisión del bot: <b>${htmlEsc(a.decision||'—')}</b>${a.opportunity_score!=null?` · ${Math.round(a.opportunity_score)}/100`:''}`,
+    `Precio pactado: <b>${fmtMoney(price.amount,cur)}</b> (≈ ${eur0(newEur)}) · anunciado ${fmtMoney(listing.original_price,listing.currency||'EUR')} (≈ ${eur0(listing.price_eur)})`,
+    'Coste puesto en España:',
+    ...importCostLines({...listing,price_eur:newEur}),
+    `Reventa estimada: ${eur0(low)} – ${eur0(high)}`,
+    `Beneficio neto: <b>${eur0(pLow)}${pHigh!=null?` – ${eur0(pHigh)}`:''}</b> · margen ${Math.round(margin)} %`,
+    vestiaireProfitLine(low,high,landed),
+    verdict,
+    ...manualTrustLines(listing),
+    verificationLine,
+    ...reasons.slice(0,3).map(r=>`• ${htmlEsc(r)}`),
+    maxLocal!=null?`Precio máximo para que sea oportunidad clara: <b>${fmtMoney(maxLocal,listing.currency||'EUR')}</b> (≈ ${eur0(maxEur)})`:'',
+    ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model}),
+    listing.url?`<a href="${htmlEsc(listingAppLink(listing))}">📱 Abrir en la app</a>`:''
+  ]:[
     `♻️ <b>Recalculado con el precio negociado</b>${task?` · ${htmlEsc(task.task_name)}`:''}`,
     `<b>${htmlEsc(a.model||listing.title||'')}</b>`,
     `Precio: <b>${fmtMoney(price.amount,cur)}</b> (≈ ${eur0(newEur)}) · antes ${fmtMoney(listing.original_price,listing.currency||'EUR')} (≈ ${eur0(listing.price_eur)})`,
     `Coste puesto en España: ${eur0(landed)} (antes ${eur0(before.importedTotalEur)})`,
     `Reventa estimada: ${eur0(low)} – ${eur0(high)}`,
     `Beneficio neto: <b>${eur0(pLow)}${pHigh!=null?` – ${eur0(pHigh)}`:''}</b> · margen ${Math.round(margin)} % (antes ${eur0(low-before.importedTotalEur)})`,
+    vestiaireProfitLine(low,high,landed),
     verdict,
     maxLocal!=null?`Precio máximo para que sea oportunidad clara: <b>${fmtMoney(maxLocal,listing.currency||'EUR')}</b> (≈ ${eur0(maxEur)})`:'',
+    ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model}),
     listing.url?`<a href="${htmlEsc(listingAppLink(listing))}">📱 Abrir en la app</a>`:''
-  ].filter(Boolean);
-  await reply(lines.join('\n'));
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+// Cola de análisis manuales: uno detrás de otro y guardados en la base de
+// datos, para retomarlos si la ejecución de la nube termina a medias.
+let manualQueue=Promise.resolve();
+function manualJobs(){
+  const jobs=getSetting('telegram_manual_jobs',[]);
+  return Array.isArray(jobs)?jobs:[];
+}
+function saveManualJobs(jobs){
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('telegram_manual_jobs',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify(jobs),new Date().toISOString());
+}
+function runQueuedManualAnalysis(job){
+  const run=manualQueue.then(()=>runManualAnalysis(job));
+  manualQueue=run.catch(()=>{});
+  return run;
+}
+function resumeManualAnalyses(){
+  const pending=manualJobs().filter(j=>Date.now()-Date.parse(j.createdAt)<12*3600e3);
+  saveManualJobs(pending);
+  for(const job of pending)runQueuedManualAnalysis(job);
+  if(pending.length)console.log(`Telegram: ${pending.length} análisis manual(es) pendiente(s) retomado(s).`);
+}
+async function runManualAnalysis(job){
+  const reply=text=>telegramApi('sendMessage',{chat_id:job.chatId,text,parse_mode:'HTML',reply_to_message_id:job.messageId,allow_sending_without_reply:true,disable_web_page_preview:true}).catch(e=>console.error('Telegram reply failed:',e.message));
+  try{
+    let listing=db.prepare('SELECT * FROM listings WHERE source=? AND source_id=?').get(job.source,String(job.sourceId));
+    if(!listing&&job.url){
+      const ref=manualListingRef(job.url);
+      if(ref)listing=await manualListingFromRef(ref);
+    }
+    if(!listing)return await reply('No he podido recuperar el anuncio. Vuelve a enviarme el enlace con el precio.');
+    const priceEur=toEur(job.price.amount,job.price.currency||listing.currency||'EUR');
+    await manualAiStore.run(true,async()=>{
+      const taskId=await manualTaskFor(listing);
+      await analyzeWithGemini(listing.id,taskId,true,null,{priceEur});
+    });
+    const fresh=db.prepare('SELECT * FROM listings WHERE id=?').get(listing.id);
+    const text=negotiationReplyText({listing:fresh,price:job.price,fresh:true});
+    if(text)return await reply(text);
+    const a=negotiationAnalysisFor(listing.id);
+    let reasons=[];try{reasons=JSON.parse(a?.decision_reasons_es_json||'[]');}catch{}
+    await reply([
+      `🧾 <b>Analizado con tu precio pactado</b>`,
+      `<b>${htmlEsc(a?.model||listing.title||'')}</b>`,
+      `Decisión del bot: <b>${htmlEsc(a?.decision||'—')}</b> · no he podido estimar la reventa.`,
+      ...manualTrustLines(fresh),
+      ...reasons.slice(0,3).map(r=>`• ${htmlEsc(r)}`)
+    ].filter(Boolean).join('\n'));
+  }catch(e){
+    console.error('Telegram manual analysis failed:',e.message);
+    // Nunca se reenvía un mensaje de error que pueda llevar trozos de la clave.
+    const why=/api[ _-]?key|401|unauthori[sz]ed/i.test(String(e?.message||''))
+      ?'la clave de la IA no es válida en este equipo.'
+      :String(e?.message||e).slice(0,300);
+    await reply(`No he podido analizar el anuncio: ${htmlEsc(why)}`);
+  }finally{
+    saveManualJobs(manualJobs().filter(j=>j.key!==job.key));
+  }
+}
+
+async function handleTelegramNegotiation(msg){
+  const chat_id=msg.chat.id;
+  const reply=(text)=>telegramApi('sendMessage',{chat_id,text,parse_mode:'HTML',reply_to_message_id:msg.message_id,disable_web_page_preview:true}).catch(e=>console.error('Telegram reply failed:',e.message));
+  const text=`${msg.text||''} ${msg.caption||''}`.trim();
+  const priceText=priceTextOnly(text);
+  const urls=[...telegramMessageUrls(msg),...telegramMessageUrls(msg.reply_to_message)];
+  if(/^\/(start|help|ayuda)/i.test(text)||(!msg.photo&&!msg.reply_to_message&&!urls.length&&!parseNegotiatedPrice(priceText)&&!listingIdFromTelegramMessage(msg))){
+    return reply(`Mándame el enlace de un anuncio con el precio que has pactado con el vendedor, por ejemplo:\n<code>https://www.goofish.com/item?id=… 3200¥</code>\nLo analizo con ese precio: modelo, autenticidad, reventa y beneficio. Funciona con ${MANUAL_SOURCES_TEXT}.\n\nTambién puedes responder a un aviso mío con el precio, o mandarme una captura del anuncio o del chat con el vendedor.`);
+  }
+  let listingId=listingIdFromTelegramMessage(msg.reply_to_message)||listingIdFromTelegramMessage(msg);
+  let price=parseNegotiatedPrice(priceText);
+  // Enlace de un anuncio que el bot no tiene: se lee de la web.
+  if(!listingId&&urls.length){
+    const ref=urls.map(manualListingRef).find(Boolean);
+    if(!ref&&!msg.photo)return reply(`Todavía no sé leer anuncios de esa web. Funciona con ${MANUAL_SOURCES_TEXT}.`);
+    if(ref){
+      try{listingId=(await manualListingFromRef(ref))?.id||null;}
+      catch(e){return reply(`No he podido leer el anuncio: ${htmlEsc(e.message)}`);}
+    }
+  }
+  const photo=(msg.photo||[]).slice(-1)[0];
+  if((!listingId||!price)&&photo){
+    try{
+      const ai=await identifyListingFromScreenshot(photo.file_id);
+      if(!listingId&&Number(ai.listing_id))listingId=Number(ai.listing_id);
+      if(!price&&Number(ai.agreed_price)>0)price={amount:Number(ai.agreed_price),currency:ai.currency||null};
+    }catch(e){
+      return reply(`No he podido leer la captura (${htmlEsc(e.message)}). Responde al aviso del anuncio con el precio, por ejemplo <b>3200¥</b>.`);
+    }
+  }
+  if(!listingId)return reply('No sé de qué anuncio se trata. Pégame el enlace del anuncio con el precio pactado, o responde directamente al aviso que te envié (mantén pulsado → Responder).');
+  const listing=db.prepare('SELECT * FROM listings WHERE id=?').get(listingId);
+  if(!listing)return reply('No encuentro ese anuncio en la base de datos del bot.');
+  if(!price)return reply(`Es el anuncio <b>${htmlEsc(String(listing.title||'').slice(0,80))}</b>. ¿A qué precio lo has pactado? Respóndeme a este mensaje con el número y la moneda, por ejemplo <b>3200¥</b> o <b>450€</b>.${listing.url?`\n<a href="${htmlEsc(listing.url)}">Ver anuncio</a>`:''}`);
+  // «¥» vale para yuanes y para yenes: en un anuncio de Japón son yenes.
+  if(price.currency==='CNY'&&listing.currency==='JPY'&&!/元|rmb|cny|yuan|kuai/i.test(priceText))price={...price,currency:'JPY'};
+  const cur=price.currency||listing.currency||'EUR';
+  const newEur=toEur(price.amount,cur);
+  if(!Number.isFinite(newEur))return reply(`No tengo el cambio de ${cur} a euros ahora mismo.`);
+  // Ya tiene reventa estimada: solo se recalcula con el precio (sin gastar IA).
+  const recalculated=negotiationReplyText({listing,price});
+  if(recalculated){await reply(recalculated);return true;}
+  // Sin reventa estimada: análisis completo con el precio pactado.
+  if(!aiConfigured())return reply('La IA no está configurada, así que no puedo analizar el anuncio.');
+  await reply(`⏳ Analizando <b>${htmlEsc(String(listing.title||'').slice(0,80))}</b> con ${fmtMoney(price.amount,cur)} (≈ ${eur0(newEur)}). Tardo uno o dos minutos.`);
+  const job={key:`${chat_id}:${msg.message_id}`,chatId:chat_id,messageId:msg.message_id,source:listing.source,sourceId:String(listing.source_id),url:listing.url,price,createdAt:new Date().toISOString()};
+  saveManualJobs([...manualJobs().filter(j=>j.key!==job.key),job]);
+  runQueuedManualAnalysis(job);
   return true;
 }
 
@@ -8814,6 +9186,39 @@ function importCostLines(x){
   return rows.map(([k,v])=>`   · ${k}: ${eur0(v)}`).concat([`   = Coste puesto: <b>${eur0(c.importedTotalEur)}</b>`]);
 }
 
+// Beneficio si se revende en Vestiaire: la reventa menos su comisión
+// (VESTIAIRE_COMMISSION_PCT, 20 % por defecto) y menos el coste puesto.
+function vestiaireProfitLine(resaleLow,resaleHigh,landed){
+  const fee=Number(process.env.VESTIAIRE_COMMISSION_PCT??20);
+  const num=v=>v===null||v===undefined||v===''?NaN:Number(v);
+  const net=r=>Number.isFinite(num(r))&&Number.isFinite(num(landed))?num(r)*(1-fee/100)-num(landed):null;
+  const lo=net(resaleLow), hi=net(resaleHigh);
+  if(lo==null&&hi==null)return '';
+  return `Beneficio en Vestiaire (−${fee} % comisión): <b>${eur0(lo)}${hi!=null?` – ${eur0(hi)}`:''}</b>`;
+}
+// Anuncios del mismo modelo en la base de datos de Vestiaire de Nil (la hoja):
+// resumen de precios y los más parecidos (talla, color y precio), a la venta
+// y vendidos.
+function vestiaireDbLines(taskName,item){
+  const r=taskName?vestiaireRefs().tasks?.[taskName]:null;
+  const fichas=r?.fichas||[];
+  if(!fichas.length)return [];
+  const probe={...item,title:`${item?.model||''} ${item?.title||''}`};
+  const forSale=vestiaireMatchFichas(fichas,probe).slice(0,3).map(m=>m.f);
+  const soldAll=fichas.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>({...f,price_eur:f.sold_price_eur,excluded:false}));
+  const sold=soldAll.length?vestiaireMatchFichas(soldAll,probe).slice(0,2).map(m=>m.f):[];
+  const desc=f=>htmlEsc([f.size,f.color,f.condition].filter(Boolean).join(' · ')||'Anuncio');
+  const summary=[
+    r.all?.n?`${r.all.n} a la venta, mediana ${eur0(r.all.median)} (${eur0(r.all.min)} – ${eur0(r.all.max)})`:'',
+    r.sold_stats?.n?`${r.sold_stats.n} vendido${r.sold_stats.n===1?'':'s'}, mediana ${eur0(r.sold_stats.median)}`:''
+  ].filter(Boolean).join(' · ');
+  return [
+    `📚 <b>Tu base de Vestiaire</b>${summary?`: ${summary}`:''}`,
+    ...forSale.map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · ${eur0(f.price_eur)}${Number.isFinite(f.likes)?` · ${f.likes} ❤️`:''}`),
+    ...sold.map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · vendido a ${eur0(f.sold_price_eur)}`)
+  ];
+}
+
 function instantAlertText(x){
   const profit=x.net_profit_low_eur!=null||x.net_profit_high_eur!=null
     ? `${eur0(x.net_profit_low_eur)} – ${eur0(x.net_profit_high_eur)}`
@@ -8832,6 +9237,8 @@ function instantAlertText(x){
     ...importCostLines(x),
     `Reventa ${resale}`,
     `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
+    vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur),
+    ...vestiaireDbLines(x._task_name,x),
     String(x.source||'').startsWith('ebay-')?(()=>{let r={};try{r=JSON.parse(x.raw_json||'{}')}catch{};return r.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`;})():'',
     x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir en la app</a>`:''
   ].filter(Boolean).join('\n');
@@ -11618,5 +12025,7 @@ server.listen(PORT,'127.0.0.1',async()=>{
   if(telegramConfigured()&&!['0','off','false','no'].includes(String(process.env.TELEGRAM_POLL||'').toLowerCase())){
     pollTelegramUpdates().catch(()=>{});
     setInterval(()=>pollTelegramUpdates().catch(()=>{}),20000).unref?.();
+    // Análisis manuales que quedaron a medias en la ejecución anterior.
+    try{resumeManualAnalyses();}catch(e){console.error('Telegram manual resume:',e.message);}
   }
 });
