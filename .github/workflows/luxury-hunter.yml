@@ -74,6 +74,8 @@ jobs:
       # Velocidad: tareas en paralelo y ciclos repetidos dentro de cada ejecución.
       TASK_CONCURRENCY: ${{ vars.TASK_CONCURRENCY || '3' }}
       LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '0' }}
+      # Cada ejecución, como mucho 38 min de tareas (+~6 min de preparación).
+      RUN_BUDGET_MINUTES: ${{ vars.RUN_BUDGET_MINUTES || '38' }}
       CYCLE_MIN_MINUTES: ${{ vars.CYCLE_MIN_MINUTES || '20' }}
       # Avisos inmediatos (email siempre; Telegram si hay secretos).
       INSTANT_ALERT_DECISIONS: ${{ vars.INSTANT_ALERT_DECISIONS || 'STRONG BUY,BUY' }}

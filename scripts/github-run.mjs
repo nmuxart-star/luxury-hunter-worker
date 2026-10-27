@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -66,11 +67,35 @@ const TASK_CONCURRENCY=envInt('TASK_CONCURRENCY',3,1,6);
 // Modo bucle: repite ciclos durante LOOP_MINUTES (0 = una sola pasada).
 const LOOP_MINUTES=envInt('LOOP_MINUTES',0,0,340);
 const CYCLE_MIN_MINUTES=envInt('CYCLE_MIN_MINUTES',20,5,180);
+// Reparto de los modelos a lo largo del día: cada ejecución dura como mucho
+// RUN_BUDGET_MINUTES (más ~6 min de preparación de GitHub) y empieza por los
+// modelos que llevan más tiempo sin revisarse. Solo arranca un modelo si,
+// según lo que tardó en sus últimas pasadas, le da tiempo a terminar; los
+// demás pasan a la siguiente ejecución. 0 = todas las tareas en cada pasada.
+const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
 const workerStartedAt=Date.now();
-async function runPool(items,limit,fn){
+const elapsedMinutes=()=>(Date.now()-workerStartedAt)/60000;
+// Minutos que tarda cada modelo: media de sus 3 últimas pasadas (25 si no hay).
+function taskMinutesEstimate(){
+  const byTask=new Map();
+  try{
+    const db=new DatabaseSync(path.join(root,'data','luxury-hunter.sqlite3'),{readOnly:true});
+    const rows=db.prepare(`SELECT task_id,(julianday(finished_at)-julianday(started_at))*1440 AS m
+      FROM task_runs WHERE status='finished' AND finished_at IS NOT NULL ORDER BY id DESC LIMIT 500`).all();
+    db.close();
+    for(const r of rows){
+      const list=byTask.get(r.task_id)||[];
+      if(list.length<3&&r.m>0&&r.m<240){list.push(r.m);byTask.set(r.task_id,list);}
+    }
+  }catch(e){console.warn('Sin historial de duración de tareas:',e.message);}
+  return id=>{const l=byTask.get(id);return l?.length?l.reduce((a,b)=>a+b,0)/l.length:25;};
+}
+// Como runPool, pero cada hueco solo empieza una tarea si canStart lo permite.
+async function runPool(items,limit,fn,canStart=()=>true){
   let next=0;
   await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{
     while(next<items.length){
+      if(!canStart(items[next]))return;
       const item=items[next++];
       await fn(item);
     }
@@ -129,9 +154,18 @@ try{
     const runnable=runAll
       ? tasks.filter(t=>t.enabled)
       : tasks.filter(t=>due(t));
-    console.log(`\n##### CICLO ${cycle}: ${runnable.length}/${tasks.length} tareas, concurrencia ${TASK_CONCURRENCY} #####`);
+    // Primero los modelos que llevan más tiempo sin revisarse.
+    runnable.sort((a,b)=>(Date.parse(a.last_run_at||'')||0)-(Date.parse(b.last_run_at||'')||0));
+    const estimate=taskMinutesEstimate();
+    let started=0;
+    const canStart=task=>{
+      if(!RUN_BUDGET_MINUTES||started===0)return true;
+      return elapsedMinutes()+estimate(task.id)<=RUN_BUDGET_MINUTES;
+    };
+    console.log(`\n##### CICLO ${cycle}: ${runnable.length}/${tasks.length} tareas, concurrencia ${TASK_CONCURRENCY}${RUN_BUDGET_MINUTES?`, máximo ${RUN_BUDGET_MINUTES} min`:''} #####`);
     const taskResults=[];
     await runPool(runnable,TASK_CONCURRENCY,async task=>{
+      started++;
       console.log(`\n=== RUN ${task.task_name} ===`);
       try{
         const q=await api('POST',`/api/tasks/${task.id}/run`,{});
@@ -142,7 +176,12 @@ try{
         taskResults.push({task_id:task.id,task_name:task.task_name,status:'error',error:e?.message||String(e)});
         console.error(`FAILED ${task.task_name}:`,e?.message||e);
       }
-    });
+    },canStart);
+    if(RUN_BUDGET_MINUTES){
+      const done=new Set(taskResults.map(x=>x.task_id));
+      const waiting=runnable.filter(t=>!done.has(t.id)).map(t=>t.task_name);
+      console.log(`Reparto: ${done.size} modelos en esta ejecución (${elapsedMinutes().toFixed(1)} min); pasan a la siguiente: ${waiting.length?waiting.join(', '):'ninguno'}.`);
+    }
 
     try{
       const digest=await api('POST','/api/email/global-digest',{
@@ -168,7 +207,7 @@ try{
 
     const cycleMinutes=(Date.now()-cycleStartedAt)/60000;
     console.log(`Ciclo ${cycle} completado en ${cycleMinutes.toFixed(1)} min.`);
-    if(!LOOP_MINUTES)break;
+    if(!LOOP_MINUTES||RUN_BUDGET_MINUTES)break;
     const waitMs=Math.max(0,CYCLE_MIN_MINUTES*60000-(Date.now()-cycleStartedAt));
     const elapsedMin=(Date.now()-workerStartedAt+waitMs)/60000;
     // No empezar un ciclo que no daría tiempo a terminar dentro del presupuesto.
