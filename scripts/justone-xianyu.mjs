@@ -2,7 +2,6 @@ import { extractXianyuTags, hasXianyuVerificationTag } from './xianyu-verificati
 
 const BASE_URL = 'https://api.justoneapi.com';
 const SEARCH_PATH = '/api/xianyu/search-item-list/v1';
-const DETAIL_PATH = '/api/xianyu/get-item-detail/v1';
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 const FIELD_KEYS = {
@@ -13,15 +12,18 @@ const FIELD_KEYS = {
   image: ['imageUrl', 'image_url', 'picUrl', 'pic_url', 'mainImage', 'main_image', 'cover', 'image', '商品主图链接', '商品主图'],
   images: ['images', 'imageList', 'image_list', 'imageInfos', '商品图片列表', '商品图片'],
   area: ['area', 'location', 'city', 'region', '发货地区'],
-  seller: ['sellerName', 'seller_name', 'sellerNick', 'seller_nick', 'nickName', 'userName', '卖家昵称'],
+  seller: ['sellerName', 'seller_name', 'sellerNick', 'seller_nick', 'nickName', 'userName', 'userNickName', 'nickname', '卖家昵称'],
+  sellerId: ['sellerId', 'seller_id', 'userId', 'user_id', 'uid', '卖家ID'],
   published: ['publishedAt', 'publishTime', 'publish_time', 'createTime', 'createdAt', '发布时间'],
   wants: ['wantCount', 'wantNum', 'want_num', 'likes', 'favoriteCount', 'wishCount', '“想要”人数'],
   description: ['description', 'desc', 'detail', 'itemDesc', 'productDescription', '商品描述', '宝贝描述'],
   browseCount: ['browseCount', 'browseCnt', 'viewCount', 'views', '浏览量'],
   sellerSales: ['sellerSales', 'seller_sales', 'soldCount', 'hasSoldNumInteger', 'sales', '卖家已售'],
   sellerItems: ['sellerItems', 'seller_items', 'itemCount', 'onSaleCount', '卖家在售'],
-  sellerReviews: ['sellerReviews', 'seller_reviews', 'reviewCount', 'reviews', '卖家评价数'],
-  sellerCredit: ['sellerCredit', 'creditLevel', 'credit', '芝麻信用'],
+  sellerReviews: ['sellerReviews', 'seller_reviews'],
+  sellerReviewCount: ['sellerReviewCount', 'seller_review_count', 'reviewCount', 'reviews', '评价数', '卖家评价数'],
+  sellerReviewRate: ['sellerReviewRate', 'seller_review_rate', 'reviewRate', 'goodRatio', 'newGoodRatioRate', '好评率'],
+  sellerCredit: ['sellerCredit', 'creditLevel', 'credit', '芝麻信用', 'zhimaLevelInfo'],
   sellerRegDays: ['sellerRegDays', 'userRegDay', 'registeredDays', '卖家注册天数']
 };
 
@@ -68,7 +70,7 @@ function deepValue(object, keys, depth = 0) {
   return null;
 }
 
-function scalar(value, keys = ['value', 'amount', 'text', 'name', 'url', 'src']) {
+function scalar(value, keys = ['value', 'amount', 'text', 'name', 'levelName', 'level', 'label', 'content', 'url', 'src']) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string' || typeof value === 'number') return value;
   if (Array.isArray(value)) return scalar(value[0], keys);
@@ -138,6 +140,7 @@ function normalizeCandidate(object) {
     images,
     area: String(scalar(deepValue(object, FIELD_KEYS.area)) || ''),
     seller: String(scalar(deepValue(object, FIELD_KEYS.seller)) || ''),
+    sellerId: String(scalar(deepValue(object, FIELD_KEYS.sellerId)) || ''),
     publishedAt,
     publishedLocal: publishedAt ? new Date(new Date(publishedAt).getTime() + 8 * 3600_000).toISOString().slice(0, 16).replace('T', ' ') : null,
     wants: scalar(deepValue(object, FIELD_KEYS.wants)),
@@ -146,6 +149,8 @@ function normalizeCandidate(object) {
     sellerSales: scalar(deepValue(object, FIELD_KEYS.sellerSales)),
     sellerItems: scalar(deepValue(object, FIELD_KEYS.sellerItems)),
     sellerReviews: scalar(deepValue(object, FIELD_KEYS.sellerReviews)),
+    sellerReviewCount: scalar(deepValue(object, FIELD_KEYS.sellerReviewCount)),
+    sellerReviewRate: scalar(deepValue(object, FIELD_KEYS.sellerReviewRate)),
     sellerCredit: scalar(deepValue(object, FIELD_KEYS.sellerCredit)),
     sellerRegDays: scalar(deepValue(object, FIELD_KEYS.sellerRegDays)),
     tags: extractXianyuTags(object)
@@ -229,13 +234,4 @@ export async function searchJustOneXianyu({ keyword, page = 1, sort = 'active', 
   const all = normalizeJustOneXianyuItems(payload);
   const items = all.filter(item => hasXianyuVerificationTag(item.tags));
   return { items, totalFound: all.length, missingVerificationTag: all.length - items.length, requestId: payload?.requestId || null };
-}
-
-export async function getJustOneXianyuDetail({ itemId, ...options }) {
-  if (!String(itemId || '').trim()) throw new JustOneApiError('La ficha de Just One API necesita un itemId.');
-  const normalizedId = String(itemId).trim();
-  const payload = await callJustOne(DETAIL_PATH, { itemId: normalizedId }, options);
-  const items = normalizeJustOneXianyuItems(payload);
-  const item = items.find(candidate => candidate.id === normalizedId) || items[0] || null;
-  return item ? { item, requestId: payload?.requestId || null } : { item: null, requestId: payload?.requestId || null };
 }

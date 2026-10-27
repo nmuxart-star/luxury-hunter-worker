@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  getJustOneXianyuDetail,
   normalizeJustOneXianyuItems,
   JustOneApiError,
   searchJustOneXianyu
@@ -27,6 +26,42 @@ test('normalizes nested listing data and deduplicates repeated item IDs',()=>{
   assert.equal(items[0].url,'https://www.goofish.com/item?id=123');
   assert.equal(items[0].publishedAt,'2023-11-14T22:13:20.000Z');
   assert.deepEqual(items[0].tags,['验货宝']);
+});
+
+test('normalizes image, publication time, and seller fields from one search result',()=>{
+  const [item]=normalizeJustOneXianyuItems({code:0,data:{items:[{
+    itemId:'search-only-1',
+    title:'Bolso preloved',
+    price:'¥1,200',
+    images:[{url:'//img.example/main.jpg'},{url:'https://img.example/second.jpg'}],
+    description:'Descripción que llega en búsqueda',
+    publishTime:1700000000,
+    seller:{
+      userNickName:'Vendedora',
+      userId:'seller-7',
+      sellerRegDays:730,
+      sellerCredit:{levelName:'良好'},
+      sellerSales:18,
+      sellerItems:4,
+      sellerReviewCount:12,
+      sellerReviewRate:'99%'
+    },
+    tags:['验货宝']
+  }]}});
+
+  assert.equal(item.image,'https://img.example/main.jpg');
+  assert.deepEqual(item.images,['https://img.example/main.jpg','https://img.example/second.jpg']);
+  assert.equal(item.description,'Descripción que llega en búsqueda');
+  assert.equal(item.publishedAt,'2023-11-14T22:13:20.000Z');
+  assert.equal(item.seller,'Vendedora');
+  assert.equal(item.sellerId,'seller-7');
+  assert.equal(item.sellerRegDays,730);
+  assert.equal(item.sellerCredit,'良好');
+  assert.equal(item.sellerSales,18);
+  assert.equal(item.sellerItems,4);
+  assert.equal(item.sellerReviewCount,12);
+  assert.equal(item.sellerReviewRate,'99%');
+  assert.deepEqual(item.tags,['验货宝']);
 });
 
 test('search uses the documented Just One API host, route, and parameters',async()=>{
@@ -75,20 +110,6 @@ test('verification requires an exact listing tag, not a seller claim or a search
   assert.equal(xianyuListingHasVerificationTag({source:'xianyu',title:'支持验货宝',raw_json:'{}'}),false);
   assert.equal(xianyuListingHasVerificationTag({source:'xianyu',raw_json:JSON.stringify({'商品信息':{'商品标签':['包邮','验货宝']}})}),true);
   assert.equal(xianyuListingHasVerificationTag({source:'bunjang',raw_json:'{}'}),true);
-});
-
-test('detail lookup uses the documented v1 route and itemId parameter',async()=>{
-  let requested;
-  const fetchImpl=async(url,options)=>{
-    requested={url:new URL(url),options};
-    return new Response(JSON.stringify({code:0,data:{itemId:'abc',title:'Reloj usado',price:300,description:'En buen estado'}}),{status:200});
-  };
-  const result=await getJustOneXianyuDetail({itemId:'abc',env,fetchImpl});
-  assert.equal(requested.url.pathname,'/api/xianyu/get-item-detail/v1');
-  assert.equal(requested.url.searchParams.get('token'),'test-key');
-  assert.equal(requested.url.searchParams.get('itemId'),'abc');
-  assert.equal(result.item.title,'Reloj usado');
-  assert.equal(result.item.description,'En buen estado');
 });
 
 test('provider business errors are rejected without exposing the API key',async()=>{

@@ -88,15 +88,19 @@ de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserv
 
 ### Just One API para Xianyu
 
-Luxury Hunter usa [Product Search V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-search-v1)
-y [Product Details V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-details-v1)
-de Just One API para buscar anuncios y consultar sus fichas. La búsqueda envía
-`keyword`, `page` y `sort`; la ficha envía `itemId`. Ambas usan un token privado.
-La API no documenta un filtro de servidor para `验货宝`: Luxury Hunter comprueba
-la etiqueta dentro de cada anuncio devuelto y solo guarda o muestra anuncios
-de Xianyu que la llevan. Tampoco muestra anuncios antiguos sin esa etiqueta
-en resultados, informes ni alertas. El texto libre del vendedor no cuenta
-como prueba de la etiqueta.
+Luxury Hunter usa solo [Product Search V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-search-v1)
+de Just One API. No llama a Product Details ni abre fichas. Conserva de la
+respuesta de búsqueda la imagen y galería que vengan, descripción, fecha de
+publicación, etiqueta `验货宝` y los campos del vendedor que estén disponibles.
+Los datos ausentes quedan vacíos; no se completan con otra petición. La etiqueta
+se comprueba en cada anuncio y solo se guarda o muestra Xianyu si la lleva. El
+texto libre del vendedor no cuenta como prueba de la etiqueta.
+
+El bot ordena por `newest` y aplica una ventana máxima de 24 horas por fecha
+real de publicación (`XIANYU_SEARCH_MAX_AGE_HOURS`, 24 por defecto). Descarta
+resultados sin imagen, señal de vendedor o fecha de publicación, y no sustituye
+una fecha desconocida por la hora en que se encontró el anuncio. Los anuncios
+añadidos manualmente solo se pueden abrir si ya aparecieron en una búsqueda.
 
 En GitHub, crea el secreto de Actions `JUSTONEAPI_TOKEN` con el token de tu cuenta.
 El workflow selecciona Just One API por defecto y no inicia las sesiones de
@@ -110,12 +114,12 @@ XIANYU_PROVIDER=justoneapi
 JUSTONEAPI_TOKEN=tu_token
 ```
 
-Con Just One API, Luxury Hunter hace por defecto una consulta cada seis horas
-y abre hasta cuatro fichas por hora. El modo directo en la nube conserva su
-ritmo anterior de dos consultas cada tres horas. Ajusta `XIANYU_MIN_INTERVAL_MIN`,
-`XIANYU_MAX_QUERIES`, `XIANYU_DETAIL_PER_HOUR` y `XIANYU_JUSTONE_SORT` según tu
-plan. Just One API es un proveedor externo: consulta sus cuotas y cargos antes
-de activarlo. Los errores se registran sin detener las demás fuentes.
+Con Just One API, Luxury Hunter hace por defecto una consulta cada seis horas.
+El modo directo en la nube conserva su ritmo anterior de dos consultas cada
+tres horas. Ajusta `XIANYU_MIN_INTERVAL_MIN`, `XIANYU_MAX_QUERIES` y
+`XIANYU_SEARCH_MAX_AGE_HOURS` según tu plan. Just One API es un proveedor
+externo: consulta sus cuotas y cargos antes de activarlo.
+Los errores se registran sin detener las demás fuentes.
 
 ## v1.7 — Más mercados y costes por origen
 
