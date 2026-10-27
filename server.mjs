@@ -2506,7 +2506,7 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   return {kept:true};
 }
 
-async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=null,sessionId,slotReserved=false}){
+async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=null,sessionId,slotReserved=false,justOnePages=null}){
   const token=String(process.env.JUSTONEAPI_TOKEN||'').trim();
   if(!token){
     const warning='Just One API está seleccionado, pero falta configurar el secreto JUSTONEAPI_TOKEN.';
@@ -2550,7 +2550,7 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
   const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
   // Páginas por búsqueda (10 anuncios cada una). Cada página es una llamada y
   // cuenta en el cupo mensual; la primera ya se ha reservado arriba.
-  const pages=clampInt(process.env.XIANYU_JUSTONE_PAGES||1,1,1,5);
+  const pages=clampInt(justOnePages??process.env.XIANYU_JUSTONE_PAGES??1,1,1,5);
   for(const keyword of selected){
     try{
       const items=[];
@@ -2738,8 +2738,9 @@ function xianyuDirectSessionBlock(){
 // One API (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
 // El turno se gasta aunque la búsqueda no salga (sesión caducada, cupo
 // agotado...): así el siguiente siempre toca al otro proveedor.
-// Si la cuenta pide verificación, queda bloqueada (no se vuelve a usar hasta
-// XIANYU_ACCOUNT_UNBLOCK) y ese turno y todos los siguientes van por Just One API.
+// Si la cuenta pide verificación (captcha o de identidad), queda bloqueada (no
+// se vuelve a usar hasta XIANYU_ACCOUNT_UNBLOCK) y ese turno y todos los
+// siguientes van por Just One API con una sola página (10 anuncios por hora).
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
@@ -2752,7 +2753,7 @@ async function searchXianyuAlternate(opts){
   if(accountBlocked||xianyuLastProvider()!=='justoneapi'){
     xianyuMarkProvider('justoneapi');
     console.log(`Xianyu (alterno): turno de Just One API${accountBlocked?' (cuenta de Xianyu bloqueada)':''}.`);
-    return {...await searchXianyuJustOneApi({...opts,slotReserved:true}),provider:'justoneapi',accountBlocked};
+    return {...await searchXianyuJustOneApi({...opts,slotReserved:true,...(accountBlocked?{justOnePages:1}:{})}),provider:'justoneapi',accountBlocked};
   }
   xianyuMarkProvider('direct');
   console.log('Xianyu (alterno): turno de la cuenta de Xianyu.');
@@ -2765,10 +2766,10 @@ async function searchXianyuAlternate(opts){
     return {...res,provider:'direct'};
   }
   xianyuBlockAccount('verificación anti-bot');
-  await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. No se volverá a usar hasta que la desbloquees; mientras tanto todas las búsquedas de Xianyu van por Just One API.').catch(()=>{});
+  await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. No se volverá a usar hasta que la desbloquees; mientras tanto Xianyu va solo por Just One API (10 anuncios cada hora).').catch(()=>{});
   console.log('Xianyu (alterno): la cuenta pidió verificación; queda bloqueada y este turno pasa a Just One API.');
   xianyuMarkProvider('justoneapi');
-  return {...await searchXianyuJustOneApi({...opts,slotReserved:true}),provider:'justoneapi',accountBlocked:true};
+  return {...await searchXianyuJustOneApi({...opts,slotReserved:true,justOnePages:1}),provider:'justoneapi',accountBlocked:true};
 }
 async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
   // Xianyu es lento (visita el perfil de cada vendedor): 1 búsqueda por tarea por defecto.
