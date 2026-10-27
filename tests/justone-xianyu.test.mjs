@@ -64,6 +64,29 @@ test('normalizes image, publication time, and seller fields from one search resu
   assert.deepEqual(item.tags,['验货宝']);
 });
 
+test('uses publication time and image gallery embedded in a real search card',()=>{
+  const [item]=normalizeJustOneXianyuItems({code:0,data:{resultList:[{data:{item:{main:{
+    clickParam:{args:{item_id:'card-1',seller_id:'seller-1',publishTime:'1700000000000'}},
+    exContent:{
+      itemId:'card-1',title:'Bolso',price:1200,picUrl:'//img.example/main.jpg',
+      detailParams:{itemId:'card-1',imageInfos:JSON.stringify([{url:'//img.example/main.jpg'},{url:'https://img.example/second.jpg'}])},
+      userNickName:'Vendedora',userAvatarUrl:'https://img.example/avatar.jpg',
+      userFishShopLabel:{tagList:[{data:{content:'15条评价'}},{data:{content:'好评率80%'}}]},
+      fishTags:{r5:{tagList:[{data:{content:'验货宝'}}]}}
+    }
+  }}}}]}});
+
+  assert.equal(item.publishedAt,'2023-11-14T22:13:20.000Z');
+  assert.deepEqual(item.images,['https://img.example/main.jpg','https://img.example/second.jpg']);
+  assert.equal(item.seller,'Vendedora');
+  assert.equal(item.sellerId,'seller-1');
+  assert.equal(item.sellerAvatar,'https://img.example/avatar.jpg');
+  assert.equal(item.sellerReviewCount,15);
+  assert.equal(item.sellerReviewRate,'80%');
+  assert.deepEqual(item.sellerBadges,['15条评价','好评率80%']);
+  assert.deepEqual(item.tags,['验货宝']);
+});
+
 test('search uses the documented Just One API host, route, and parameters',async()=>{
   let requested;
   const fetchImpl=async(url,options)=>{

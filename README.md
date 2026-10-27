@@ -96,6 +96,13 @@ Los datos ausentes quedan vacíos; no se completan con otra petición. La etique
 se comprueba en cada anuncio y solo se guarda o muestra Xianyu si la lleva. El
 texto libre del vendedor no cuenta como prueba de la etiqueta.
 
+En la respuesta real de búsqueda, la fecha llega en `clickParam.args.publishTime`
+y la galería en `exContent.detailParams.imageInfos`; ambos se leen del mismo
+resultado. El apodo, ID y avatar del vendedor se conservan cuando aparecen.
+Las etiquetas del vendedor pueden aportar número de opiniones y porcentaje de
+valoraciones positivas. Antigüedad de la cuenta, crédito y ventas quedan vacíos
+si la búsqueda no devuelve esos datos.
+
 El bot ordena por `newest` y aplica una ventana máxima de 24 horas por fecha
 real de publicación (`XIANYU_SEARCH_MAX_AGE_HOURS`, 24 por defecto). Descarta
 resultados sin imagen, señal de vendedor o fecha de publicación, y no sustituye

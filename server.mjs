@@ -2396,6 +2396,7 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
     ...(detail?.['卖家信息']||oldSeller),
     '卖家昵称':it.seller||prev?.seller_name||oldSeller['卖家昵称']||null,
     '卖家ID':it.sellerId||oldSeller['卖家ID']||null,
+    '卖家头像':it.sellerAvatar||oldSeller['卖家头像']||null,
     '卖家注册天数':it.sellerRegDays??oldSeller['卖家注册天数']??null,
     '芝麻信用':it.sellerCredit??oldSeller['芝麻信用']??null,
     '卖家已售':numericOrOld(it.sellerSales,prev?.seller_sales??oldSeller['卖家已售']),
@@ -2403,15 +2404,18 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
     '卖家评价数':it.sellerReviewCount??oldSeller['卖家评价数']??null,
     '卖家好评率':it.sellerReviewRate??oldSeller['卖家好评率']??null,
     '卖家评价原始字段':it.sellerReviews??oldSeller['卖家评价原始字段']??null,
+    '卖家标签':it.sellerBadges?.length?it.sellerBadges:oldSeller['卖家标签']||[],
     'camposDisponiblesEnBusqueda':{
       name:!!(it.seller||prev?.seller_name),
       id:!!(it.sellerId||oldSeller['卖家ID']),
+      avatar:!!it.sellerAvatar,
       accountAgeDays:it.sellerRegDays!==null&&it.sellerRegDays!==undefined,
       credit:it.sellerCredit!==null&&it.sellerCredit!==undefined,
       sales:it.sellerSales!==null&&it.sellerSales!==undefined,
       activeListings:it.sellerItems!==null&&it.sellerItems!==undefined,
       reviewCount:it.sellerReviewCount!==null&&it.sellerReviewCount!==undefined,
-      reviewRate:it.sellerReviewRate!==null&&it.sellerReviewRate!==undefined
+      reviewRate:it.sellerReviewRate!==null&&it.sellerReviewRate!==undefined,
+      badges:!!it.sellerBadges?.length
     }
   };
   const raw={
