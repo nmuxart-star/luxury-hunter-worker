@@ -10,6 +10,7 @@ import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
+import {nextXianyuSearchUsage,xianyuBudgetMonth,XIANYU_MONTHLY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2333,6 +2334,19 @@ function xianyuMarkSearch(){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
+function reserveXianyuSearch(){
+  const key='xianyu_search_usage';
+  const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
+  const limit=clampInt(process.env.XIANYU_MONTHLY_SEARCH_LIMIT??XIANYU_MONTHLY_SEARCH_LIMIT,
+    XIANYU_MONTHLY_SEARCH_LIMIT,0,XIANYU_MONTHLY_SEARCH_LIMIT);
+  const next=nextXianyuSearchUsage(row?.value_json??null,xianyuBudgetMonth(),limit);
+  if(next.allowed){
+    db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+      .run(key,JSON.stringify(next.usage),new Date().toISOString());
+  }
+  return next;
+}
 
 function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   if(!it?.id||!it?.title)return {kept:false,reason:'missingCoreFields'};
@@ -2445,18 +2459,42 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
     await reportHealthIssue('xianyu-search',warning+' Las demás plataformas continúan funcionando.').catch(()=>{});
     return {ok:false,state:'unconfigured',warning,perQuery:[],kept:0};
   }
-  const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
+  // Si se perdió el artefacto de estado de GitHub, no se puede saber cuánto se
+  // gastó este mes. Pausar evita reiniciar por accidente el contador a cero.
+  if(String(process.env.GITHUB_ACTIONS||'').toLowerCase()==='true'&&process.env.LH_STATE_RESTORED!=='1'){
+    const warning='No se pudo recuperar el estado persistente; Xianyu queda pausado para proteger el presupuesto mensual.';
+    await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
+    return {ok:false,state:'state_missing',mode:'justoneapi',warning,perQuery:[],kept:0};
+  }
+  const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
   if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',mode:'justoneapi',perQuery:[],kept:0};
   }
-  const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
+  // Una sola búsqueda por ventana de tiempo, incluso si una variable antigua
+  // XIANYU_MAX_QUERIES=2 sigue presente en GitHub.
+  const maxQueries=1;
   const selected=(queries||[]).map(q=>String(q||'').trim()).filter(Boolean).slice(0,maxQueries);
+  if(selected.length){
+    let budget;
+    try{budget=reserveXianyuSearch();}
+    catch(error){
+      const warning=String(error?.message||'Presupuesto mensual de Xianyu no disponible.');
+      await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
+      return {ok:false,state:'budget_error',mode:'justoneapi',warning,perQuery:[],kept:0};
+    }
+    if(!budget.allowed){
+      const warning=`Xianyu pausado: ${budget.usage.attempts}/${budget.limit} búsquedas de Just One API usadas en ${budget.usage.month}.`;
+      await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
+      return {ok:true,state:'budget_exhausted',mode:'justoneapi',warning,perQuery:[],kept:0};
+    }
+    clearHealthIssue('xianyu-budget');
+    xianyuMarkSearch();
+  }
   const perQuery=[];
-  let kept=0,attempted=false;
+  let kept=0;
   const min=Number.isFinite(Number(minEur))&&Number(minEur)>0?Number(minEur):null;
   const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
   for(const keyword of selected){
-    attempted=true;
     try{
       const result=await searchJustOneXianyu({keyword,page:1,sort:'newest'});
       const rejected={noVerificationTag:result.missingVerificationTag,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
@@ -2475,7 +2513,6 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
       break;
     }
   }
-  if(attempted)xianyuMarkSearch();
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-justoneapi',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
   if(perQuery.length&&perQuery.every(query=>!query.error))clearHealthIssue('xianyu-search');
   return {ok:!perQuery.some(query=>query.error),mode:'justoneapi',perQuery,kept};

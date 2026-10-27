@@ -121,12 +121,18 @@ XIANYU_PROVIDER=justoneapi
 JUSTONEAPI_TOKEN=tu_token
 ```
 
-Con Just One API, Luxury Hunter hace por defecto una consulta cada seis horas.
-El modo directo en la nube conserva su ritmo anterior de dos consultas cada
-tres horas. Ajusta `XIANYU_MIN_INTERVAL_MIN`, `XIANYU_MAX_QUERIES` y
-`XIANYU_SEARCH_MAX_AGE_HOURS` según tu plan. Just One API es un proveedor
-externo: consulta sus cuotas y cargos antes de activarlo.
-Los errores se registran sin detener las demás fuentes.
+Con Just One API se hace **como máximo una búsqueda cada 60 minutos** entre
+todas las tareas, sin entrar en fichas. El límite es de **650 intentos por mes**
+(hora de Madrid); también se cuentan las peticiones fallidas. Al llegar al
+límite, Xianyu se pausa hasta el mes siguiente y las demás fuentes continúan.
+`XIANYU_MONTHLY_SEARCH_LIMIT` puede bajar el límite, pero nunca subirlo por
+encima de 650. Si el estado persistente de GitHub no se recupera, Xianyu se
+pausa para no reiniciar el contador. La tarifa publicada el 27 de octubre de
+2026 es ¥0,20 por búsqueda: 650 intentos equivalen a ¥130, aproximadamente
+17,43 € al cambio de referencia de ese día. El coste en euros puede variar si
+cambian la tarifa o el tipo de cambio. El modo directo en la nube conserva su
+ritmo anterior. `XIANYU_SEARCH_MAX_AGE_HOURS` controla la antigüedad máxima de
+los anuncios. Los errores se registran sin detener las demás fuentes.
 
 ## v1.7 — Más mercados y costes por origen
 
