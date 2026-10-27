@@ -2206,7 +2206,10 @@ function xianyuDirectMode(){
   return String(process.env.XIANYU_MODE||'direct').toLowerCase()!=='connector';
 }
 function xianyuProvider(){
-  return String(process.env.XIANYU_PROVIDER||'justoneapi').trim().toLowerCase()==='direct'?'direct':'justoneapi';
+  // alternate: una búsqueda con Just One API y la siguiente con la cuenta de
+  // Nil (modo directo), y así sucesivamente.
+  const p=String(process.env.XIANYU_PROVIDER||'justoneapi').trim().toLowerCase();
+  return p==='direct'||p==='alternate'?p:'justoneapi';
 }
 
 async function getXianyuDirect(file=xianyuActiveAccount){
@@ -2367,6 +2370,14 @@ function xianyuMarkSearch(){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
+function xianyuLastProvider(){
+  const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_provider'").get();
+  return row?.value_json==='direct'?'direct':row?.value_json==='justoneapi'?'justoneapi':null;
+}
+function xianyuMarkProvider(provider){
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_provider',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(provider,new Date().toISOString());
+}
 function reserveXianyuSearch(){
   const key='xianyu_search_usage';
   const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
@@ -2485,7 +2496,7 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   return {kept:true};
 }
 
-async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
+async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=null,sessionId,slotReserved=false}){
   const token=String(process.env.JUSTONEAPI_TOKEN||'').trim();
   if(!token){
     const warning='Just One API está seleccionado, pero falta configurar el secreto JUSTONEAPI_TOKEN.';
@@ -2500,7 +2511,7 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
     return {ok:false,state:'state_missing',mode:'justoneapi',warning,perQuery:[],kept:0};
   }
   const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
-  if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+  if(!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',mode:'justoneapi',perQuery:[],kept:0};
   }
   // Una sola búsqueda por ventana de tiempo, incluso si una variable antigua
@@ -2527,17 +2538,43 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
   let kept=0;
   const min=Number.isFinite(Number(minEur))&&Number(minEur)>0?Number(minEur):null;
   const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
+  // Páginas por búsqueda (10 anuncios cada una). Cada página es una llamada y
+  // cuenta en el cupo mensual; la primera ya se ha reservado arriba.
+  const pages=clampInt(process.env.XIANYU_JUSTONE_PAGES||1,1,1,5);
   for(const keyword of selected){
     try{
-      const result=await searchJustOneXianyu({keyword,page:1,sort:'newest'});
-      const rejected={noVerificationTag:result.missingVerificationTag,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
+      const items=[];
+      const seen=new Set();
+      let found=0,missingTag=0,requestId=null,pagesRead=0;
+      for(let page=1;page<=pages;page++){
+        if(page>1){
+          const extra=reserveXianyuSearch();
+          if(!extra.allowed){
+            await reportHealthIssue('xianyu-budget',`Xianyu pausado: ${extra.usage.attempts}/${extra.limit} búsquedas de Just One API usadas en ${extra.usage.month}.`).catch(()=>{});
+            break;
+          }
+          await sleep(1200);
+        }
+        const result=await searchJustOneXianyu({keyword,page,sort:'newest'});
+        pagesRead++;
+        requestId=requestId||result.requestId;
+        found+=result.totalFound;
+        missingTag+=result.missingVerificationTag;
+        for(const it of result.items){
+          if(it?.id&&seen.has(it.id))continue;
+          if(it?.id)seen.add(it.id);
+          items.push(it);
+        }
+        if(!result.totalFound)break;
+      }
+      const rejected={noVerificationTag:missingTag,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
       let localKept=0;
-      for(const it of result.items.slice(0,Math.max(1,Number(maxItems)))){
+      for(const it of items.slice(0,Math.max(1,Number(maxItems)))){
         const saved=saveXianyuCandidate({...it,provider:'justoneapi'},{sessionId,sourceQuery:keyword,minEur:min,maxEur:max});
         if(saved.kept){localKept++;kept++;}
         else if(rejected[saved.reason]!==undefined)rejected[saved.reason]++;
       }
-      perQuery.push({query:keyword,provider:'Just One API',requestId:result.requestId,found:result.totalFound,kept:localKept,rejected});
+      perQuery.push({query:keyword,provider:'Just One API',requestId,pages:pagesRead,found,kept:localKept,rejected});
       await sleep(1200);
     }catch(error){
       const message=String(error?.message||'Error de proveedor').slice(0,240);
@@ -2551,7 +2588,7 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
   return {ok:!perQuery.some(query=>query.error),mode:'justoneapi',perQuery,kept};
 }
 
-async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto'}){
+async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto',slotReserved=false}){
   // Como mucho una búsqueda de Xianyu cada XIANYU_MIN_INTERVAL_MIN minutos
   // (entre todas las tareas y ejecuciones). Menos peticiones = menos verificaciones.
   const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
@@ -2564,7 +2601,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   if(xianyuPausedReason){
     return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
   }
-  if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+  if(!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
   const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
@@ -2657,25 +2694,57 @@ function searchXianyuLive(opts){
   // Una búsqueda de Xianyu a la vez (misma sesión, ritmo humano).
   // Si la sesión no es válida ya se avisa una vez (xianyu-login); no repetir
   // un error por cada tarea.
+  if(xianyuProvider()==='alternate'){
+    const run=xianyuQueue.then(()=>searchXianyuAlternate(opts));
+    xianyuQueue=run.catch(()=>{});
+    return run;
+  }
   if(xianyuProvider()==='justoneapi'){
     const run=xianyuQueue.then(()=>searchXianyuJustOneApi(opts));
     xianyuQueue=run.catch(()=>{});
     return run;
   }
+  const blocked=xianyuDirectSessionBlock();
+  if(blocked)return Promise.resolve(blocked);
+  const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
+  const run=xianyuQueue.then(()=>fn(opts));
+  xianyuQueue=run.catch(()=>{});
+  return run;
+}
+function xianyuDirectSessionBlock(){
   const ss=String(process.env.XIANYU_SESSION_STATUS||'').trim();
   if(xianyuDirectMode()&&['risk_control','error'].includes(ss)){
     const warning=ss==='risk_control'
       ?'Xianyu ha pedido verificación de seguridad. Se espera a que la cuenta se revise manualmente.'
       :'No hay ninguna sesión válida de Xianyu. Renueva una de las cuentas.';
-    return Promise.resolve({ok:true,state:'paused',warning,perQuery:[],kept:0});
+    return {ok:true,state:'paused',warning,perQuery:[],kept:0};
   }
   if(ss&&ss!=='ok'&&!xianyuDirectMode()){
-    return Promise.resolve({ok:true,state:'paused',warning:`Sesión de Xianyu no disponible (${ss}).`,perQuery:[],kept:0});
+    return {ok:true,state:'paused',warning:`Sesión de Xianyu no disponible (${ss}).`,perQuery:[],kept:0};
   }
+  return null;
+}
+// Una búsqueda por ventana de XIANYU_MIN_INTERVAL_MIN, alternando entre Just
+// One API (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
+// El turno se gasta aunque la búsqueda no salga (sesión caducada, cupo
+// agotado...): así el siguiente siempre toca al otro proveedor y ni el coste
+// de Just One API ni las visitas a Xianyu con la cuenta aumentan.
+async function searchXianyuAlternate(opts){
+  const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
+  if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
+  const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
+  if(Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+    return {ok:true,state:'throttled',mode:'alternate',perQuery:[],kept:0};
+  }
+  const provider=xianyuLastProvider()==='justoneapi'?'direct':'justoneapi';
+  xianyuMarkProvider(provider);
+  xianyuMarkSearch();
+  console.log(`Xianyu (alterno): turno de ${provider==='direct'?'la cuenta de Xianyu':'Just One API'}.`);
+  if(provider==='justoneapi')return {...await searchXianyuJustOneApi({...opts,slotReserved:true}),provider};
+  const blocked=xianyuDirectSessionBlock();
+  if(blocked)return {...blocked,provider};
   const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
-  const run=xianyuQueue.then(()=>fn(opts));
-  xianyuQueue=run.catch(()=>{});
-  return run;
+  return {...await fn({...opts,slotReserved:true}),provider};
 }
 async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
   // Xianyu es lento (visita el perfil de cada vendedor): 1 búsqueda por tarea por defecto.

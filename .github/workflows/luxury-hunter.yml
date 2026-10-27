@@ -61,8 +61,11 @@ jobs:
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       JUSTONEAPI_TOKEN: ${{ secrets.JUSTONEAPI_TOKEN }}
       XIANYU_BASE_URL: http://127.0.0.1:8000
-      XIANYU_PROVIDER: ${{ vars.XIANYU_PROVIDER == 'direct' && 'direct' || 'justoneapi' }}
+      # justoneapi, direct (cuenta de Nil) o alternate (una búsqueda con cada uno).
+      XIANYU_PROVIDER: ${{ (vars.XIANYU_PROVIDER == 'direct' || vars.XIANYU_PROVIDER == 'alternate') && vars.XIANYU_PROVIDER || 'justoneapi' }}
       XIANYU_JUSTONE_SORT: ${{ vars.XIANYU_JUSTONE_SORT || 'active' }}
+      # Páginas de Just One API por búsqueda (10 anuncios y una llamada cada una).
+      XIANYU_JUSTONE_PAGES: ${{ vars.XIANYU_JUSTONE_PAGES || '1' }}
       # Xianyu con Just One API: solo una búsqueda, sin consultar fichas.
       XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || (vars.XIANYU_PROVIDER == 'direct' && '2' || '1') }}
       XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || '60' }}
@@ -183,10 +186,10 @@ jobs:
         env:
           XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
           XIANYU_MODE: ${{ vars.XIANYU_MODE }}
-          XIANYU_PROVIDER: ${{ vars.XIANYU_PROVIDER == 'direct' && 'direct' || 'justoneapi' }}
+          XIANYU_PROVIDER: ${{ (vars.XIANYU_PROVIDER == 'direct' || vars.XIANYU_PROVIDER == 'alternate') && vars.XIANYU_PROVIDER || 'justoneapi' }}
         shell: bash
         run: |
-          if [ "${XIANYU_PROVIDER:-justoneapi}" != "direct" ]; then
+          if [ "${XIANYU_PROVIDER:-justoneapi}" = "justoneapi" ]; then
             echo "XIANYU_SESSION_STATUS=not_required" >> "$GITHUB_ENV"
             echo "Just One API selected; skipping Xianyu browser sessions and connector."
             exit 0
