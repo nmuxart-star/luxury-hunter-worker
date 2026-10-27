@@ -2,7 +2,6 @@ import { extractXianyuTags, hasXianyuVerificationTag } from './xianyu-verificati
 
 const BASE_URL = 'https://api.justoneapi.com';
 const SEARCH_PATH = '/api/xianyu/search-item-list/v1';
-const DETAIL_PATH = '/api/xianyu/get-item-detail/v1';
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 const FIELD_KEYS = {
@@ -13,15 +12,19 @@ const FIELD_KEYS = {
   image: ['imageUrl', 'image_url', 'picUrl', 'pic_url', 'mainImage', 'main_image', 'cover', 'image', '商品主图链接', '商品主图'],
   images: ['images', 'imageList', 'image_list', 'imageInfos', '商品图片列表', '商品图片'],
   area: ['area', 'location', 'city', 'region', '发货地区'],
-  seller: ['sellerName', 'seller_name', 'sellerNick', 'seller_nick', 'nickName', 'userName', '卖家昵称'],
+  seller: ['sellerName', 'seller_name', 'sellerNick', 'seller_nick', 'nickName', 'userName', 'userNickName', 'nickname', '卖家昵称'],
+  sellerId: ['sellerId', 'seller_id', 'userId', 'user_id', 'uid', '卖家ID'],
+  sellerAvatar: ['userAvatarUrl', 'sellerAvatarUrl', 'avatarUrl', '卖家头像'],
   published: ['publishedAt', 'publishTime', 'publish_time', 'createTime', 'createdAt', '发布时间'],
   wants: ['wantCount', 'wantNum', 'want_num', 'likes', 'favoriteCount', 'wishCount', '“想要”人数'],
   description: ['description', 'desc', 'detail', 'itemDesc', 'productDescription', '商品描述', '宝贝描述'],
   browseCount: ['browseCount', 'browseCnt', 'viewCount', 'views', '浏览量'],
   sellerSales: ['sellerSales', 'seller_sales', 'soldCount', 'hasSoldNumInteger', 'sales', '卖家已售'],
   sellerItems: ['sellerItems', 'seller_items', 'itemCount', 'onSaleCount', '卖家在售'],
-  sellerReviews: ['sellerReviews', 'seller_reviews', 'reviewCount', 'reviews', '卖家评价数'],
-  sellerCredit: ['sellerCredit', 'creditLevel', 'credit', '芝麻信用'],
+  sellerReviews: ['sellerReviews', 'seller_reviews'],
+  sellerReviewCount: ['sellerReviewCount', 'seller_review_count', 'reviewCount', 'reviews', '评价数', '卖家评价数'],
+  sellerReviewRate: ['sellerReviewRate', 'seller_review_rate', 'reviewRate', 'goodRatio', 'newGoodRatioRate', '好评率'],
+  sellerCredit: ['sellerCredit', 'creditLevel', 'credit', '芝麻信用', 'zhimaLevelInfo'],
   sellerRegDays: ['sellerRegDays', 'userRegDay', 'registeredDays', '卖家注册天数']
 };
 
@@ -68,7 +71,7 @@ function deepValue(object, keys, depth = 0) {
   return null;
 }
 
-function scalar(value, keys = ['value', 'amount', 'text', 'name', 'url', 'src']) {
+function scalar(value, keys = ['value', 'amount', 'text', 'name', 'levelName', 'level', 'label', 'content', 'url', 'src']) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string' || typeof value === 'number') return value;
   if (Array.isArray(value)) return scalar(value[0], keys);
@@ -106,15 +109,38 @@ function imageUrl(value) {
   const raw = scalar(value, ['url', 'src', 'imageUrl', 'image_url', 'picUrl', 'pic_url']);
   if (raw === null || raw === undefined) return '';
   const url = String(raw).trim();
-  return url.startsWith('//') ? `https:${url}` : url;
+  if (url.startsWith('//')) return `https:${url}`;
+  return /^https?:\/\//i.test(url) ? url : '';
+}
+
+function imageUrls(value) {
+  if (typeof value === 'string' && /^[\[{]/.test(value.trim())) {
+    try { return imageUrls(JSON.parse(value)); }
+    catch { return []; }
+  }
+  if (Array.isArray(value)) return value.flatMap(imageUrls);
+  const url = imageUrl(value);
+  return url ? [url] : [];
 }
 
 function imageList(object) {
   const many = deepValue(object, FIELD_KEYS.images);
   const single = deepValue(object, FIELD_KEYS.image);
-  const values = Array.isArray(many) ? [...many] : many ? [many] : [];
-  if (single) values.unshift(single);
-  return [...new Set(values.map(imageUrl).filter(Boolean))];
+  return [...new Set([...imageUrls(single), ...imageUrls(many)])];
+}
+
+function sellerBadgeInfo(object) {
+  const tags = object?.userFishShopLabel?.tagList;
+  const badges = Array.isArray(tags) ? tags.map(tag => String(tag?.data?.content || tag?.content || '').trim()).filter(Boolean) : [];
+  const reviewText = badges.find(text => /条评价/.test(text)) || '';
+  const rateText = badges.find(text => /好评率/.test(text)) || '';
+  const reviewMatch = reviewText.match(/(\d+(?:\.\d+)?)\s*(万)?\s*条评价/);
+  const rateMatch = rateText.match(/好评率\s*(\d+(?:\.\d+)?)\s*%/);
+  return {
+    badges,
+    reviewCount: reviewMatch ? Number(reviewMatch[1]) * (reviewMatch[2] ? 10_000 : 1) : null,
+    reviewRate: rateMatch ? `${rateMatch[1]}%` : null
+  };
 }
 
 function normalizeCandidate(object) {
@@ -126,6 +152,7 @@ function normalizeCandidate(object) {
   if (id === null || !title || !Number.isFinite(price) || price <= 0) return null;
 
   const images = imageList(object);
+  const sellerBadges = sellerBadgeInfo(object);
   const publishedAt = normalizedTimestamp(deepValue(object, FIELD_KEYS.published));
   const rawUrl = scalar(firstOwn(object, FIELD_KEYS.url) ?? deepValue(object, FIELD_KEYS.url.filter(key => key !== 'url')));
   const itemId = String(id).trim();
@@ -138,6 +165,8 @@ function normalizeCandidate(object) {
     images,
     area: String(scalar(deepValue(object, FIELD_KEYS.area)) || ''),
     seller: String(scalar(deepValue(object, FIELD_KEYS.seller)) || ''),
+    sellerId: String(scalar(deepValue(object, FIELD_KEYS.sellerId)) || ''),
+    sellerAvatar: imageUrl(deepValue(object, FIELD_KEYS.sellerAvatar)),
     publishedAt,
     publishedLocal: publishedAt ? new Date(new Date(publishedAt).getTime() + 8 * 3600_000).toISOString().slice(0, 16).replace('T', ' ') : null,
     wants: scalar(deepValue(object, FIELD_KEYS.wants)),
@@ -146,6 +175,9 @@ function normalizeCandidate(object) {
     sellerSales: scalar(deepValue(object, FIELD_KEYS.sellerSales)),
     sellerItems: scalar(deepValue(object, FIELD_KEYS.sellerItems)),
     sellerReviews: scalar(deepValue(object, FIELD_KEYS.sellerReviews)),
+    sellerReviewCount: scalar(deepValue(object, FIELD_KEYS.sellerReviewCount)) ?? sellerBadges.reviewCount,
+    sellerReviewRate: scalar(deepValue(object, FIELD_KEYS.sellerReviewRate)) ?? sellerBadges.reviewRate,
+    sellerBadges: sellerBadges.badges,
     sellerCredit: scalar(deepValue(object, FIELD_KEYS.sellerCredit)),
     sellerRegDays: scalar(deepValue(object, FIELD_KEYS.sellerRegDays)),
     tags: extractXianyuTags(object)
@@ -164,8 +196,7 @@ function walkObjects(value, visit, depth = 0) {
 
 export function normalizeJustOneXianyuItems(payload) {
   const byId = new Map();
-  walkObjects(payload, object => {
-    const item = normalizeCandidate(object);
+  const mergeItem = item => {
     if (!item) return;
     const old = byId.get(item.id);
     if (!old) byId.set(item.id, item);
@@ -178,7 +209,29 @@ export function normalizeJustOneXianyuItems(payload) {
         if ((old[key] === '' || old[key] === null || old[key] === undefined || (Array.isArray(old[key]) && !old[key].length)) && value !== null && value !== '') old[key] = value;
       }
     }
-  });
+  };
+
+  // En la búsqueda real, la fecha está junto al anuncio, en clickParam.args,
+  // mientras que el título, las fotos y las etiquetas están en exContent.
+  const cards = Array.isArray(payload?.data?.resultList) ? payload.data.resultList : [];
+  for (const card of cards) {
+    const main = card?.data?.item?.main;
+    const item = normalizeCandidate(main?.exContent);
+    if (!item) continue;
+    const args = main?.clickParam?.args || {};
+    const contextId = String(args.item_id || args.id || main?.exContent?.detailParams?.itemId || '').trim();
+    if (!contextId || contextId === item.id) {
+      if (!item.sellerId && args.seller_id) item.sellerId = String(args.seller_id);
+      const publishedAt = normalizedTimestamp(args.publishTime);
+      if (publishedAt) {
+        item.publishedAt = publishedAt;
+        item.publishedLocal = new Date(new Date(publishedAt).getTime() + 8 * 3600_000).toISOString().slice(0, 16).replace('T', ' ');
+      }
+    }
+    mergeItem(item);
+  }
+
+  walkObjects(payload, object => mergeItem(normalizeCandidate(object)));
   return [...byId.values()];
 }
 
@@ -229,13 +282,4 @@ export async function searchJustOneXianyu({ keyword, page = 1, sort = 'active', 
   const all = normalizeJustOneXianyuItems(payload);
   const items = all.filter(item => hasXianyuVerificationTag(item.tags));
   return { items, totalFound: all.length, missingVerificationTag: all.length - items.length, requestId: payload?.requestId || null };
-}
-
-export async function getJustOneXianyuDetail({ itemId, ...options }) {
-  if (!String(itemId || '').trim()) throw new JustOneApiError('La ficha de Just One API necesita un itemId.');
-  const normalizedId = String(itemId).trim();
-  const payload = await callJustOne(DETAIL_PATH, { itemId: normalizedId }, options);
-  const items = normalizeJustOneXianyuItems(payload);
-  const item = items.find(candidate => candidate.id === normalizedId) || items[0] || null;
-  return item ? { item, requestId: payload?.requestId || null } : { item: null, requestId: payload?.requestId || null };
 }

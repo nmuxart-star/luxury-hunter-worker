@@ -1,5 +1,5 @@
-// Prueba real: busca en Xianyu, abre la ficha del primer anuncio y lo envía
-// a Telegram con fotos, enlace a la app y botones. No usa IA.
+// Prueba real: busca en Xianyu y envía el primer resultado guardado a Telegram
+// con los datos disponibles en búsqueda. No usa fichas ni IA.
 // Uso (GitHub Actions): node scripts/telegram-listing-check.mjs "<búsqueda>" <minEur> <maxEur>
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,8 +18,7 @@ try{
   const first=(s.items||[])[0];
   console.log('Xianyu:',JSON.stringify(s.status?.xianyu?.perQuery||[]));
   if(!first)throw new Error('sin resultados');
-  const d=await post('/api/xianyu/detail',{listingIds:[first.id]});
-  console.log('Ficha:',JSON.stringify(d.items?.[0]||{}).slice(0,200));
+  console.log('Búsqueda:',JSON.stringify({title:first.title,image:first.image_url,seller:first.seller_name,description:first.description}).slice(0,400));
   const t=await post('/api/telegram/test-listing',{listingId:first.id});
   console.log('Telegram:',JSON.stringify(t));
   code=t.sent?0:1;

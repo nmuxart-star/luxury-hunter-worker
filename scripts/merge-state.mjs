@@ -5,6 +5,7 @@
 // Uso: node scripts/merge-state.mjs <destino.sqlite3> <otra1.sqlite3> [otra2...]
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
+import {xianyuBudgetMonth} from './xianyu-search-budget.mjs';
 
 const [target,...others]=process.argv.slice(2);
 if(!target||!fs.existsSync(target)){console.log('merge-state: falta la base de destino');process.exit(0);}
@@ -22,6 +23,8 @@ let lastDigest=getSetting(db,'global_digest_state')?.last_sent_at||null;
 let tgOffset=Number(getSetting(db,'telegram_update_offset')||0);
 const monthNow=new Date().toISOString().slice(0,7);
 let month=(getSetting(db,'ai_spend_month')||{});if(month.month!==monthNow)month={month:monthNow,usd:0};
+let xianyuUsage=getSetting(db,'xianyu_search_usage');
+const xianyuMonth=xianyuBudgetMonth();
 
 const listingCols=cols(db,'listings').filter(c=>c!=='id');
 const analysisCols=hasTable(db,'task_analyses')?cols(db,'task_analyses').filter(c=>!['id','task_id','listing_id'].includes(c)):[];
@@ -82,6 +85,9 @@ for(const file of others){
   tgOffset=Math.max(tgOffset,Number(getSetting(src,'telegram_update_offset')||0));
   const sm=getSetting(src,'ai_spend_month');
   if(sm?.month===monthNow&&Number(sm.usd||0)>Number(month.usd||0))month=sm;
+  const xu=getSetting(src,'xianyu_search_usage');
+  if(xu?.month===xianyuMonth&&Number.isSafeInteger(xu.attempts)&&xu.attempts>=0&&
+      (xianyuUsage?.month!==xianyuMonth||xu.attempts>Number(xianyuUsage.attempts||0)))xianyuUsage=xu;
   src.close();
 }
 const cur=getSetting(db,'ai_spend');
@@ -89,4 +95,5 @@ putSetting('ai_spend',{...(cur?.day===today?cur:{day:today,calls:0,webSearches:0
 if(lastDigest)putSetting('global_digest_state',{...(getSetting(db,'global_digest_state')||{}),last_sent_at:lastDigest});
 if(tgOffset)putSetting('telegram_update_offset',tgOffset);
 if(month.usd)putSetting('ai_spend_month',month);
+if(xianyuUsage?.month===xianyuMonth&&Number.isSafeInteger(xianyuUsage.attempts))putSetting('xianyu_search_usage',xianyuUsage);
 console.log(`merge-state: +${stats.listings} anuncios, +${stats.analyses} análisis, +${stats.notifications} avisos, +${stats.feedback} valoraciones; gasto IA hoy ${spendToday.toFixed(2)} $; último resumen ${lastDigest||'-'}`);

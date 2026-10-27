@@ -9,7 +9,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
-import {getJustOneXianyuDetail,searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
+import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
+import {nextXianyuSearchUsage,xianyuBudgetMonth,XIANYU_MONTHLY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2333,47 +2334,119 @@ function xianyuMarkSearch(){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
+function reserveXianyuSearch(){
+  const key='xianyu_search_usage';
+  const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
+  const limit=clampInt(process.env.XIANYU_MONTHLY_SEARCH_LIMIT??XIANYU_MONTHLY_SEARCH_LIMIT,
+    XIANYU_MONTHLY_SEARCH_LIMIT,0,XIANYU_MONTHLY_SEARCH_LIMIT);
+  const next=nextXianyuSearchUsage(row?.value_json??null,xianyuBudgetMonth(),limit);
+  if(next.allowed){
+    db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+      .run(key,JSON.stringify(next.usage),new Date().toISOString());
+  }
+  return next;
+}
 
 function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   if(!it?.id||!it?.title)return {kept:false,reason:'missingCoreFields'};
   if(!hasXianyuVerificationTag(it.tags))return {kept:false,reason:'noVerificationTag'};
   if(!Number.isFinite(Number(it.price))||Number(it.price)<=0)return {kept:false,reason:'invalidPrice'};
+
+  const prev=db.prepare('SELECT description,raw_json,seller_sales,seller_items,seller_reviews,seller_name,image_url FROM listings WHERE source=? AND source_id=?').get('xianyu',it.id);
+  let prevRaw={};
+  try{prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};}catch{}
+  const oldInfo=prevRaw?.['商品信息']||{};
+  const oldSeller=prevRaw?.['卖家信息']||{};
+
+  const searchImages=Array.isArray(it.images)?it.images.filter(Boolean):[];
+  if(it.image&&!searchImages.includes(it.image))searchImages.unshift(it.image);
+  const hasImage=searchImages.length>0||!!prev?.image_url||!!oldInfo['商品主图链接'];
+  if(!hasImage)return {kept:false,reason:'missingImage'};
+
+  const sellerValues=[it.seller,it.sellerId,it.sellerSales,it.sellerItems,it.sellerRegDays,it.sellerCredit,it.sellerReviews,it.sellerReviewCount,it.sellerReviewRate,
+    prev?.seller_name,prev?.seller_sales,prev?.seller_items,oldSeller['卖家ID'],oldSeller['芝麻信用'],oldSeller['卖家注册天数']];
+  if(!sellerValues.some(value=>value!==null&&value!==undefined&&String(value).trim()!==''))return {kept:false,reason:'missingSellerInfo'};
+
+  const publishValue=it.publishedAt||prevRaw.publishedAt||it.publishedLocal||oldInfo['发布时间'];
+  const publishedMs=parseMarketplacePublishedMs(publishValue,'+08:00');
+  if(publishedMs===null)return {kept:false,reason:'missingPublicationTime'};
+  const maxAgeHours=clampInt(process.env.XIANYU_SEARCH_MAX_AGE_HOURS??24,24,1,720);
+  const ageMs=Date.now()-publishedMs;
+  if(ageMs>maxAgeHours*3600e3)return {kept:false,reason:'listingTooOld'};
+  if(ageMs< -10*60e3)return {kept:false,reason:'futurePublication'};
+
   const pe=toEur(it.price,'CNY');
   const lo=minEur===null||minEur===undefined||minEur===''?NaN:Number(minEur);
   const hi=maxEur===null||maxEur===undefined||maxEur===''?NaN:Number(maxEur);
   if(Number.isFinite(lo)&&pe!=null&&pe<lo)return {kept:false,reason:'belowMin'};
   if(Number.isFinite(hi)&&hi>0&&pe!=null&&pe>hi)return {kept:false,reason:'aboveMax'};
 
-  // Si ya se abrió la ficha antes, no perder descripción, fotos ni vendedor.
-  const prev=db.prepare('SELECT description,raw_json,seller_sales,seller_items,seller_name FROM listings WHERE source=? AND source_id=?').get('xianyu',it.id);
-  let prevRaw={};
-  try{prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};}catch{}
+  // Aprovecha todos los campos que llegaron en la búsqueda y conserva datos
+  // completos de registros anteriores sin volver a consultar la ficha.
   const detail=prevRaw?.detailFetched?prevRaw:null;
-  const oldInfo=prevRaw?.['商品信息']||{};
+  const oldImages=Array.isArray(oldInfo['商品图片列表'])?oldInfo['商品图片列表']:
+    (oldInfo['商品主图链接']?[oldInfo['商品主图链接']]:[]);
+  const images=searchImages.length?searchImages:oldImages;
+  const numericOrOld=(value,oldValue)=>value!==null&&value!==undefined&&value!==''&&Number.isFinite(Number(value))?Number(value):oldValue??null;
+  const publishedAt=new Date(publishedMs).toISOString();
+  const publishedLocal=it.publishedLocal||new Date(publishedMs+8*3600e3).toISOString().slice(0,16).replace('T',' ');
   const currentInfo={
     ...(detail?.['商品信息']||{}),
     '商品ID':it.id,
     '商品标题':it.title,
     '当前售价':it.price,
     '商品链接':it.url,
-    '商品主图链接':it.image||oldInfo['商品主图链接']||'',
+    '商品主图链接':it.image||images[0]||oldInfo['商品主图链接']||'',
+    '商品图片列表':images,
+    '商品描述':it.description||oldInfo['商品描述']||'',
     '发货地区':it.area,
     '“想要”人数':it.wants,
     '商品标签':it.tags,
-    '发布时间':it.publishedLocal||oldInfo['发布时间']||null
+    '浏览量':it.browseCount??oldInfo['浏览量']??null,
+    '发布时间':publishedLocal
+  };
+  const sellerInfo={
+    ...(detail?.['卖家信息']||oldSeller),
+    '卖家昵称':it.seller||prev?.seller_name||oldSeller['卖家昵称']||null,
+    '卖家ID':it.sellerId||oldSeller['卖家ID']||null,
+    '卖家头像':it.sellerAvatar||oldSeller['卖家头像']||null,
+    '卖家注册天数':it.sellerRegDays??oldSeller['卖家注册天数']??null,
+    '芝麻信用':it.sellerCredit??oldSeller['芝麻信用']??null,
+    '卖家已售':numericOrOld(it.sellerSales,prev?.seller_sales??oldSeller['卖家已售']),
+    '卖家在售':numericOrOld(it.sellerItems,prev?.seller_items??oldSeller['卖家在售']),
+    '卖家评价数':it.sellerReviewCount??oldSeller['卖家评价数']??null,
+    '卖家好评率':it.sellerReviewRate??oldSeller['卖家好评率']??null,
+    '卖家评价原始字段':it.sellerReviews??oldSeller['卖家评价原始字段']??null,
+    '卖家标签':it.sellerBadges?.length?it.sellerBadges:oldSeller['卖家标签']||[],
+    'camposDisponiblesEnBusqueda':{
+      name:!!(it.seller||prev?.seller_name),
+      id:!!(it.sellerId||oldSeller['卖家ID']),
+      avatar:!!it.sellerAvatar,
+      accountAgeDays:it.sellerRegDays!==null&&it.sellerRegDays!==undefined,
+      credit:it.sellerCredit!==null&&it.sellerCredit!==undefined,
+      sales:it.sellerSales!==null&&it.sellerSales!==undefined,
+      activeListings:it.sellerItems!==null&&it.sellerItems!==undefined,
+      reviewCount:it.sellerReviewCount!==null&&it.sellerReviewCount!==undefined,
+      reviewRate:it.sellerReviewRate!==null&&it.sellerReviewRate!==undefined,
+      badges:!!it.sellerBadges?.length
+    }
   };
   const raw={
     ...(detail||{}),
     '商品信息':currentInfo,
-    publishedAt:it.publishedAt||null,
+    '卖家信息':sellerInfo,
+    publishedAt,
     searchOnly:!detail,
     ...(it.provider?{dataProvider:it.provider}:prevRaw.dataProvider?{dataProvider:prevRaw.dataProvider}:{})
   };
   upsertListing({
-    source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:detail?prev.description:(it.description||''),
+    source:'xianyu',source_id:it.id,url:it.url,title:it.title,description:it.description||prev?.description||'',
     original_price:it.price,currency:'CNY',price_eur:pe,seller_name:it.seller||prev?.seller_name||'',
-    image_url:it.image||oldInfo['商品主图链接']||'',
-    seller_sales:detail?prev.seller_sales:(Number(it.sellerSales)||null),seller_items:detail?prev.seller_items:(Number(it.sellerItems)||null),
+    image_url:it.image||images[0]||oldInfo['商品主图链接']||'',
+    seller_sales:detail?prev.seller_sales:numericOrOld(it.sellerSales,prev?.seller_sales),
+    seller_items:detail?prev.seller_items:numericOrOld(it.sellerItems,prev?.seller_items),
+    seller_reviews:numericOrOld(it.sellerReviewCount,prev?.seller_reviews),
     status:'',purchase_via:'China agent',raw
   },sessionId,sourceQuery);
   return {kept:true};
@@ -2386,21 +2459,45 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
     await reportHealthIssue('xianyu-search',warning+' Las demás plataformas continúan funcionando.').catch(()=>{});
     return {ok:false,state:'unconfigured',warning,perQuery:[],kept:0};
   }
-  const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
+  // Si se perdió el artefacto de estado de GitHub, no se puede saber cuánto se
+  // gastó este mes. Pausar evita reiniciar por accidente el contador a cero.
+  if(String(process.env.GITHUB_ACTIONS||'').toLowerCase()==='true'&&process.env.LH_STATE_RESTORED!=='1'){
+    const warning='No se pudo recuperar el estado persistente; Xianyu queda pausado para proteger el presupuesto mensual.';
+    await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
+    return {ok:false,state:'state_missing',mode:'justoneapi',warning,perQuery:[],kept:0};
+  }
+  const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
   if(minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',mode:'justoneapi',perQuery:[],kept:0};
   }
-  const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
+  // Una sola búsqueda por ventana de tiempo, incluso si una variable antigua
+  // XIANYU_MAX_QUERIES=2 sigue presente en GitHub.
+  const maxQueries=1;
   const selected=(queries||[]).map(q=>String(q||'').trim()).filter(Boolean).slice(0,maxQueries);
+  if(selected.length){
+    let budget;
+    try{budget=reserveXianyuSearch();}
+    catch(error){
+      const warning=String(error?.message||'Presupuesto mensual de Xianyu no disponible.');
+      await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
+      return {ok:false,state:'budget_error',mode:'justoneapi',warning,perQuery:[],kept:0};
+    }
+    if(!budget.allowed){
+      const warning=`Xianyu pausado: ${budget.usage.attempts}/${budget.limit} búsquedas de Just One API usadas en ${budget.usage.month}.`;
+      await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
+      return {ok:true,state:'budget_exhausted',mode:'justoneapi',warning,perQuery:[],kept:0};
+    }
+    clearHealthIssue('xianyu-budget');
+    xianyuMarkSearch();
+  }
   const perQuery=[];
-  let kept=0,attempted=false;
+  let kept=0;
   const min=Number.isFinite(Number(minEur))&&Number(minEur)>0?Number(minEur):null;
   const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
   for(const keyword of selected){
-    attempted=true;
     try{
-      const result=await searchJustOneXianyu({keyword,page:1,sort:String(process.env.XIANYU_JUSTONE_SORT||'active')});
-      const rejected={noVerificationTag:result.missingVerificationTag,missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
+      const result=await searchJustOneXianyu({keyword,page:1,sort:'newest'});
+      const rejected={noVerificationTag:result.missingVerificationTag,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
       let localKept=0;
       for(const it of result.items.slice(0,Math.max(1,Number(maxItems)))){
         const saved=saveXianyuCandidate({...it,provider:'justoneapi'},{sessionId,sourceQuery:keyword,minEur:min,maxEur:max});
@@ -2416,7 +2513,6 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
       break;
     }
   }
-  if(attempted)xianyuMarkSearch();
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-justoneapi',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
   if(perQuery.length&&perQuery.every(query=>!query.error))clearHealthIssue('xianyu-search');
   return {ok:!perQuery.some(query=>query.error),mode:'justoneapi',perQuery,kept};
@@ -2505,7 +2601,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       perQuery.push({query:keyword,risk:true});
       break;
     }
-    const rejected={noVerificationTag:0,missingCoreFields:0,invalidPrice:0,belowMin:0,aboveMax:0};
+    const rejected={noVerificationTag:0,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
     let localKept=0;
     for(const it of res.items.slice(0,Math.max(1,Number(maxItems)))){
       const result=saveXianyuCandidate(it,{sessionId,sourceQuery:keyword,minEur,maxEur});
@@ -2521,118 +2617,6 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   clearHealthIssue('xianyu-risk');
   clearHealthIssue('xianyu-search');
   return {ok:true,mode:'direct',perQuery,kept};
-}
-
-// ── XIANYU DETAIL V1 ────────────────────────────────────────────────────
-// Solo para los pocos anuncios que pasan el triaje: abre la ficha (fotos,
-// descripción, vendedor) con un límite por hora. Si Xianyu pide
-// verificación, se dejan de abrir fichas un rato (la búsqueda sigue).
-const XIANYU_DETAIL_API='h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/';
-const xianyuDetailLog=[];
-let xianyuDetailPausedAt=0;
-let xianyuDetailPauseLen=XIANYU_PAUSE_MS;
-
-function xianyuDetailBudgetLeft(){
-  if(xianyuPausedReason&&xianyuProvider()==='direct')return 0;
-  const perHour=clampInt(process.env.XIANYU_DETAIL_PER_HOUR??4,4,0,20);
-  const now=Date.now();
-  while(xianyuDetailLog.length&&now-xianyuDetailLog[0]>3600e3)xianyuDetailLog.shift();
-  if(now-xianyuDetailPausedAt<xianyuDetailPauseLen)return 0;
-  return Math.max(0,perHour-xianyuDetailLog.length);
-}
-
-async function fetchXianyuDetailOnce(sourceId){
-  const x=await getXianyuDirect();
-  const page=await x.context.newPage();
-  try{
-    const resp=page.waitForResponse(r=>r.url().includes(XIANYU_DETAIL_API)&&r.request().method()==='POST',{timeout:30000});
-    await page.goto(`https://www.goofish.com/item?id=${encodeURIComponent(sourceId)}`,{waitUntil:'domcontentloaded',timeout:40000});
-    let json=null;
-    try{json=await (await resp).json();}catch{}
-    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
-    if(!json?.data?.itemDO)return {missing:true};
-    return {ok:true,item:json.data.itemDO,seller:json.data.sellerDO||{}};
-  }finally{
-    await page.close().catch(()=>{});
-  }
-}
-
-async function fetchJustOneXianyuDetailOnce(sourceId){
-  const result=await getJustOneXianyuDetail({itemId:sourceId});
-  return result.item?{ok:true,item:result.item}:{missing:true};
-}
-
-async function enrichXianyuDetails(items){
-  if(!xianyuDirectMode()&&xianyuProvider()!=='justoneapi')return {fetched:0};
-  let fetched=0,skipped=0;
-  for(const item of items||[]){
-    if(item.source!=='xianyu')continue;
-    let raw={};
-    try{raw=JSON.parse(item.raw_json||'{}');}catch{}
-    if(raw.detailFetched)continue;
-    if(xianyuDetailBudgetLeft()<=0){skipped++;continue;}
-    xianyuDetailLog.push(Date.now());
-    // Misma cola que las búsquedas: nunca dos páginas de Xianyu a la vez.
-    const useJustOneApi=xianyuProvider()==='justoneapi';
-    const run=xianyuQueue.then(()=>useJustOneApi?fetchJustOneXianyuDetailOnce(item.source_id):fetchXianyuDetailOnce(item.source_id));
-    xianyuQueue=run.catch(()=>{});
-    const res=await run.catch(e=>({error:e.message}));
-    if(res?.error){
-      const message=String(res.error).slice(0,240);
-      console.error(`Xianyu detail ${useJustOneApi?'Just One API':'direct'}: ${message}`);
-      if(useJustOneApi)await reportHealthIssue('xianyu-detail',`Just One API no pudo cargar una ficha de Xianyu: ${message}.`).catch(()=>{});
-      continue;
-    }
-    if(res?.risk){
-      xianyuDetailPausedAt=Date.now();
-      xianyuDetailPauseLen=XIANYU_RISK_PAUSE_MS;
-      console.log('Xianyu detail: verificación anti-bot; no se abren más fichas durante 2 h (la búsqueda sigue).');
-      break;
-    }
-    if(!res?.ok)continue;
-    const ido=res.item, sdo=res.seller||{};
-    let images=useJustOneApi
-      ?(ido.images||[]).map(image=>String(image||'').replace(/^\/\//,'https://')).filter(Boolean)
-      :(ido.imageInfos||[]).map(i=>String(i?.url||'').replace(/^\/\//,'https://')).filter(Boolean);
-    if(!images.length){
-      const oldImage=String(raw?.['商品信息']?.['商品主图链接']||item.image_url||'').trim();
-      if(oldImage)images=[oldImage];
-    }
-    const info={
-      ...(raw['商品信息']||{}),
-      ...(useJustOneApi&&ido.description?{'商品描述':ido.description}:{}),
-      '商品图片列表':images,
-      '“想要”人数':(useJustOneApi?ido.wants:ido.wantCnt)??raw?.['商品信息']?.['“想要”人数'],
-      '浏览量':useJustOneApi?ido.browseCount??null:ido.browseCnt??null
-    };
-    const sellerInfo=useJustOneApi?{
-      '卖家注册天数':ido.sellerRegDays??null,
-      '芝麻信用':ido.sellerCredit??null,
-      '卖家已售':ido.sellerSales??null,
-      '卖家在售':ido.sellerItems??null,
-      '好评率':ido.sellerReviews??null
-    }:{
-      '卖家注册天数':sdo.userRegDay??null,
-      '芝麻信用':sdo?.zhimaLevelInfo?.levelName||null,
-      '卖家已售':sdo.hasSoldNumInteger??null,
-      '卖家在售':sdo.itemCount??null,
-      '好评率':sdo.newGoodRatioRate??null
-    };
-    const newRaw={...raw,'商品信息':info,'卖家信息':sellerInfo,detailFetched:new Date().toISOString(),searchOnly:false};
-    const desc=String((useJustOneApi?ido.description:ido.desc)||'').trim();
-    const sellerSales=useJustOneApi?Number(ido.sellerSales):Number(sdo.hasSoldNumInteger);
-    const sellerItems=useJustOneApi?Number(ido.sellerItems):Number(sdo.itemCount);
-    db.prepare('UPDATE listings SET description=?,raw_json=?,image_url=COALESCE(NULLIF(?,\'\'),image_url),seller_sales=?,seller_items=? WHERE id=?')
-      .run(desc||item.description||'',JSON.stringify(newRaw),images[0]||'',sellerSales||null,sellerItems||null,Number(item.id));
-    item.description=desc||item.description||'';
-    item.raw_json=JSON.stringify(newRaw);
-    if(images[0])item.image_url=images[0];
-    fetched++;
-    if(useJustOneApi)clearHealthIssue('xianyu-detail');
-    await sleep(3000+Math.random()*3000);
-  }
-  if(fetched||skipped)console.log(`Xianyu detail: ${fetched} fichas abiertas${skipped?`, ${skipped} sin abrir por límite horario`:''}.`);
-  return {fetched,skipped};
 }
 
 let xianyuQueue=Promise.resolve();
@@ -8789,52 +8773,9 @@ async function resolveXianyuShortLink(href){
 }
 
 async function importManualXianyu(sourceId){
-  let it=null;
-  if(xianyuProvider()==='justoneapi'){
-    const d=(await getJustOneXianyuDetail({itemId:sourceId})).item;
-    if(d)it={
-      title:d.title,price:Number(d.price),description:d.description,images:d.images||[],tags:d.tags||[],
-      area:d.area,wants:d.wants,browse:d.browseCount,publishedAt:d.publishedAt||null,publishedLocal:d.publishedLocal||null,
-      sales:Number(d.sellerSales)||null,items:Number(d.sellerItems)||null,
-      seller:{'卖家注册天数':d.sellerRegDays??null,'芝麻信用':d.sellerCredit??null,'卖家已售':d.sellerSales??null,'卖家在售':d.sellerItems??null,'好评率':d.sellerReviews??null}
-    };
-  }else{
-    if((xianyuPausedReason&&xianyuPauseCode==='risk')||Date.now()-xianyuDetailPausedAt<xianyuDetailPauseLen){
-      throw new Error('Xianyu está en pausa por una verificación anti-bot. Vuelve a probar en unas horas.');
-    }
-    const run=xianyuQueue.then(()=>fetchXianyuDetailOnce(sourceId));
-    xianyuQueue=run.catch(()=>{});
-    const res=await run;
-    if(res?.risk){
-      xianyuDetailPausedAt=Date.now();
-      xianyuDetailPauseLen=XIANYU_RISK_PAUSE_MS;
-      throw new Error('Xianyu ha pedido una verificación anti-bot al abrir la ficha. Vuelve a probar en unas horas.');
-    }
-    if(res?.ok){
-      const ido=res.item, sdo=res.seller||{};
-      it={
-        title:ido.title,price:Number(ido.soldPrice??ido.price??ido.defaultPrice),description:ido.desc,
-        images:(ido.imageInfos||[]).map(i=>String(i?.url||'').replace(/^\/\//,'https://')).filter(Boolean),
-        tags:extractXianyuTags(ido),wants:ido.wantCnt,browse:ido.browseCnt,
-        sales:Number(sdo.hasSoldNumInteger)||null,items:Number(sdo.itemCount)||null,
-        seller:{'卖家注册天数':sdo.userRegDay??null,'芝麻信用':sdo?.zhimaLevelInfo?.levelName||null,'卖家已售':sdo.hasSoldNumInteger??null,'卖家在售':sdo.itemCount??null,'好评率':sdo.newGoodRatioRate??null}
-      };
-    }
-  }
-  if(!it?.title||!Number.isFinite(it.price)||it.price<=0)throw new Error('No he podido leer ese anuncio de Xianyu (puede que esté vendido o retirado).');
-  const url=`https://www.goofish.com/item?id=${sourceId}`;
-  return upsertListing({
-    source:'xianyu',source_id:sourceId,url,title:it.title,description:String(it.description||'').trim(),
-    original_price:it.price,currency:'CNY',price_eur:toEur(it.price,'CNY'),seller_name:'',
-    seller_sales:it.sales,seller_items:it.items,image_url:it.images[0]||'',status:'',purchase_via:'China agent',
-    raw:{
-      '商品信息':{'商品ID':sourceId,'商品标题':it.title,'当前售价':it.price,'商品链接':url,'商品主图链接':it.images[0]||'',
-        '发货地区':it.area||null,'“想要”人数':it.wants??null,'商品标签':it.tags,'发布时间':it.publishedLocal||null,
-        '商品图片列表':it.images,'浏览量':it.browse??null},
-      '卖家信息':it.seller,publishedAt:it.publishedAt||null,detailFetched:new Date().toISOString(),searchOnly:false,
-      dataProvider:xianyuProvider(),addedBy:'telegram'
-    }
-  });
+  const existing=db.prepare('SELECT id FROM listings WHERE source=? AND source_id=?').get('xianyu',String(sourceId));
+  if(existing?.id)return Number(existing.id);
+  throw new Error('No consultaré la ficha de Xianyu. Primero deja que una búsqueda encuentre el anuncio; después podrás abrirlo desde el resultado guardado.');
 }
 
 async function importManualBunjang(sourceId){
@@ -9806,17 +9747,10 @@ async function executeTask(taskId, runId=null) {
         pendingItems=pendingItems.slice(0,maxAiItems);
         console.log(`Task ${taskId}: ${deferred} anuncios menos prioritarios aplazados a la siguiente ejecución.`);
       }
-      // Xianyu: abrir la ficha completa solo de los candidatos que van a
-      // análisis (mejor puntuación de triaje primero).
+      // Xianyu funciona en modo búsqueda únicamente para evitar cargos de ficha.
       const xianyuPending=pendingItems.filter(x=>x.source==='xianyu');
       if(xianyuPending.length){
-        try{
-          result.status.xianyuDetail=await enrichXianyuDetails(
-            [...xianyuPending].sort((a,b)=>(b._triageScore??-1)-(a._triageScore??-1))
-          );
-        }catch(e){
-          console.error(`Task ${taskId}: fichas de Xianyu no disponibles:`,e.message);
-        }
+        result.status.xianyuDetail={fetched:0,skipped:xianyuPending.length,mode:'search-only'};
       }
       dayCounts.counts[taskId]=Number(dayCounts.counts[taskId]||0)+pendingItems.filter(x=>!x._needsVerification).length;
       db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_task_day',?,?)
@@ -11785,9 +11719,7 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='POST'&&u.pathname==='/api/xianyu/detail'){
       const b=await readBody(req);
       const ids=(Array.isArray(b.listingIds)?b.listingIds:[b.listingId]).map(Number).filter(Boolean);
-      const items=ids.map(id=>db.prepare('SELECT * FROM listings WHERE id=?').get(id)).filter(Boolean);
-      const r=await enrichXianyuDetails(items);
-      return json(res,200,{...r,items:ids.map(id=>{const l=db.prepare('SELECT id,title,description,seller_sales,raw_json FROM listings WHERE id=?').get(id);let raw={};try{raw=JSON.parse(l?.raw_json||'{}');}catch{}return l?{id:l.id,title:l.title,desc:String(l.description||'').slice(0,80),sales:l.seller_sales,images:(raw['商品信息']?.['商品图片列表']||[]).length,seller:raw['卖家信息']||null}:null;})});
+      return json(res,200,{fetched:0,skipped:ids.length,mode:'search-only',message:'Las fichas detalladas de Xianyu están desactivadas; el bot usa solo los datos devueltos por búsqueda.'});
     }
     if(req.method==='POST'&&u.pathname==='/api/search/global'){const b=await readBody(req);return json(res,200,await globalSearch(b));}
     if(req.method==='GET'&&u.pathname==='/api/search/latest'){
