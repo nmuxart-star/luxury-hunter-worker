@@ -1757,107 +1757,140 @@ async function fetchBunjangPublication(item){
 }
 
 
-// Confianza en Bunjang: si el anuncio tiene 번개케어 (verificación de
-// autenticidad de Bunjang) y la nota/reseñas/ventas de la tienda. Una sola
-// petición a la API pública de la ficha; no se guarda el nombre del vendedor.
-async function fetchBunjangTrust(id){
+// ── BUNJANG: WEB COREANA ─────────────────────────────────────────────────
+// m.bunjang.co.kr manda a Bunjang Global (globalbunjang.com) a quien entra
+// desde fuera de Corea, y allí hay menos anuncios y otro formato. Por eso se
+// usan directamente las APIs de la web coreana: el buscador ordenado por
+// "más recientes" y la ficha de cada anuncio. El envío lo gestiona Nil.
+const BUNJANG_API='https://api.bunjang.co.kr';
+const BUNJANG_HEADERS={'user-agent':'Mozilla/5.0','accept':'application/json','origin':'https://m.bunjang.co.kr','referer':'https://m.bunjang.co.kr/'};
+
+// Primera página del buscador coreano (unos 60 anuncios, los más recientes).
+async function bunjangKoreaSearch(q){
+  const params=new URLSearchParams({q,sort:'latest'});
+  const r=await fetch(`${BUNJANG_API}/api/search/v8/pw/product/specs/keyword?${params}`,{headers:BUNJANG_HEADERS,signal:AbortSignal.timeout(20000)});
+  if(!r.ok)throw new Error(`buscador de Bunjang HTTP ${r.status}`);
+  const j=await r.json();
+  const grid=(j?.data?.searchSpec?.uiBlockList||[]).find(b=>b?.id==='mainGrid'||b?.blockType==='productList.grid.main')?.searchResponse;
+  // Fuera los anuncios patrocinados de otras webs (EXT_AD) y los de pago.
+  return {items:(grid?.data||[]).filter(x=>x?.type==='PRODUCT'&&x?.pid&&x?.ad!==true),total:Number(grid?.totalCount)||null};
+}
+
+// Ficha de la web coreana: descripción, fotos, 번개케어 y la nota, reseñas y
+// ventas de la tienda. No se guarda el nombre del vendedor.
+async function fetchBunjangDetail(id){
   try{
-    const r=await fetch(`https://api.bunjang.co.kr/api/pms/v3/products-detail/${encodeURIComponent(id)}?viewerUid=-1`,{
-      headers:{'user-agent':'Mozilla/5.0','accept':'application/json'},
-      signal:AbortSignal.timeout(15000)
-    });
+    const r=await fetch(`${BUNJANG_API}/api/pms/v3/products-detail/${encodeURIComponent(id)}?viewerUid=-1`,{headers:BUNJANG_HEADERS,signal:AbortSignal.timeout(15000)});
     if(!r.ok)return null;
     const d=(await r.json())?.data||{};
     const p=d.product||{}, sh=d.shop||{};
+    const tpl=String(p.imageUrl||'');
+    const count=Math.min(10,Math.max(1,Number(p.imageCount)||1));
+    const images=tpl?Array.from({length:count},(_,i)=>tpl.replace('{cnt}',String(i+1)).replace('{res}','900')):[];
+    const num=v=>Number.isFinite(Number(v))?Number(v):null;
     return {
-      care:p.care===true,
-      inspectionStatus:p.inspectionStatus||null,
-      rating:Number.isFinite(Number(sh.reviewRating))?Number(sh.reviewRating):null,
-      reviewCount:Number.isFinite(Number(sh.reviewCount))?Number(sh.reviewCount):null,
-      salesCount:Number.isFinite(Number(sh.salesCount))?Number(sh.salesCount):null,
-      proshop:sh.proshop?.isProshop===true,
+      name:String(p.name||''),
+      price:num(p.price),
       description:String(p.description||'').slice(0,4000),
-      checkedAt:new Date().toISOString()
+      images,
+      saleStatus:p.saleStatus||null,
+      condition:p.condition||null,
+      updatedAt:p.updatedAt||null,
+      trust:{
+        care:p.care===true,
+        inspectionStatus:p.inspectionStatus||null,
+        rating:num(sh.reviewRating),
+        reviewCount:num(sh.reviewCount),
+        salesCount:num(sh.salesCount),
+        proshop:sh.proshop?.isProshop===true,
+        checkedAt:new Date().toISOString()
+      }
     };
   }catch{return null;}
 }
+async function fetchBunjangTrust(id){
+  const d=await fetchBunjangDetail(id);
+  return d?{...d.trust,description:d.description}:null;
+}
 
-async function searchBunjangLive({ queries, pages=1, maxItems=20, minEur=null, maxEur=null, sessionId }) {
+async function searchBunjangLive({ queries, maxItems=60, minEur=null, maxEur=null, sessionId }) {
   const maxQueries = clampInt(process.env.BUNJANG_MAX_QUERIES || 2, 2, 1, 5);
   const selectedQueries = (queries || []).slice(0, maxQueries);
   const unique = new Map();
   const perQuery = [];
   for (const q0 of selectedQueries) {
     const q = String(q0).trim(); if (!q) continue;
-    const s = await runBunjangCli(['--json','--preferred-transport','browser','search',q,'--sort','date','--pages',String(pages),'--max-items',String(maxItems)]);
-    const ids = (s.items || []).map(x => x.id).filter(Boolean);
-    ids.forEach(id => { if (!unique.has(String(id))) unique.set(String(id), q); });
-    perQuery.push({ query:q, count:ids.length });
+    try{
+      const res=await bunjangKoreaSearch(q);
+      const found=res.items.slice(0,Math.max(1,Number(maxItems)||60));
+      for(const it of found)if(!unique.has(String(it.pid)))unique.set(String(it.pid),{it,q});
+      perQuery.push({ query:q, count:found.length, total:res.total });
+    }catch(e){
+      perQuery.push({ query:q, count:0, error:e.message });
+    }
     await sleep(700);
   }
-  let details = [];
-  for (const group of chunks([...unique.keys()], 40)) {
-    if (!group.length) continue;
-    const d = await runBunjangCli(['--json','item','list','--ids',group.join(',')]);
-    details.push(...(d.items || []));
-  }
-  let kept=0;
-  for (const item of details) {
-    const p = Number(item.price);
+  let kept=0, detailed=0;
+  for (const [pid,{it,q}] of unique) {
+    const p = Number(it.price);
     const pe = toEur(p, 'KRW');
-    if (!Number.isFinite(p)) continue;
+    if (!Number.isFinite(p) || p<=0) continue;
     if (Number.isFinite(Number(minEur)) && pe != null && pe < Number(minEur)) continue;
     if (Number.isFinite(Number(maxEur)) && pe != null && pe > Number(maxEur)) continue;
-    const sourceQuery = unique.get(String(item.id)) || '';
 
-    // Fecha de publicación: si el anuncio ya se vio en otra ejecución, se
-    // reutiliza la que se guardó y no se vuelve a abrir su página.
-    let publication=null;
+    // La ficha (descripción, fotos, Care y valoraciones) se reutiliza 3 días.
+    let prev=null, prevRaw={};
     try{
-      const prev=db.prepare("SELECT raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(String(item.id));
-      const pr=prev?JSON.parse(prev.raw_json||'{}'):null;
-      if(pr?.publishedAt&&pr?.luxuryHunterPublication?.status&&pr.luxuryHunterPublication.status!=='UNKNOWN'){
-        publication={publishedAt:pr.publishedAt||null,ageText:pr.luxuryHunterPublication.ageText||null,source:'cache',sourceValue:pr.luxuryHunterPublication.sourceValue||null,status:pr.luxuryHunterPublication.status};
-      }
+      prev=db.prepare("SELECT description,raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(pid);
+      prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};
     }catch{}
-    if(!publication)publication=await fetchBunjangPublication(item);
+    let detail=null;
+    const cached=prevRaw?.koreaDetail, pt=prevRaw?.luxuryHunterTrust;
+    if(cached&&pt?.checkedAt&&Date.now()-Date.parse(pt.checkedAt)<3*86400e3){
+      detail={...cached,description:prev?.description||'',trust:pt};
+    }else{
+      detail=await fetchBunjangDetail(pid);
+      detailed++;
+      await sleep(250);
+    }
 
-    // Care y valoraciones: se reutilizan si se comprobaron en los últimos 3 días.
-    let trust=null;
-    try{
-      const prev=db.prepare("SELECT raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(String(item.id));
-      const pt=prev?JSON.parse(prev.raw_json||'{}').luxuryHunterTrust:null;
-      if(pt?.checkedAt&&Date.now()-Date.parse(pt.checkedAt)<3*86400e3)trust=pt;
-    }catch{}
-    if(!trust){trust=await fetchBunjangTrust(item.id);await sleep(250);}
-
-    const rawWithPublication={
-      ...item,
-      luxuryHunterTrust:trust?{...trust,description:undefined}:null,
-      publishedAt:publication.publishedAt,
-      luxuryHunterPublication:{
-        marketplace:'bunjang',
-        ageText:publication.ageText,
-        source:publication.source,
-        sourceValue:publication.sourceValue||null,
-        status:publication.status,
-        checkedAt:new Date().toISOString()
-      }
-    };
+    // Antigüedad que muestra Bunjang ("hace 3 horas"): la del anuncio o su
+    // última subida al principio de la lista.
+    const updatedAt=it.updatedAt||detail?.updatedAt||null;
+    const updatedMs=Date.parse(updatedAt||'');
+    const ageMs=Date.now()-updatedMs;
+    const status=Number.isFinite(updatedMs)?(ageMs>=-10*60e3&&ageMs<24*3600e3?'FRESH':'STALE'):'UNKNOWN';
+    const images=detail?.images?.length?detail.images:[String(it.productImage||'').replace('{res}','900')].filter(Boolean);
+    const trust=detail?.trust||(it.care===true?{care:true,checkedAt:new Date().toISOString()}:null);
 
     upsertListing({
-      source:'bunjang', source_id:item.id, url:item.url, title:item.title, description:item.description||trust?.description||'',
+      source:'bunjang', source_id:pid, url:`https://m.bunjang.co.kr/products/${pid}`,
+      title:it.name||detail?.name||'', description:detail?.description||'',
       original_price:p, currency:'KRW', price_eur:pe, seller_name:null,
-      seller_items:item.sellerItemCount, seller_sales:trust?.salesCount??item.sellerSalesCount, seller_reviews:trust?.reviewCount??item.sellerReviewCount,
-      image_url:item.imageUrl, status:item.status, purchase_via:'Korea proxy', raw:rawWithPublication
-    }, sessionId, sourceQuery);
-
+      seller_items:null, seller_sales:trust?.salesCount??null, seller_reviews:trust?.reviewCount??null,
+      image_url:images[0]||'', status:String(it.status||detail?.saleStatus||'').toUpperCase()==='SELLING'?'':String(it.status||detail?.saleStatus||'').toLowerCase(),
+      purchase_via:'Korea proxy',
+      raw:{
+        pid, name:it.name||null, price:p, care:it.care===true, favoriteCount:it.favoriteCount??null,
+        images,
+        koreaDetail:detail?{name:detail.name,images:detail.images,saleStatus:detail.saleStatus,condition:detail.condition,updatedAt:detail.updatedAt}:null,
+        luxuryHunterTrust:trust,
+        publishedAt:Number.isFinite(updatedMs)?new Date(updatedMs).toISOString():null,
+        luxuryHunterPublication:{
+          marketplace:'bunjang',
+          ageText:it.updatedBefore||null,
+          source:'korea_search_api',
+          sourceValue:updatedAt,
+          status,
+          checkedAt:new Date().toISOString()
+        }
+      }
+    }, sessionId, q);
     kept++;
-
-    await sleep(120);
   }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('bunjang','live-search',`Queries ${perQuery.length}; IDs ${unique.size}; kept ${kept}`,new Date().toISOString());
-  return { ok:true, perQuery, uniqueIds:unique.size, detailed:details.length, kept };
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('bunjang','live-search',`Web coreana · consultas ${perQuery.length}; anuncios ${unique.size}; fichas ${detailed}; kept ${kept}`,new Date().toISOString());
+  const failed=perQuery.length&&perQuery.every(x=>x.error);
+  return { ok:!failed, mode:'korea', perQuery, uniqueIds:unique.size, detailed, kept, ...(failed?{error:perQuery[0].error}:{}) };
 }
 
 async function xianyuFetch(pathname, options={}) {
@@ -8779,17 +8812,18 @@ async function importManualXianyu(sourceId){
 }
 
 async function importManualBunjang(sourceId){
-  const d=await runBunjangCli(['--json','item','list','--ids',String(sourceId)]);
-  const item=(d.items||[]).find(x=>String(x.id)===String(sourceId))||(d.items||[])[0];
-  const p=Number(item?.price);
-  if(!item?.title||!Number.isFinite(p)||p<=0)throw new Error('No he podido leer ese anuncio de Bunjang (puede que esté vendido o retirado).');
-  const trust=await fetchBunjangTrust(sourceId);
+  const d=await fetchBunjangDetail(sourceId);
+  const p=Number(d?.price);
+  if(!d?.name||!Number.isFinite(p)||p<=0)throw new Error('No he podido leer ese anuncio de Bunjang (puede que esté vendido o retirado).');
+  const updatedMs=Date.parse(d.updatedAt||'');
   return upsertListing({
-    source:'bunjang',source_id:item.id,url:item.url,title:item.title,description:item.description||trust?.description||'',
+    source:'bunjang',source_id:String(sourceId),url:`https://m.bunjang.co.kr/products/${sourceId}`,title:d.name,description:d.description||'',
     original_price:p,currency:'KRW',price_eur:toEur(p,'KRW'),seller_name:null,
-    seller_items:item.sellerItemCount,seller_sales:trust?.salesCount??item.sellerSalesCount,seller_reviews:trust?.reviewCount??item.sellerReviewCount,
-    image_url:item.imageUrl,status:item.status,purchase_via:'Korea proxy',
-    raw:{...item,luxuryHunterTrust:trust?{...trust,description:undefined}:null,addedBy:'telegram'}
+    seller_items:null,seller_sales:d.trust.salesCount,seller_reviews:d.trust.reviewCount,
+    image_url:d.images[0]||'',status:String(d.saleStatus||'').toUpperCase()==='SELLING'?'':String(d.saleStatus||'').toLowerCase(),purchase_via:'Korea proxy',
+    raw:{pid:String(sourceId),name:d.name,price:p,care:d.trust.care,images:d.images,
+      koreaDetail:{name:d.name,images:d.images,saleStatus:d.saleStatus,condition:d.condition,updatedAt:d.updatedAt},
+      luxuryHunterTrust:d.trust,publishedAt:Number.isFinite(updatedMs)?new Date(updatedMs).toISOString():null,addedBy:'telegram'}
   });
 }
 
@@ -8875,12 +8909,19 @@ function manualTrustLines(listing){
     const s=raw.luxuryHunterSeller;
     if(s)lines.push(`${japanSellerVeto(s)?'⚠️':'✅'} Vendedor: ${s.positivePct??'—'} % positivas · ${s.total} valoraciones.`);
   }
-  if(String(listing.status||'').toLowerCase()==='sold')lines.push('⚠️ El anuncio aparece como vendido.');
+  if(/^sold/i.test(String(listing.status||'')))lines.push('⚠️ El anuncio aparece como vendido.');
   return lines;
 }
 
 // Respuesta con el precio pactado. null si aún no hay reventa estimada.
-function negotiationReplyText({listing,price,fresh=false}){
+// Bolsos iguales de la base de Vestiaire para una respuesta de Telegram.
+async function negotiationVestiaireExact(listing){
+  const a=negotiationAnalysisFor(listing.id);
+  if(!a?.task_id)return null;
+  const task=db.prepare('SELECT task_name FROM tasks WHERE id=?').get(Number(a.task_id));
+  return manualAiStore.run(true,()=>vestiaireExactMatchesSafe(task?.task_name,{...listing,model:a.model,verification_json:a.verification_json}));
+}
+function negotiationReplyText({listing,price,fresh=false,vestiaireExact=null}){
   const cur=price.currency||listing.currency||'EUR';
   const newEur=toEur(price.amount,cur);
   const a=negotiationAnalysisFor(listing.id);
@@ -8924,7 +8965,7 @@ function negotiationReplyText({listing,price,fresh=false}){
     verificationLine,
     ...reasons.slice(0,3).map(r=>`• ${htmlEsc(r)}`),
     maxLocal!=null?`Precio máximo para que sea oportunidad clara: <b>${fmtMoney(maxLocal,listing.currency||'EUR')}</b> (≈ ${eur0(maxEur)})`:'',
-    ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model}),
+    ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model,_vestiaireExact:vestiaireExact}),
     listing.url?`<a href="${htmlEsc(listingAppLink(listing))}">📱 Abrir en la app</a>`:''
   ]:[
     `♻️ <b>Recalculado con el precio negociado</b>${task?` · ${htmlEsc(task.task_name)}`:''}`,
@@ -8936,7 +8977,7 @@ function negotiationReplyText({listing,price,fresh=false}){
     vestiaireProfitLine(low,high,landed),
     verdict,
     maxLocal!=null?`Precio máximo para que sea oportunidad clara: <b>${fmtMoney(maxLocal,listing.currency||'EUR')}</b> (≈ ${eur0(maxEur)})`:'',
-    ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model}),
+    ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model,_vestiaireExact:vestiaireExact}),
     listing.url?`<a href="${htmlEsc(listingAppLink(listing))}">📱 Abrir en la app</a>`:''
   ];
   return lines.filter(Boolean).join('\n');
@@ -8979,7 +9020,7 @@ async function runManualAnalysis(job){
       await analyzeWithGemini(listing.id,taskId,true,null,{priceEur});
     });
     const fresh=db.prepare('SELECT * FROM listings WHERE id=?').get(listing.id);
-    const text=negotiationReplyText({listing:fresh,price:job.price,fresh:true});
+    const text=negotiationReplyText({listing:fresh,price:job.price,fresh:true,vestiaireExact:await negotiationVestiaireExact(fresh)});
     if(text)return await reply(text);
     const a=negotiationAnalysisFor(listing.id);
     let reasons=[];try{reasons=JSON.parse(a?.decision_reasons_es_json||'[]');}catch{}
@@ -9042,8 +9083,10 @@ async function handleTelegramNegotiation(msg){
   const newEur=toEur(price.amount,cur);
   if(!Number.isFinite(newEur))return reply(`No tengo el cambio de ${cur} a euros ahora mismo.`);
   // Ya tiene reventa estimada: solo se recalcula con el precio (sin gastar IA).
-  const recalculated=negotiationReplyText({listing,price});
-  if(recalculated){await reply(recalculated);return true;}
+  if(negotiationReplyText({listing,price})){
+    await reply(negotiationReplyText({listing,price,vestiaireExact:await negotiationVestiaireExact(listing)}));
+    return true;
+  }
   // Sin reventa estimada: análisis completo con el precio pactado.
   if(!aiConfigured())return reply('La IA no está configurada, así que no puedo analizar el anuncio.');
   await reply(`⏳ Analizando <b>${htmlEsc(String(listing.title||'').slice(0,80))}</b> con ${fmtMoney(price.amount,cur)} (≈ ${eur0(newEur)}). Tardo uno o dos minutos.`);
@@ -9137,26 +9180,57 @@ function vestiaireProfitLine(resaleLow,resaleHigh,landed){
   if(lo==null&&hi==null)return '';
   return `Beneficio en Vestiaire (−${fee} % comisión): <b>${eur0(lo)}${hi!=null?` – ${eur0(hi)}`:''}</b>`;
 }
-// Anuncios del mismo modelo en la base de datos de Vestiaire de Nil (la hoja):
-// resumen de precios y los más parecidos (talla, color y precio), a la venta
-// y vendidos.
+// ── BASE DE VESTIAIRE: SOLO BOLSOS IGUALES ───────────────────────────────
+// Para cada aviso, la IA barata compara el anuncio (título, descripción, foto
+// y, si existe, la identificación exacta del análisis) con las filas de la
+// pestaña de ese modelo en la hoja de Nil, y devuelve solo las que son el
+// mismo bolso: mismo modelo, tamaño, material y color. Si no hay ninguno, el
+// aviso lo dice; nunca se enseñan bolsos "parecidos".
+async function vestiaireExactMatches(taskName,x){
+  const r=taskName?vestiaireRefs().tasks?.[taskName]:null;
+  const fichas=r?.fichas||[];
+  if(!fichas.length||!aiConfigured())return null;
+  let exact=null;
+  try{exact=JSON.parse(x?.verification_json||'{}')?.exact||null;}catch{}
+  const target={
+    title:x?.title||'',
+    model:x?.model||'',
+    description:String(x?.description||'').slice(0,900),
+    ...(exact&&exact.target_match!==false?{identified:{family:exact.family,variant:exact.exact_variant_label,size:exact.size,material:exact.material,colour:exact.main_color,hardware:exact.hardware,pattern:exact.pattern}}:{})
+  };
+  const rows=fichas.map((f,i)=>({row:i,size:f.size||undefined,cm:f.dims||undefined,material:f.material||undefined,colour:f.color||undefined,vintage:f.vintage||undefined,notes:f.notes?String(f.notes).slice(0,60):undefined}));
+  const prompt=`You compare one second-hand luxury handbag listing with the reseller's own database of Vestiaire Collective listings of the same model line (${taskName}).
+TARGET LISTING (JSON): ${JSON.stringify(target)}
+DATABASE ROWS (JSON): ${JSON.stringify(rows)}
+Return ONLY JSON: {"exact": [row numbers]}.
+Include a row ONLY if it is exactly the same product as the target: same model/line, same size or format (measurements within about 2 cm when both are known), same material and same colour family (and same hardware colour when both are known). Condition, price and year do not matter.
+The database materials are Vestiaire's broad Spanish categories: Piel or Cuero = any leather (lambskin, caviar, calfskin, grained...), Lona or Tela = canvas/fabric (including monogram coated canvas), Charol = patent leather, Ante = suede, Seda = silk, Sintético = synthetic, Tweed = tweed. A broad category matches a more specific target material of that category, never a different category.
+The target's size, material and colour must all be clear from its title, description, identification or photo; if any of them is unclear, return {"exact": []}. Never include near matches or merely similar bags. When unsure, leave the row out.`;
+  const imageParts=await fetchGeminiImageParts(x,1).catch(()=>[]);
+  const {data}=await geminiJsonRequest({key:aiApiKey(),model:aiTriageModel(),parts:[{text:prompt},...imageParts],purpose:'telegram'});
+  const idx=[...new Set((Array.isArray(data?.exact)?data.exact:[]).map(Number).filter(i=>Number.isInteger(i)&&i>=0&&i<fichas.length))];
+  return idx.map(i=>fichas[i]);
+}
+async function vestiaireExactMatchesSafe(taskName,x){
+  try{return await vestiaireExactMatches(taskName,x);}
+  catch(e){console.error('Vestiaire, bolsos iguales:',e.message);return {failed:true};}
+}
+// Bloque del aviso con los bolsos iguales de la base de Vestiaire
+// (calculados antes con vestiaireExactMatchesSafe en item._vestiaireExact).
 function vestiaireDbLines(taskName,item){
   const r=taskName?vestiaireRefs().tasks?.[taskName]:null;
   const fichas=r?.fichas||[];
-  if(!fichas.length)return [];
-  const probe={...item,title:`${item?.model||''} ${item?.title||''}`};
-  const forSale=vestiaireMatchFichas(fichas,probe).slice(0,3).map(m=>m.f);
-  const soldAll=fichas.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>({...f,price_eur:f.sold_price_eur,excluded:false}));
-  const sold=soldAll.length?vestiaireMatchFichas(soldAll,probe).slice(0,2).map(m=>m.f):[];
-  const desc=f=>htmlEsc([f.size,f.color,f.condition].filter(Boolean).join(' · ')||'Anuncio');
-  const summary=[
-    r.all?.n?`${r.all.n} a la venta, mediana ${eur0(r.all.median)} (${eur0(r.all.min)} – ${eur0(r.all.max)})`:'',
-    r.sold_stats?.n?`${r.sold_stats.n} vendido${r.sold_stats.n===1?'':'s'}, mediana ${eur0(r.sold_stats.median)}`:''
-  ].filter(Boolean).join(' · ');
+  const found=item?._vestiaireExact;
+  if(!fichas.length||found==null)return [];
+  if(found.failed)return ['📚 Tu base de Vestiaire: no he podido comprobar si hay bolsos iguales.'];
+  if(!found.length)return [`📚 Tu base de Vestiaire: <b>no hay ningún bolso igual</b> (revisados ${fichas.length} anuncios de este modelo).`];
+  const desc=f=>htmlEsc([f.size,f.material,f.color,f.condition].filter(Boolean).join(' · ')||'Anuncio');
+  const forSale=found.filter(f=>!f.sold).sort((a,b)=>(Number(a.price_eur)||0)-(Number(b.price_eur)||0));
+  const sold=found.filter(f=>f.sold);
   return [
-    `📚 <b>Tu base de Vestiaire</b>${summary?`: ${summary}`:''}`,
-    ...forSale.map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · ${eur0(f.price_eur)}${Number.isFinite(f.likes)?` · ${f.likes} ❤️`:''}`),
-    ...sold.map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · vendido a ${eur0(f.sold_price_eur)}`)
+    `📚 <b>Iguales en tu base de Vestiaire</b>: ${forSale.length} a la venta${sold.length?` · ${sold.length} vendido${sold.length===1?'':'s'}`:''}`,
+    ...forSale.slice(0,4).map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · ${eur0(f.price_eur)}${Number.isFinite(f.likes)?` · ${f.likes} ❤️`:''}`),
+    ...sold.slice(0,3).map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · vendido${Number.isFinite(f.sold_price_eur)?` a ${eur0(f.sold_price_eur)}`:''}`)
   ];
 }
 
@@ -9264,6 +9338,8 @@ async function sendInstantAlerts(task,runId,items){
   fresh.splice(0,fresh.length,...limitTaskAlerts(task,freshAll,{kinds:['instant'],max:Number(process.env.INSTANT_ALERT_TASK_DAILY_MAX||4)}));
   const soft=await sendSoftAlerts(task,runId,items,new Set(freshAll.map(x=>Number(x.id))));
   if(!fresh.length)return {sent:0,soft};
+  // Bolsos iguales en la base de Vestiaire de Nil, para el texto del aviso.
+  for(const x of fresh)x._vestiaireExact=await vestiaireExactMatchesSafe(task.task_name,x);
 
   const channels=[];
   const errors=[];
@@ -9349,6 +9425,7 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
   const picksLimited=limitTaskAlerts(task,picks,{kinds:['instant','soft'],max:Number(process.env.SOFT_ALERT_TASK_DAILY_MAX||3)});
   picks.splice(0,picks.length,...picksLimited);
   if(!picks.length)return {sent:0};
+  for(const x of picks)x._vestiaireExact=await vestiaireExactMatchesSafe(task.task_name,x);
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'soft','telegram',?)`);
   let sent=0;
   for(const x of picks){
