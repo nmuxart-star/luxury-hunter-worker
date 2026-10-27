@@ -12,6 +12,7 @@ import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccount
 import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
 import {nextXianyuSearchUsage,xianyuBudgetMonth,XIANYU_MONTHLY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
+import {xianyuAccountBlockActive,XIANYU_ACCOUNT_BLOCK_KEY} from './scripts/xianyu-account-block.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
@@ -2378,6 +2379,15 @@ function xianyuMarkProvider(provider){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_provider',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(provider,new Date().toISOString());
 }
+function xianyuAccountBlocked(){
+  const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(XIANYU_ACCOUNT_BLOCK_KEY);
+  return xianyuAccountBlockActive(row?.value_json,process.env.XIANYU_ACCOUNT_UNBLOCK);
+}
+function xianyuBlockAccount(reason){
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+    .run(XIANYU_ACCOUNT_BLOCK_KEY,JSON.stringify({at:new Date().toISOString(),reason}),new Date().toISOString());
+}
 function reserveXianyuSearch(){
   const key='xianyu_search_usage';
   const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
@@ -2727,8 +2737,9 @@ function xianyuDirectSessionBlock(){
 // Una búsqueda por ventana de XIANYU_MIN_INTERVAL_MIN, alternando entre Just
 // One API (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
 // El turno se gasta aunque la búsqueda no salga (sesión caducada, cupo
-// agotado...): así el siguiente siempre toca al otro proveedor y ni el coste
-// de Just One API ni las visitas a Xianyu con la cuenta aumentan.
+// agotado...): así el siguiente siempre toca al otro proveedor.
+// Si la cuenta pide verificación, queda bloqueada (no se vuelve a usar hasta
+// XIANYU_ACCOUNT_UNBLOCK) y ese turno y todos los siguientes van por Just One API.
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
@@ -2736,15 +2747,28 @@ async function searchXianyuAlternate(opts){
   if(Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',mode:'alternate',perQuery:[],kept:0};
   }
-  const provider=xianyuLastProvider()==='justoneapi'?'direct':'justoneapi';
-  xianyuMarkProvider(provider);
   xianyuMarkSearch();
-  console.log(`Xianyu (alterno): turno de ${provider==='direct'?'la cuenta de Xianyu':'Just One API'}.`);
-  if(provider==='justoneapi')return {...await searchXianyuJustOneApi({...opts,slotReserved:true}),provider};
-  const blocked=xianyuDirectSessionBlock();
-  if(blocked)return {...blocked,provider};
+  const accountBlocked=xianyuAccountBlocked();
+  if(accountBlocked||xianyuLastProvider()!=='justoneapi'){
+    xianyuMarkProvider('justoneapi');
+    console.log(`Xianyu (alterno): turno de Just One API${accountBlocked?' (cuenta de Xianyu bloqueada)':''}.`);
+    return {...await searchXianyuJustOneApi({...opts,slotReserved:true}),provider:'justoneapi',accountBlocked};
+  }
+  xianyuMarkProvider('direct');
+  console.log('Xianyu (alterno): turno de la cuenta de Xianyu.');
   const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
-  return {...await fn({...opts,slotReserved:true}),provider};
+  const res=xianyuDirectSessionBlock()||await fn({...opts,slotReserved:true});
+  const verification=String(process.env.XIANYU_SESSION_STATUS||'').trim()==='risk_control'||
+    (res.perQuery||[]).some(q=>q?.risk);
+  if(!verification){
+    clearHealthIssue('xianyu-account-blocked');
+    return {...res,provider:'direct'};
+  }
+  xianyuBlockAccount('verificación anti-bot');
+  await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. No se volverá a usar hasta que la desbloquees; mientras tanto todas las búsquedas de Xianyu van por Just One API.').catch(()=>{});
+  console.log('Xianyu (alterno): la cuenta pidió verificación; queda bloqueada y este turno pasa a Just One API.');
+  xianyuMarkProvider('justoneapi');
+  return {...await searchXianyuJustOneApi({...opts,slotReserved:true}),provider:'justoneapi',accountBlocked:true};
 }
 async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
   // Xianyu es lento (visita el perfil de cada vendedor): 1 búsqueda por tarea por defecto.
