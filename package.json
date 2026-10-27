@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.mjs",
     "check": "node scripts/check.mjs",
-    "test:xianyu": "node --test tests/xianyu-account-pool.test.mjs tests/justone-xianyu.test.mjs tests/xianyu-search-budget.test.mjs tests/xianyu-account-block.test.mjs",
+    "test:xianyu": "node --test tests/xianyu-account-pool.test.mjs tests/justone-xianyu.test.mjs tests/xianyu-search-budget.test.mjs",
     "background:install": "bash scripts/install-background.sh",
     "background:status": "bash scripts/status-background.sh",
     "background:uninstall": "bash scripts/uninstall-background.sh",

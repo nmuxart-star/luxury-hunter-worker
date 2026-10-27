@@ -12,8 +12,6 @@ import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccount
 import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
 import {nextXianyuSearchUsage,xianyuBudgetMonth,XIANYU_MONTHLY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
-import {xianyuAccountBlockActive,XIANYU_ACCOUNT_BLOCK_KEY} from './scripts/xianyu-account-block.mjs';
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -2379,14 +2377,17 @@ function xianyuMarkProvider(provider){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_provider',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(provider,new Date().toISOString());
 }
+// La cuenta de Nil está pidiendo verificación (captcha o de identidad).
 function xianyuAccountBlocked(){
-  const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(XIANYU_ACCOUNT_BLOCK_KEY);
-  return xianyuAccountBlockActive(row?.value_json,process.env.XIANYU_ACCOUNT_UNBLOCK);
+  return !!db.prepare("SELECT 1 FROM app_settings WHERE key='xianyu_account_blocked'").get();
 }
 function xianyuBlockAccount(reason){
-  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_account_blocked',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
-    .run(XIANYU_ACCOUNT_BLOCK_KEY,JSON.stringify({at:new Date().toISOString(),reason}),new Date().toISOString());
+    .run(JSON.stringify({at:new Date().toISOString(),reason}),new Date().toISOString());
+}
+function xianyuUnblockAccount(){
+  db.prepare("DELETE FROM app_settings WHERE key='xianyu_account_blocked'").run();
 }
 function reserveXianyuSearch(){
   const key='xianyu_search_usage';
@@ -2738,9 +2739,10 @@ function xianyuDirectSessionBlock(){
 // One API (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
 // El turno se gasta aunque la búsqueda no salga (sesión caducada, cupo
 // agotado...): así el siguiente siempre toca al otro proveedor.
-// Si la cuenta pide verificación (captcha o de identidad), queda bloqueada (no
-// se vuelve a usar hasta XIANYU_ACCOUNT_UNBLOCK) y ese turno y todos los
-// siguientes van por Just One API con una sola página (10 anuncios por hora).
+// Si la cuenta pide verificación (captcha o de identidad), ese turno pasa a
+// Just One API y, mientras siga así, Just One API usa una sola página (10
+// anuncios por hora). Cada turno de la cuenta comprueba si ya vuelve a
+// funcionar; cuando funciona, se vuelve a alternar con normalidad.
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
@@ -2750,25 +2752,31 @@ async function searchXianyuAlternate(opts){
   }
   xianyuMarkSearch();
   const accountBlocked=xianyuAccountBlocked();
-  if(accountBlocked||xianyuLastProvider()!=='justoneapi'){
+  if(xianyuLastProvider()!=='justoneapi'){
     xianyuMarkProvider('justoneapi');
-    console.log(`Xianyu (alterno): turno de Just One API${accountBlocked?' (cuenta de Xianyu bloqueada)':''}.`);
+    console.log(`Xianyu (alterno): turno de Just One API${accountBlocked?' (la cuenta de Xianyu pide verificación: 1 página)':''}.`);
     return {...await searchXianyuJustOneApi({...opts,slotReserved:true,...(accountBlocked?{justOnePages:1}:{})}),provider:'justoneapi',accountBlocked};
   }
   xianyuMarkProvider('direct');
-  console.log('Xianyu (alterno): turno de la cuenta de Xianyu.');
+  console.log(`Xianyu (alterno): turno de la cuenta de Xianyu${accountBlocked?' (comprobando si ya funciona)':''}.`);
   const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
   const res=xianyuDirectSessionBlock()||await fn({...opts,slotReserved:true});
   const verification=String(process.env.XIANYU_SESSION_STATUS||'').trim()==='risk_control'||
-    (res.perQuery||[]).some(q=>q?.risk);
+    (res.perQuery||[]).some(q=>q?.risk)||(res.state==='paused'&&xianyuPauseCode==='risk');
   if(!verification){
-    clearHealthIssue('xianyu-account-blocked');
+    const worked=!res.state&&(res.perQuery||[]).some(q=>Number.isFinite(q?.found));
+    if(accountBlocked&&worked){
+      xianyuUnblockAccount();
+      clearHealthIssue('xianyu-account-blocked');
+      console.log('Xianyu (alterno): la cuenta vuelve a funcionar; se vuelve a alternar con normalidad.');
+    }
     return {...res,provider:'direct'};
   }
-  xianyuBlockAccount('verificación anti-bot');
-  await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. No se volverá a usar hasta que la desbloquees; mientras tanto Xianyu va solo por Just One API (10 anuncios cada hora).').catch(()=>{});
-  console.log('Xianyu (alterno): la cuenta pidió verificación; queda bloqueada y este turno pasa a Just One API.');
-  xianyuMarkProvider('justoneapi');
+  if(!accountBlocked){
+    xianyuBlockAccount('verificación anti-bot');
+    await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. Mientras siga así, Xianyu va por Just One API (10 anuncios cada hora) y en cada turno de tu cuenta se comprueba si ya funciona; cuando funcione, se vuelve a alternar.').catch(()=>{});
+  }
+  console.log('Xianyu (alterno): la cuenta pide verificación; este turno pasa a Just One API (1 página).');
   return {...await searchXianyuJustOneApi({...opts,slotReserved:true,justOnePages:1}),provider:'justoneapi',accountBlocked:true};
 }
 async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
