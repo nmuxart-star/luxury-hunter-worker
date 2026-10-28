@@ -2735,21 +2735,17 @@ function xianyuDirectSessionBlock(){
   }
   return null;
 }
-// Una búsqueda por ventana de XIANYU_MIN_INTERVAL_MIN, alternando entre Just
-// One API (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
+// Cada tarea busca en Xianyu, alternando de tarea en tarea entre Just One API
+// (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
 // El turno se gasta aunque la búsqueda no salga (sesión caducada, cupo
 // agotado...): así el siguiente siempre toca al otro proveedor.
 // Si la cuenta pide verificación (captcha o de identidad), ese turno pasa a
 // Just One API y, mientras siga así, Just One API usa una sola página (10
-// anuncios por hora). Cada turno de la cuenta comprueba si ya vuelve a
-// funcionar; cuando funciona, se vuelve a alternar con normalidad.
+// anuncios). Cada turno de la cuenta comprueba si ya vuelve a funcionar;
+// cuando funciona, se vuelve a alternar con normalidad.
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
-  const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
-  if(Date.now()-xianyuLastSearchAt()<minInterval*60e3){
-    return {ok:true,state:'throttled',mode:'alternate',perQuery:[],kept:0};
-  }
   xianyuMarkSearch();
   const accountBlocked=xianyuAccountBlocked();
   if(xianyuLastProvider()!=='justoneapi'){
