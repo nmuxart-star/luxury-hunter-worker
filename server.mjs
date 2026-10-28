@@ -2922,6 +2922,10 @@ const JAPAN_RADAR_SPECS=[
     searchWaitMs:3500,
     detailWaitMs:4000,
     searchUrl:q=>`https://jp.mercari.com/search?keyword=${encodeURIComponent(q)}&sort=created_time&order=desc`,
+    // Fuera de Japón Mercari enseña los precios en euros: el precio en yenes
+    // se lee de su API (buscador y ficha).
+    searchApi:/api\.mercari\.jp\/v2\/entities:search/,
+    detailApi:/api\.mercari\.jp\/items\/get(\?|$)/,
     accepts:u=>/^\/item\/m\d+/i.test(u.pathname)||/^\/shops\/product\/[^/]+/i.test(u.pathname)
   },
   {
@@ -3345,8 +3349,16 @@ async function japanHttpSnapshot(url){
   };
 }
 
-async function japanBrowserSnapshot(context,url,waitMs=1000,scrollSteps=0){
+async function japanBrowserSnapshot(context,url,waitMs=1000,scrollSteps=0,apiPattern=null){
   const page=await context.newPage();
+  // Respuestas JSON de la propia web que cumplen apiPattern (Mercari: precio
+  // en yenes aunque fuera de Japón la página lo enseñe convertido a euros).
+  const apiReads=[];
+  if(apiPattern){
+    page.on('response',r=>{
+      if(apiPattern.test(r.url()))apiReads.push(r.json().catch(()=>null));
+    });
+  }
 
   try{
     const response=await page.goto(url,{
@@ -3368,12 +3380,18 @@ async function japanBrowserSnapshot(context,url,waitMs=1000,scrollSteps=0){
       .innerText()
       .catch(()=>'');
 
+    const api=(await Promise.all(apiReads.map(p=>Promise.race([
+      p,
+      new Promise(resolve=>setTimeout(()=>resolve(null),5000))
+    ])))).filter(Boolean);
+
     return {
       status:response?.status()??0,
       finalUrl:page.url(),
       html,
       body:String(body||'').replace(/\s+/g,' ').trim(),
-      title:await page.title().catch(()=>'')
+      title:await page.title().catch(()=>''),
+      api
     };
   }finally{
     await page.close();
@@ -3437,12 +3455,28 @@ function japanCollectCandidates(spec,html){
   return out;
 }
 
+// Precios en yenes de las respuestas del buscador de Mercari, por anuncio.
+function mercariSearchApiPrices(apiResponses){
+  const prices=new Map();
+  for(const json of apiResponses||[]){
+    for(const it of Array.isArray(json?.items)?json.items:[]){
+      const id=String(it?.id||'').trim();
+      const price=Number(it?.price);
+      if(!id||!Number.isFinite(price)||price<=0)continue;
+      prices.set(/^m\d+$/i.test(id)?id:`shops-${id}`,price);
+    }
+  }
+  return prices;
+}
+
 async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
   const snap=spec.mode==='browser'
     ? await japanBrowserSnapshot(
         browserContext,
         candidate.href,
-        spec.detailWaitMs||900
+        spec.detailWaitMs||900,
+        0,
+        spec.detailApi||null
       )
     : await japanHttpSnapshot(candidate.href);
 
@@ -3479,7 +3513,12 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
     ''
   ).trim();
 
-  const price=japanYenPrice(
+  // Mercari: primero el precio en yenes de su API (ficha y buscador); el
+  // texto de la página puede venir convertido a euros.
+  const detailApiPrice=(snap.api||[])
+    .map(json=>Number(json?.data?.price))
+    .find(value=>Number.isFinite(value)&&value>0);
+  const price=detailApiPrice??candidate.apiPrice??japanYenPrice(
     spec.id,
     product,
     snap.body,
@@ -3590,6 +3629,7 @@ async function searchJapanSource(
   let withPublicationDate=0;
   let detailErrors=0;
   let successfulQueries=0;
+  let noPrice=0;
 
   if(spec.mode==='browser'&&!browserContext){
     return {
@@ -3618,7 +3658,8 @@ async function searchJapanSource(
             browserContext,
             searchUrl,
             spec.searchWaitMs||2500,
-            spec.scrollSteps||0
+            spec.scrollSteps||0,
+            spec.searchApi||null
           )
         : await japanHttpSnapshot(searchUrl);
 
@@ -3632,6 +3673,14 @@ async function searchJapanSource(
         spec,
         snap.html
       );
+
+      if(spec.searchApi){
+        const apiPrices=mercariSearchApiPrices(snap.api);
+        for(const candidate of candidates){
+          const apiPrice=apiPrices.get(japanSourceId(spec.id,candidate.href));
+          if(apiPrice)candidate.apiPrice=apiPrice;
+        }
+      }
 
       if(spec.id==='mercari-jp'&&personalOnly){
         candidates=candidates.filter(
@@ -3669,6 +3718,13 @@ async function searchJapanSource(
         }
 
         if(item.status==='sold')continue;
+
+        // Sin precio fiable no se guarda: un anuncio a 0 € daría un
+        // beneficio falso y avisos que no lo son.
+        if(!(Number(item.original_price)>0)){
+          noPrice++;
+          continue;
+        }
 
         const pe=item.price_eur==null?null:Number(item.price_eur);
         const hasMinEur=
@@ -3740,6 +3796,7 @@ async function searchJapanSource(
     kept,
     withPublicationDate,
     detailErrors,
+    noPrice,
     perQuery,
     error:ok?null:'No accessible search query succeeded'
   };
