@@ -8444,7 +8444,19 @@ function japanSellerVeto(seller){
   };
 }
 
+// Sin precio (o a 0 €) no se analiza ni se avisa: el beneficio saldría falso.
+function noPriceVeto(item){
+  const price=Number(item?.price_eur);
+  if(Number.isFinite(price)&&price>0)return null;
+  return {
+    code:'no_price',
+    reasons:['El anuncio no tiene un precio válido (sale a 0 €); no se analiza ni se avisa.']
+  };
+}
+
 function deterministicPrescreen(item){
+  const noPrice=noPriceVeto(item);
+  if(noPrice)return noPrice;
   const veto=xianyuVerificationVeto(item);
   if(veto)return veto;
   const bj=bunjangTrustVeto(item);
@@ -9473,6 +9485,7 @@ async function sendInstantAlerts(task,runId,items){
   const requireMarket=!['0','false','no','off'].includes(String(process.env.INSTANT_ALERT_REQUIRE_MARKET||'').toLowerCase());
   const alreadyAlerted=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind='instant' LIMIT 1`);
   const fresh=(items||[]).filter(x=>{
+    if(noPriceVeto(x))return false;
     if(!decisions.includes(String(x.decision||'').toUpperCase()))return false;
     const profitLow=Number(x.net_profit_low_eur);
     if(minProfit!=null&&Number.isFinite(minProfit)&&!(profitLow>=minProfit))return false;
@@ -9570,6 +9583,7 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
   const minProfit=Number(process.env.SOFT_ALERT_MIN_PROFIT_EUR||0)||Math.max(150,Number.isFinite(taskMin)?Math.round(taskMin*0.6):150);
   const already=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind IN ('instant','soft') LIMIT 1`);
   const picks=(items||[]).filter(x=>{
+    if(noPriceVeto(x))return false;
     if(strictIds.has(Number(x.id)))return false;
     if(!['STRONG BUY','BUY','WATCH'].includes(String(x.decision||'').toUpperCase()))return false;
     if(String(x.authenticity_risk||'').toUpperCase()==='HIGH')return false;
@@ -9853,8 +9867,8 @@ async function executeTask(taskId, runId=null) {
             continue;
           }
         }else{
-          // Ya analizado antes: si es de Xianyu sin 验货宝 se descarta y no se toca más.
-          const veto=xianyuVerificationVeto(item);
+          // Ya analizado antes: sin precio o de Xianyu sin 验货宝 se descarta y no se toca más.
+          const veto=noPriceVeto(item)||xianyuVerificationVeto(item);
           if(veto){
             if(String(existingAnalysis.decision||'').toUpperCase()!=='REJECT')storePrescreenReject(taskId,item,veto);
             continue;
@@ -11121,6 +11135,7 @@ function listingWasEverEmailed(listingId){
 }
 
 function qualifiesForEmail(task,item){
+  if(noPriceVeto(item))return false;
   if(task.decision_mode==='ai'){
     if(!item.decision || !(task.notify_decisions||[]).includes(item.decision)) return false;
     if(task.notify_min_score!=null && Number(item.opportunity_score||0)<Number(task.notify_min_score)) return false;
@@ -11562,6 +11577,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
     for(const x of items){
       const decision=String(x.decision||'').toUpperCase();
       if(!['STRONG BUY','BUY','WATCH'].includes(decision))continue;
+      if(noPriceVeto(x))continue;
 
       if(listingFeedback(x.id)==='not_interested')continue;
       if(listingWasEverEmailed(x.id)){
