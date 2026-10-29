@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
+import {shouldRunAllTasks} from './github-run-schedule.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -102,6 +103,7 @@ async function runPool(items,limit,fn,canStart=()=>true){
   }));
 }
 let code=0;
+let anyTaskStarted=false;
 try{
   await waitServer();
   console.log('Luxury Hunter cloud worker ready.');
@@ -141,17 +143,20 @@ try{
       console.log(`Disabled stale cloud task: ${old.task_name}`);
     }
   }
-  const forceManual=process.env.GITHUB_EVENT_NAME==='workflow_dispatch';
+  const runAllTasks=shouldRunAllTasks({
+    eventName:process.env.GITHUB_EVENT_NAME,
+    autoChain:process.env.LH_AUTO_CHAIN==='1',
+    loopMinutes:LOOP_MINUTES
+  });
   const globalEmail=cfg.global_email||{};
   let cycle=0;
   while(true){
     cycle++;
     const cycleStartedAt=Date.now();
     const tasks=(await api('GET','/api/tasks')).tasks||[];
-    // En modo bucle o lanzamiento manual se ejecutan todas las tareas activas
-    // en cada ciclo: lo ya analizado se salta, así que repetir es barato.
-    const runAll=forceManual||LOOP_MINUTES>0;
-    const runnable=runAll
+    // Las ejecuciones encadenadas respetan interval_minutes de cada modelo.
+    // Solo un lanzamiento manual real fuerza todas las tareas activas.
+    const runnable=runAllTasks
       ? tasks.filter(t=>t.enabled)
       : tasks.filter(t=>due(t));
     // Primero los modelos que llevan más tiempo sin revisarse.
@@ -166,6 +171,7 @@ try{
     const taskResults=[];
     await runPool(runnable,TASK_CONCURRENCY,async task=>{
       started++;
+      anyTaskStarted=true;
       console.log(`\n=== RUN ${task.task_name} ===`);
       try{
         const q=await api('POST',`/api/tasks/${task.id}/run`,{});
@@ -220,6 +226,10 @@ try{
 }catch(e){
   code=1; console.error(e?.stack||e);
 }finally{
+  if(process.env.GITHUB_OUTPUT){
+    try{fs.appendFileSync(process.env.GITHUB_OUTPUT,`started=${anyTaskStarted?'true':'false'}\n`);}
+    catch(e){console.error('Could not report task-start status:',e.message);}
+  }
   if(child.exitCode===null && child.signalCode===null){
     child.kill('SIGTERM');
 

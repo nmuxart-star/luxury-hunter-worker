@@ -7,6 +7,10 @@ on:
         description: 'Enviar el resumen (email + Telegram) en esta ejecución'
         type: boolean
         default: false
+      auto_chain:
+        description: 'Ejecución automática encadenada; respetar intervalos de tareas'
+        type: boolean
+        default: false
   schedule:
     - cron: '17 * * * *'
 
@@ -70,6 +74,7 @@ jobs:
       XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || (vars.XIANYU_PROVIDER == 'direct' && '2' || '1') }}
       XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || '60' }}
       XIANYU_MONTHLY_SEARCH_LIMIT: ${{ vars.XIANYU_MONTHLY_SEARCH_LIMIT || '650' }}
+      XIANYU_DAILY_SEARCH_LIMIT: ${{ vars.XIANYU_DAILY_SEARCH_LIMIT || '20' }}
       XIANYU_QUERY_TIMEOUT_SEC: ${{ vars.XIANYU_QUERY_TIMEOUT_SEC || '180' }}
       BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
@@ -92,6 +97,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       XIANYU_MODE: ${{ vars.XIANYU_MODE }}
       FORCE_DIGEST: ${{ inputs.force_digest && '1' || '' }}
+      LH_AUTO_CHAIN: ${{ inputs.auto_chain && '1' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -290,6 +296,7 @@ jobs:
           docker logs luxury-hunter-xianyu --tail 80 || true
 
       - name: Run due tasks
+        id: run_due_tasks
         run: node scripts/github-run.mjs
 
       # Si Goofish dio la sesión por caducada o bloqueó la búsqueda, se envía
@@ -356,10 +363,10 @@ jobs:
       # Encadena la siguiente ejecución al terminar (cobertura continua) si
       # la variable de repositorio SELF_CHAIN vale 'true'. El cron sigue como red de seguridad.
       - name: Chain next run
-        if: always() && vars.SELF_CHAIN == 'true'
+        if: always() && vars.SELF_CHAIN == 'true' && steps.run_due_tasks.outputs.started == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run luxury-hunter.yml --ref "${GITHUB_REF_NAME}" || echo "Could not chain next run"
+        run: gh workflow run luxury-hunter.yml --ref "${GITHUB_REF_NAME}" -f auto_chain=true || echo "Could not chain next run"
 
       - name: Xianyu logs
         if: always()

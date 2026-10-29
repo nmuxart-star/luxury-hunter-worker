@@ -10,7 +10,8 @@ import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
-import {nextXianyuSearchUsage,xianyuBudgetMonth,XIANYU_MONTHLY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
+import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearchIntervalMs,
+  XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
@@ -2369,6 +2370,14 @@ function xianyuMarkSearch(){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
+function xianyuLastPaidSearchAt(){
+  const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_paid_search'").get();
+  return Number(row?.value_json||0)||0;
+}
+function xianyuMarkPaidSearch(){
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_paid_search',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
+}
 function xianyuLastProvider(){
   const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_provider'").get();
   return row?.value_json==='direct'?'direct':row?.value_json==='justoneapi'?'justoneapi':null;
@@ -2394,13 +2403,23 @@ function reserveXianyuSearch(){
   const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
   const limit=clampInt(process.env.XIANYU_MONTHLY_SEARCH_LIMIT??XIANYU_MONTHLY_SEARCH_LIMIT,
     XIANYU_MONTHLY_SEARCH_LIMIT,0,XIANYU_MONTHLY_SEARCH_LIMIT);
-  const next=nextXianyuSearchUsage(row?.value_json??null,xianyuBudgetMonth(),limit);
-  if(next.allowed){
+  const dailyLimit=clampInt(process.env.XIANYU_DAILY_SEARCH_LIMIT??XIANYU_DAILY_SEARCH_LIMIT,
+    XIANYU_DAILY_SEARCH_LIMIT,0,XIANYU_DAILY_SEARCH_LIMIT);
+  const now=new Date();
+  const next=nextXianyuSearchUsage(row?.value_json??null,xianyuBudgetMonth(now),limit,xianyuBudgetDay(now),dailyLimit);
+  const value=JSON.stringify(next.usage);
+  if(row?.value_json!==value){
     db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
-      .run(key,JSON.stringify(next.usage),new Date().toISOString());
+      .run(key,value,new Date().toISOString());
   }
+  if(next.allowed)console.log(`Xianyu Just One API: llamada reservada; hoy ${next.usage.dayAttempts}/${next.dailyLimit}, mes ${next.usage.attempts}/${next.limit}.`);
   return next;
+}
+function xianyuBudgetWarning(budget){
+  return budget.reason==='daily_limit'
+    ?`Just One API pausado hoy: ${budget.usage.dayAttempts}/${budget.dailyLimit} llamadas usadas el ${budget.usage.day}. La cuenta de Xianyu conserva sus turnos.`
+    :`Just One API pausado este mes: ${budget.usage.attempts}/${budget.limit} llamadas usadas en ${budget.usage.month}. La cuenta de Xianyu conserva sus turnos.`;
 }
 
 function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
@@ -2521,6 +2540,15 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
     await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
     return {ok:false,state:'state_missing',mode:'justoneapi',warning,perQuery:[],kept:0};
   }
+  const pages=clampInt(justOnePages??process.env.XIANYU_JUSTONE_PAGES??1,1,1,5);
+  const dailyLimit=clampInt(process.env.XIANYU_DAILY_SEARCH_LIMIT??XIANYU_DAILY_SEARCH_LIMIT,
+    XIANYU_DAILY_SEARCH_LIMIT,0,XIANYU_DAILY_SEARCH_LIMIT);
+  const paidInterval=xianyuPaidSearchIntervalMs(pages,dailyLimit);
+  const sincePaid=Date.now()-xianyuLastPaidSearchAt();
+  if(Number.isFinite(paidInterval)&&sincePaid<paidInterval){
+    console.log(`Xianyu Just One API: turno omitido; próxima búsqueda pagada en ~${Math.ceil((paidInterval-sincePaid)/60_000)} min.`);
+    return {ok:true,state:'paid_throttled',mode:'justoneapi',perQuery:[],kept:0};
+  }
   const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
   if(!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',mode:'justoneapi',perQuery:[],kept:0};
@@ -2538,11 +2566,13 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
       return {ok:false,state:'budget_error',mode:'justoneapi',warning,perQuery:[],kept:0};
     }
     if(!budget.allowed){
-      const warning=`Xianyu pausado: ${budget.usage.attempts}/${budget.limit} búsquedas de Just One API usadas en ${budget.usage.month}.`;
+      const warning=xianyuBudgetWarning(budget);
+      console.log(warning);
       await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
       return {ok:true,state:'budget_exhausted',mode:'justoneapi',warning,perQuery:[],kept:0};
     }
     clearHealthIssue('xianyu-budget');
+    xianyuMarkPaidSearch();
     xianyuMarkSearch();
   }
   const perQuery=[];
@@ -2551,7 +2581,6 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
   const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
   // Páginas por búsqueda (10 anuncios cada una). Cada página es una llamada y
   // cuenta en el cupo mensual; la primera ya se ha reservado arriba.
-  const pages=clampInt(justOnePages??process.env.XIANYU_JUSTONE_PAGES??1,1,1,5);
   for(const keyword of selected){
     try{
       const items=[];
@@ -2561,7 +2590,7 @@ async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=nu
         if(page>1){
           const extra=reserveXianyuSearch();
           if(!extra.allowed){
-            await reportHealthIssue('xianyu-budget',`Xianyu pausado: ${extra.usage.attempts}/${extra.limit} búsquedas de Just One API usadas en ${extra.usage.month}.`).catch(()=>{});
+            await reportHealthIssue('xianyu-budget',xianyuBudgetWarning(extra)).catch(()=>{});
             break;
           }
           await sleep(1200);
@@ -2735,18 +2764,17 @@ function xianyuDirectSessionBlock(){
   }
   return null;
 }
-// Cada tarea busca en Xianyu, alternando de tarea en tarea entre Just One API
-// (XIANYU_JUSTONE_PAGES páginas) y la cuenta de Nil (modo directo).
+// Cada tarea con Xianyu alterna entre Just One API y la cuenta de Nil.
+// Los turnos de pago se espacian y se detienen al alcanzar el cupo diario.
 // El turno se gasta aunque la búsqueda no salga (sesión caducada, cupo
 // agotado...): así el siguiente siempre toca al otro proveedor.
 // Si la cuenta pide verificación (captcha o de identidad), ese turno pasa a
 // Just One API y, mientras siga así, Just One API usa una sola página (10
-// anuncios). Cada turno de la cuenta comprueba si ya vuelve a funcionar;
-// cuando funciona, se vuelve a alternar con normalidad.
+// anuncios) cuando el presupuesto lo permita. Cada turno de la cuenta comprueba
+// si ya vuelve a funcionar; entonces se vuelve a alternar con normalidad.
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
-  xianyuMarkSearch();
   const accountBlocked=xianyuAccountBlocked();
   if(xianyuLastProvider()!=='justoneapi'){
     xianyuMarkProvider('justoneapi');
@@ -2770,7 +2798,7 @@ async function searchXianyuAlternate(opts){
   }
   if(!accountBlocked){
     xianyuBlockAccount('verificación anti-bot');
-    await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. Mientras siga así, Xianyu va por Just One API (10 anuncios cada hora) y en cada turno de tu cuenta se comprueba si ya funciona; cuando funcione, se vuelve a alternar.').catch(()=>{});
+    await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. Mientras siga así, Xianyu usa Just One API cuando el presupuesto diario lo permite; en cada turno de tu cuenta se comprueba si ya funciona.').catch(()=>{});
   }
   console.log('Xianyu (alterno): la cuenta pide verificación; este turno pasa a Just One API (1 página).');
   return {...await searchXianyuJustOneApi({...opts,slotReserved:true,justOnePages:1}),provider:'justoneapi',accountBlocked:true};
