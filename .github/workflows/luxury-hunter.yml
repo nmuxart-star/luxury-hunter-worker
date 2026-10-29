@@ -301,15 +301,16 @@ jobs:
 
       # Si Goofish dio la sesión por caducada o bloqueó la búsqueda, se envía
       # un QR a Telegram para renovarla escaneando con la app (máx. 1 vez / 20 h).
-      - name: Xianyu QR renewal if needed
+      # Si la sesión de Xianyu ha caducado, se avisa por Telegram con un texto
+      # (máx. 1 vez / 20 h). Ya no se envía un QR: no se puede escanear con el
+      # mismo móvil en el que se ve. La sesión se renueva desde el Mac.
+      - name: Xianyu session renewal notice
         if: always()
-        env:
-          XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
         shell: bash
         run: |
-          if [ ! -f .xianyu/state/Nil.json ] || [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then exit 0; fi
+          if [ ! -f .xianyu/state/Nil.json ] || [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
           if [ "${XIANYU_SESSION_STATUS:-}" != "expired" ] && [ ! -f .xianyu-needs-login ]; then
-            echo "Xianyu session fine; no QR needed."; exit 0
+            echo "Xianyu session fine; no notice needed."; exit 0
           fi
           LAST=0
           [ -f .state/xianyu-qr-last ] && LAST=$(cat .state/xianyu-qr-last)
@@ -317,15 +318,11 @@ jobs:
           mkdir -p lh-upload
           echo "$LAST" > lh-upload/xianyu-qr-last
           if [ $((NOW-LAST)) -lt 72000 ]; then
-            echo "QR already requested in the last 20 h; skipping."; exit 0
+            echo "Renewal notice already sent in the last 20 h; skipping."; exit 0
           fi
           echo "$NOW" > lh-upload/xianyu-qr-last
-          if node scripts/xianyu-qr-login.mjs .xianyu/state/Nil.json 4; then
-            openssl enc -aes-256-cbc -salt -pbkdf2 -in .xianyu/state/Nil.json -out lh-upload/xianyu-state.enc -pass env:XIANYU_STATE_PASSWORD
-            mkdir -p lh-upload/xianyu-accounts
-            cp lh-upload/xianyu-state.enc lh-upload/xianyu-accounts/Nil.enc
-            echo "New Xianyu session saved."
-          fi
+          TEXT="🔑 La sesión de tu cuenta de Xianyu ha caducado en la nube y sus turnos no pueden buscar. Para renovarla, en tu Mac pídele a Claude «inicia sesión en Xianyu» (o ejecuta: cd ~/luxury-hunter && npm run xianyu:login)."
+          curl -s -o /dev/null -w "Telegram notice HTTP %{http_code}\n" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TEXT" || echo "Could not send the renewal notice"
 
       - name: Collect persistent state
         if: always()
