@@ -1,6 +1,6 @@
 # Luxury Hunter on GitHub Actions
 
-This mode runs the worker every 3 hours without depending on your Mac.
+This mode checks for due models through GitHub Actions without depending on your Mac.
 
 Important limitations:
 - GitHub-hosted runners are ephemeral. SQLite is restored from the previous workflow artifact and uploaded again at the end.
@@ -24,3 +24,17 @@ npm run cloud:encrypt-config
 ```
 
 Commit `cloud/config.enc`, not `cloud/config.json`.
+
+## Just One API budget
+
+Each paid Xianyu result page is one API request. In alternate mode, provider
+turns happen for individual model tasks inside a workflow run; one workflow run
+can therefore make several paid requests. Automatic chained runs honor each
+model's `interval_minutes` setting.
+
+Paid searches are spaced according to `XIANYU_JUSTONE_PAGES` and capped at 20
+requests per Madrid day and 650 per Madrid month. `XIANYU_DAILY_SEARCH_LIMIT`
+and `XIANYU_MONTHLY_SEARCH_LIMIT` may lower these ceilings, never raise them.
+At ¥0.20 per request, the daily ceiling limits a 31-day month to ¥124. After
+the daily cap, Just One API turns are skipped while the direct Xianyu account
+keeps its own turns. This reduces Xianyu coverage to keep the paid budget.

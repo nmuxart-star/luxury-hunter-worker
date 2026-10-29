@@ -121,18 +121,19 @@ XIANYU_PROVIDER=justoneapi
 JUSTONEAPI_TOKEN=tu_token
 ```
 
-Con Just One API se hace **como máximo una búsqueda cada 60 minutos** entre
-todas las tareas, sin entrar en fichas. El límite es de **650 intentos por mes**
-(hora de Madrid); también se cuentan las peticiones fallidas. Al llegar al
-límite, Xianyu se pausa hasta el mes siguiente y las demás fuentes continúan.
-`XIANYU_MONTHLY_SEARCH_LIMIT` puede bajar el límite, pero nunca subirlo por
-encima de 650. Si el estado persistente de GitHub no se recupera, Xianyu se
-pausa para no reiniciar el contador. La tarifa publicada el 27 de octubre de
-2026 es ¥0,20 por búsqueda: 650 intentos equivalen a ¥130, aproximadamente
-17,43 € al cambio de referencia de ese día. El coste en euros puede variar si
-cambian la tarifa o el tipo de cambio. El modo directo usa la búsqueda web y
-no consume Just One API. `XIANYU_SEARCH_MAX_AGE_HOURS` controla la antigüedad
-máxima de los anuncios. Los errores se registran sin detener las demás fuentes.
+Cada página de resultados de Just One API es una petición facturada. Una
+búsqueda de dos páginas genera dos cargos y nunca entra en fichas. Las
+búsquedas pagadas se espacian según el número de páginas y tienen un límite
+de **20 peticiones al día y 650 al mes** (hora de Madrid); también se cuentan
+los intentos fallidos. `XIANYU_DAILY_SEARCH_LIMIT` y
+`XIANYU_MONTHLY_SEARCH_LIMIT` pueden bajar esos límites, nunca subirlos.
+Al alcanzar el límite diario se omiten los turnos pagados hasta el día
+siguiente; la cuenta de Xianyu conserva sus turnos. Si no se recupera el
+estado persistente de GitHub, se pausan las búsquedas pagadas para proteger
+el contador. A ¥0,20 por petición, 20 al día durante un mes de 31 días serían
+¥124 como máximo. El coste en euros puede variar si cambian la tarifa o el
+tipo de cambio. `XIANYU_SEARCH_MAX_AGE_HOURS` controla la antigüedad máxima
+de los anuncios. Los errores se registran sin detener las demás fuentes.
 
 ## v1.7 — Más mercados y costes por origen
 

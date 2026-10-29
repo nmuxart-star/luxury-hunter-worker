@@ -5,7 +5,7 @@
 // Uso: node scripts/merge-state.mjs <destino.sqlite3> <otra1.sqlite3> [otra2...]
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import {xianyuBudgetMonth} from './xianyu-search-budget.mjs';
+import {xianyuBudgetMonth,xianyuBudgetDay,XIANYU_DAILY_SEARCH_LIMIT} from './xianyu-search-budget.mjs';
 
 const [target,...others]=process.argv.slice(2);
 if(!target||!fs.existsSync(target)){console.log('merge-state: falta la base de destino');process.exit(0);}
@@ -25,6 +25,24 @@ const monthNow=new Date().toISOString().slice(0,7);
 let month=(getSetting(db,'ai_spend_month')||{});if(month.month!==monthNow)month={month:monthNow,usd:0};
 let xianyuUsage=getSetting(db,'xianyu_search_usage');
 const xianyuMonth=xianyuBudgetMonth();
+const xianyuDay=xianyuBudgetDay();
+let xianyuLastPaidSearch=Number(getSetting(db,'xianyu_last_paid_search')||0);
+if(!Number.isFinite(xianyuLastPaidSearch))xianyuLastPaidSearch=0;
+function mergeXianyuUsage(candidate){
+  if(candidate?.month!==xianyuMonth||!Number.isSafeInteger(candidate.attempts)||candidate.attempts<0)return;
+  const current=xianyuUsage?.month===xianyuMonth?xianyuUsage:null;
+  const dailyUsed=value=>value?.day===xianyuDay&&Number.isSafeInteger(value.dayAttempts)
+    ?value.dayAttempts:value?.attempts>0&&!value?.day?XIANYU_DAILY_SEARCH_LIMIT:0;
+  xianyuUsage={
+    month:xianyuMonth,
+    attempts:Math.max(current?.attempts||0,candidate.attempts),
+    day:xianyuDay,
+    dayAttempts:Math.max(dailyUsed(current),dailyUsed(candidate))
+  };
+}
+const initialXianyuUsage=xianyuUsage;
+xianyuUsage=null;
+mergeXianyuUsage(initialXianyuUsage);
 
 const listingCols=cols(db,'listings').filter(c=>c!=='id');
 const analysisCols=hasTable(db,'task_analyses')?cols(db,'task_analyses').filter(c=>!['id','task_id','listing_id'].includes(c)):[];
@@ -86,8 +104,9 @@ for(const file of others){
   const sm=getSetting(src,'ai_spend_month');
   if(sm?.month===monthNow&&Number(sm.usd||0)>Number(month.usd||0))month=sm;
   const xu=getSetting(src,'xianyu_search_usage');
-  if(xu?.month===xianyuMonth&&Number.isSafeInteger(xu.attempts)&&xu.attempts>=0&&
-      (xianyuUsage?.month!==xianyuMonth||xu.attempts>Number(xianyuUsage.attempts||0)))xianyuUsage=xu;
+  mergeXianyuUsage(xu);
+  const srcLastPaid=Number(getSetting(src,'xianyu_last_paid_search')||0);
+  if(Number.isFinite(srcLastPaid))xianyuLastPaidSearch=Math.max(xianyuLastPaidSearch,srcLastPaid);
   src.close();
 }
 const cur=getSetting(db,'ai_spend');
@@ -96,4 +115,5 @@ if(lastDigest)putSetting('global_digest_state',{...(getSetting(db,'global_digest
 if(tgOffset)putSetting('telegram_update_offset',tgOffset);
 if(month.usd)putSetting('ai_spend_month',month);
 if(xianyuUsage?.month===xianyuMonth&&Number.isSafeInteger(xianyuUsage.attempts))putSetting('xianyu_search_usage',xianyuUsage);
+if(Number.isFinite(xianyuLastPaidSearch)&&xianyuLastPaidSearch>0)putSetting('xianyu_last_paid_search',xianyuLastPaidSearch);
 console.log(`merge-state: +${stats.listings} anuncios, +${stats.analyses} análisis, +${stats.notifications} avisos, +${stats.feedback} valoraciones; gasto IA hoy ${spendToday.toFixed(2)} $; último resumen ${lastDigest||'-'}`);
