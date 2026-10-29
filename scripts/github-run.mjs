@@ -159,8 +159,10 @@ try{
     const runnable=runAllTasks
       ? tasks.filter(t=>t.enabled)
       : tasks.filter(t=>due(t));
-    // Primero los modelos que llevan más tiempo sin revisarse.
-    runnable.sort((a,b)=>(Date.parse(a.last_run_at||'')||0)-(Date.parse(b.last_run_at||'')||0));
+    // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
+    // cada grupo, los que llevan más tiempo sin revisarse.
+    const priority=t=>Number(t.interval_minutes)||Infinity;
+    runnable.sort((a,b)=>(priority(a)-priority(b))||((Date.parse(a.last_run_at||'')||0)-(Date.parse(b.last_run_at||'')||0)));
     const estimate=taskMinutesEstimate();
     let started=0;
     const canStart=task=>{
