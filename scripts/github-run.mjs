@@ -57,7 +57,9 @@ const child=spawn(process.execPath,['server.mjs'],{cwd:root,env:{
   ...process.env,
   DISABLE_SCHEDULER:'1',
   PORT:'8200',
-  ...(globalEmailTo&&!process.env.GLOBAL_EMAIL_TO?{GLOBAL_EMAIL_TO:globalEmailTo}:{})
+  ...(globalEmailTo&&!process.env.GLOBAL_EMAIL_TO?{GLOBAL_EMAIL_TO:globalEmailTo}:{}),
+  // Hoja de oportunidades: el ID va en la configuración cifrada, no en los logs.
+  ...(cfg.opportunities_sheet_id&&!process.env.OPPORTUNITIES_SHEET_ID?{OPPORTUNITIES_SHEET_ID:String(cfg.opportunities_sheet_id)}:{})
 },stdio:'inherit'});
 const envInt=(name,fallback,min,max)=>{
   const n=Number(process.env[name]);

@@ -51,7 +51,11 @@ if(grow) global_email={...global_email,...(parse(grow.value_json,{})||{})};
 // Referencias de Vestiaire capturadas por Nil (van cifradas, no se publican).
 let vestiaire_refs=null;
 try{vestiaire_refs=JSON.parse(fs.readFileSync(path.join(root,'data','vestiaire-refs.json'),'utf8'));}catch{}
-const out={version:3,exported_at:new Date().toISOString(),tasks,economics,global_email,vestiaire_refs};
+// ID de la hoja "Oportunidades Luxury Hunter" (va cifrado, no se publica).
+let envFile='';
+try{envFile=fs.readFileSync(path.join(root,'.env'),'utf8');}catch{}
+const opportunities_sheet_id=String(process.env.OPPORTUNITIES_SHEET_ID||envFile.match(/^OPPORTUNITIES_SHEET_ID=(.*)$/m)?.[1]||'').trim()||null;
+const out={version:3,exported_at:new Date().toISOString(),tasks,economics,global_email,vestiaire_refs,opportunities_sheet_id};
 fs.mkdirSync(path.join(root,'cloud'),{recursive:true});
 const outPath=path.join(root,'cloud','config.json');
 fs.writeFileSync(outPath,JSON.stringify(out,null,2)+'\n');

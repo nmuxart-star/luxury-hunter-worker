@@ -4159,6 +4159,7 @@ const VESTIAIRE_SHEET_REFRESH_MS=Math.max(5,Number(process.env.VESTIAIRE_SHEET_R
 let vestiaireSheetCache=null;
 let vestiaireSheetPromise=null;
 let googleSheetsToken=null;
+let googleSheetsWriteToken=null;
 
 // Clave de la cuenta de servicio: en la nube va en el secreto; en el Mac, en
 // un archivo (GOOGLE_SHEETS_SA_FILE, carpeta private/ que no se sube a git).
@@ -4172,14 +4173,17 @@ function googleSheetsSaRaw(){
 function vestiaireSheetConfigured(){
   return !!(String(process.env.VESTIAIRE_SHEET_ID||'').trim()&&(googleSheetsSaRaw()||String(process.env.GOOGLE_SHEETS_API_KEY||'').trim()));
 }
-async function googleSheetsAuth(){
+// write=true pide permiso de escritura (solo para la hoja de oportunidades).
+async function googleSheetsAuth(write=false){
   const raw=googleSheetsSaRaw();
   if(!raw)return {query:`key=${encodeURIComponent(String(process.env.GOOGLE_SHEETS_API_KEY||'').trim())}`,headers:{}};
-  if(googleSheetsToken&&googleSheetsToken.exp>Date.now()+60e3)return {query:'',headers:{authorization:`Bearer ${googleSheetsToken.token}`}};
+  const cached=write?googleSheetsWriteToken:googleSheetsToken;
+  if(cached&&cached.exp>Date.now()+60e3)return {query:'',headers:{authorization:`Bearer ${cached.token}`}};
   const sa=JSON.parse(raw);
   const now=Math.floor(Date.now()/1000);
   const b64=o=>Buffer.from(JSON.stringify(o)).toString('base64url');
-  const unsigned=`${b64({alg:'RS256',typ:'JWT'})}.${b64({iss:sa.client_email,scope:'https://www.googleapis.com/auth/spreadsheets.readonly',aud:'https://oauth2.googleapis.com/token',iat:now,exp:now+3600})}`;
+  const scope=write?'https://www.googleapis.com/auth/spreadsheets':'https://www.googleapis.com/auth/spreadsheets.readonly';
+  const unsigned=`${b64({alg:'RS256',typ:'JWT'})}.${b64({iss:sa.client_email,scope,aud:'https://oauth2.googleapis.com/token',iat:now,exp:now+3600})}`;
   const sig=createSign('RSA-SHA256').update(unsigned).sign(sa.private_key,'base64url');
   const r=await fetch('https://oauth2.googleapis.com/token',{
     method:'POST',
@@ -4189,8 +4193,77 @@ async function googleSheetsAuth(){
   });
   const j=await r.json().catch(()=>({}));
   if(!r.ok||!j.access_token)throw new Error(`Google token: ${j.error_description||j.error||r.status}`);
-  googleSheetsToken={token:j.access_token,exp:Date.now()+Number(j.expires_in||3600)*1000};
+  const token={token:j.access_token,exp:Date.now()+Number(j.expires_in||3600)*1000};
+  if(write)googleSheetsWriteToken=token;else googleSheetsToken=token;
   return {query:'',headers:{authorization:`Bearer ${j.access_token}`}};
+}
+
+// OPORTUNIDADES EN GOOGLE SHEETS
+// Cada anuncio con nota de IA > 60 y precio válido se añade una sola vez a la
+// hoja "Oportunidades Luxury Hunter" (OPPORTUNITIES_SHEET_ID) con el coste
+// real puesto en España y la reventa. Cálculo de autónomo en el régimen de
+// bienes usados (REBU): el IVA de importación se paga y forma parte del coste,
+// y al vender se paga el 21 % sobre el margen (IVA incluido: margen × 21/121).
+// Las columnas de venta son fórmulas: si cambias el precio de venta sugerido,
+// la comisión, el IVA y el beneficio se recalculan.
+const OPPORTUNITY_SHEET_MIN_SCORE=60;
+const OPPORTUNITY_SOURCE_LABELS={
+  'xianyu':'Xianyu','bunjang':'Bunjang','mercari-jp':'Mercari','rakuma-jp':'Rakuma',
+  'yahoo-auctions-jp':'Yahoo! Auctions','yahoo-fleamarket-jp':'Yahoo! Flea Market',
+  '2ndstreet-jp':'2nd Street','komehyo-jp':'Komehyo','rakuten-jp':'Rakuten'
+};
+function opportunitySheetRow(r){
+  const c=importEconomics(r);
+  const text=v=>{const s=String(v??'').replace(/\s+/g,' ').trim();return /^[=+\-@]/.test(s)?`'${s}`:s;};
+  const money=v=>Number.isFinite(Number(v))?roundMoney(Number(v)):'';
+  const d=new Date(r.analyzed_at||Date.now());
+  const p=Object.fromEntries(new Intl.DateTimeFormat('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(d).map(x=>[x.type,x.value]));
+  const source=String(r.source||'');
+  const web=OPPORTUNITY_SOURCE_LABELS[source]||(source.startsWith('ebay-')?`eBay ${source.slice(5).toUpperCase()}`:source);
+  const low=Number(r.resale_low_eur), high=Number(r.resale_high_eur);
+  const mid=[low,high].filter(v=>Number.isFinite(v)&&v>0);
+  const suggested=mid.length?Math.round(mid.reduce((a,b)=>a+b,0)/mid.length/10)*10:'';
+  const col=letter=>`INDIRECT("${letter}"&ROW())`;
+  const origin=Number(r.original_price);
+  return [
+    `${p.day}/${p.month}/${p.year} ${p.hour}:${p.minute}`,
+    text(r.task_name), text(web), String(r.url||''), text(String(r.title||'').slice(0,140)),
+    Number(r.opportunity_score)||'', text(r.decision), text(r.authenticity_risk),
+    Number.isFinite(origin)&&origin>0?text(`${origin.toLocaleString('es-ES')} ${r.currency||''}`):'',
+    money(c.productPriceEur), money(c.domesticShippingEur), money(c.agentFeeEur),
+    money(c.paymentFeeEur+c.verificationFeeEur), money(c.internationalShippingEur),
+    money(c.customsValueEur), c.customsDutyPercent, money(c.customsDutyEur), money(c.importVatEur),
+    money(c.clearanceFeeEur), money(c.authenticationFeeEur), money(c.otherEur), money(c.importedTotalEur),
+    Number.isFinite(low)&&low>0?Math.round(low):'', Number.isFinite(high)&&high>0?Math.round(high):'', suggested,
+    `=${col('Y')}*20/100`,
+    `=(${col('Y')}-${col('V')}+ABS(${col('Y')}-${col('V')}))/2*21/121`,
+    `=${col('Y')}-${col('V')}-${col('Z')}-${col('AA')}`,
+    `=ROUND(${col('AB')}/${col('V')}*100)`
+  ];
+}
+async function syncOpportunitiesSheet(){
+  const id=String(process.env.OPPORTUNITIES_SHEET_ID||'').trim();
+  if(!id||!googleSheetsSaRaw())return {added:0,reason:'not_configured'};
+  const since=new Date(Date.now()-72*3600e3).toISOString();
+  const rows=db.prepare(`SELECT l.*,a.task_id,t.task_name,a.decision,a.opportunity_score,a.authenticity_risk,
+      a.resale_low_eur,a.resale_high_eur,a.updated_at AS analyzed_at
+    FROM task_analyses a JOIN listings l ON l.id=a.listing_id JOIN tasks t ON t.id=a.task_id
+    WHERE a.opportunity_score>? AND a.updated_at>=? AND COALESCE(l.price_eur,0)>0
+      AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.listing_id=l.id AND n.kind='sheet')
+    ORDER BY a.updated_at LIMIT 200`).all(OPPORTUNITY_SHEET_MIN_SCORE,since);
+  const seen=new Set();
+  const picks=rows.filter(r=>!seen.has(r.id)&&seen.add(r.id));
+  if(!picks.length)return {ok:true,added:0};
+  const auth=await googleSheetsAuth(true);
+  const url=`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(id)}/values/${encodeURIComponent('Oportunidades!A1')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const r=await fetch(url,{method:'POST',headers:{...auth.headers,'content-type':'application/json'},
+    body:JSON.stringify({values:picks.map(opportunitySheetRow)}),signal:AbortSignal.timeout(30000)});
+  if(!r.ok)throw new Error(`Hoja de oportunidades HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,NULL,'sheet','google-sheets',?)`);
+  const now=new Date().toISOString();
+  for(const x of picks)mark.run(Number(x.task_id),Number(x.id),now);
+  console.log(`Hoja de oportunidades: ${picks.length} anuncio(s) añadidos.`);
+  return {ok:true,added:picks.length};
 }
 function sheetNumber(v){
   if(typeof v==='number')return Number.isFinite(v)?v:null;
@@ -10317,6 +10390,12 @@ async function executeTask(taskId, runId=null) {
     }catch(e){
       result.status.instantAlerts={sent:0,error:e.message};
       console.error(`Instant alerts task ${taskId}:`,e.message);
+    }
+    try{
+      result.status.opportunitiesSheet=await syncOpportunitiesSheet();
+    }catch(e){
+      result.status.opportunitiesSheet={ok:false,added:0,error:e.message};
+      console.error(`Opportunities sheet task ${taskId}:`,e.message);
     }
     await reportRunHealth(result.status).catch(e=>console.error('Run health:',e.message));
 
