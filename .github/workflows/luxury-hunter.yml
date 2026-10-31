@@ -70,6 +70,8 @@ jobs:
       XIANYU_JUSTONE_SORT: ${{ vars.XIANYU_JUSTONE_SORT || 'active' }}
       # Páginas de Just One API por búsqueda (10 anuncios y una llamada cada una).
       XIANYU_JUSTONE_PAGES: ${{ vars.XIANYU_JUSTONE_PAGES || '1' }}
+      # 1 = Just One API apagada: en modo alterno todas las tareas buscan con la cuenta.
+      XIANYU_JUSTONE_DISABLED: ${{ vars.XIANYU_JUSTONE_DISABLED || '' }}
       # Xianyu con Just One API: solo una búsqueda, sin consultar fichas.
       XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || (vars.XIANYU_PROVIDER == 'direct' && '2' || '1') }}
       XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || '60' }}

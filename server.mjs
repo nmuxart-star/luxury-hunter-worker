@@ -2830,6 +2830,14 @@ async function searchXianyuAlternate(opts){
     return {res,searched};
   };
 
+  // XIANYU_JUSTONE_DISABLED=1: Just One API queda apagada hasta nuevo aviso
+  // de Nil. Todas las tareas buscan con su cuenta y no se avisa de su saldo.
+  if(['1','true','yes','on'].includes(String(process.env.XIANYU_JUSTONE_DISABLED||'').toLowerCase())){
+    xianyuMarkProvider('direct');
+    console.log(`Xianyu: Just One API desactivada; esta tarea busca con la cuenta${accountBlocked?' (comprobando si ya funciona)':''}.`);
+    const acc=await runAccount();
+    return {...acc.res,provider:'direct',accountBlocked:acc.verification,justOneDisabled:true};
+  }
   if(xianyuLastProvider()!=='justoneapi'){
     xianyuMarkProvider('justoneapi');
     console.log(`Xianyu (alterno): turno de Just One API${accountBlocked?' (la cuenta de Xianyu pide verificación: 1 página)':''}.`);
