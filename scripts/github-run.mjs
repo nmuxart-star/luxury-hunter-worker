@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import {shouldRunAllTasks} from './github-run-schedule.mjs';
+import {shouldRunAllTasks,isDue as due,nextDueTask} from './github-run-schedule.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -23,15 +23,6 @@ async function api(method,url,body){
   const txt=await r.text(); let data={}; try{data=txt?JSON.parse(txt):{}}catch{data={raw:txt}}
   if(!r.ok) throw new Error(`${method} ${url}: ${r.status} ${data.error||txt}`);
   return data;
-}
-function due(task,now=new Date()){
-  if(!task.enabled) return false;
-  if(task.interval_minutes){
-    if(!task.last_run_at) return true;
-    return now.getTime()-new Date(task.last_run_at).getTime() >= Number(task.interval_minutes)*60000-120000;
-  }
-  // GitHub Actions v1.5 is optimized for interval tasks. Cron tasks are left to the local scheduler.
-  return false;
 }
 async function waitServer(){
   for(let i=0;i<60;i++){
@@ -76,8 +67,15 @@ const CYCLE_MIN_MINUTES=envInt('CYCLE_MIN_MINUTES',20,5,180);
 // según lo que tardó en sus últimas pasadas, le da tiempo a terminar; los
 // demás pasan a la siguiente ejecución. 0 = todas las tareas en cada pasada.
 const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
+// Si al arrancar todavía no toca ningún modelo, la ejecución espera al
+// siguiente (como mucho IDLE_WAIT_MAX_MINUTES) en vez de terminar vacía:
+// una ejecución vacía no encadena la siguiente y el bot se quedaba parado
+// hasta el cron de GitHub, que llega con horas de retraso.
+const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
 const workerStartedAt=Date.now();
-const elapsedMinutes=()=>(Date.now()-workerStartedAt)/60000;
+// El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
+let budgetStartedAt=workerStartedAt;
+const elapsedMinutes=()=>(Date.now()-budgetStartedAt)/60000;
 // Minutos que tarda cada modelo: media de sus 3 últimas pasadas (25 si no hay).
 function taskMinutesEstimate(){
   const byTask=new Map();
@@ -155,12 +153,22 @@ try{
   while(true){
     cycle++;
     const cycleStartedAt=Date.now();
-    const tasks=(await api('GET','/api/tasks')).tasks||[];
+    let tasks=(await api('GET','/api/tasks')).tasks||[];
     // Las ejecuciones encadenadas respetan interval_minutes de cada modelo.
     // Solo un lanzamiento manual real fuerza todas las tareas activas.
-    const runnable=runAllTasks
+    let runnable=runAllTasks
       ? tasks.filter(t=>t.enabled)
       : tasks.filter(t=>due(t));
+    if(!runnable.length&&cycle===1&&IDLE_WAIT_MAX_MINUTES>0){
+      const next=nextDueTask(tasks);
+      if(next&&next.ms<=IDLE_WAIT_MAX_MINUTES*60000){
+        console.log(`Todavía no toca ningún modelo; espero ${Math.ceil(next.ms/60000)} min hasta ${next.task.task_name} para no cortar la cadena.`);
+        await sleep(next.ms+5000);
+        budgetStartedAt=Date.now();
+        tasks=(await api('GET','/api/tasks')).tasks||[];
+        runnable=tasks.filter(t=>due(t));
+      }
+    }
     // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
     // cada grupo, los que llevan más tiempo sin revisarse.
     const priority=t=>Number(t.interval_minutes)||Infinity;
