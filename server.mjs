@@ -7800,6 +7800,24 @@ function effectivePlan(basePlan, taskOrBody={}) {
   if(Array.isArray(j)&&j.length) plan.japan=normalizeLines(j);
   return plan;
 }
+// Tareas "Radar ...": recorren por turnos una lista larga de modelos. Cada
+// ejecución empieza la lista por los siguientes modelos de cada web, porque
+// solo se usan las primeras búsquedas (1 en Xianyu, 2 en Japón, 2 en Corea).
+const RADAR_STEP={xianyu:1,japan:2,bunjang:2};
+function radarRotatePlan(plan,taskId){
+  if(!taskId)return plan;
+  const task=db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId);
+  if(!/^radar\b/i.test(String(task?.task_name||'')))return plan;
+  const turn=db.prepare('SELECT COUNT(*) AS n FROM task_runs WHERE task_id=?').get(taskId).n;
+  const out={...plan};
+  for(const [key,step] of Object.entries(RADAR_STEP)){
+    const list=Array.isArray(plan[key])?plan[key]:[];
+    if(list.length<2)continue;
+    const off=(turn*step)%list.length;
+    out[key]=[...list.slice(off),...list.slice(0,off)];
+  }
+  return out;
+}
 function buildExecutionManifest(task, plan, run=null, session=null) {
   const sources = task.sources || ['xianyu','bunjang','buyee'];
   const pages=clampInt(task.max_pages,1,1,5);
@@ -7915,8 +7933,8 @@ async function globalSearch(body) {
     ? configuredPlan
     : await buildQueryPlan(product);
 
-  const plan=effectivePlan(basePlan,body);
   const taskId=body.taskId?Number(body.taskId):null;
+  const plan=radarRotatePlan(effectivePlan(basePlan,body),taskId);
   db.prepare('INSERT INTO search_sessions(id,product_query,query_plan_json,status,started_at,task_id) VALUES(?,?,?,?,?,?)').run(sessionId,product,JSON.stringify(plan),'running',startedAt,taskId);
   if(body.runId) db.prepare('UPDATE task_runs SET session_id=? WHERE id=?').run(sessionId,Number(body.runId));
   const status={};
