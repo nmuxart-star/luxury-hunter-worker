@@ -72,7 +72,7 @@ const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
 // una ejecución vacía no encadena la siguiente y el bot se quedaba parado
 // hasta el cron de GitHub, que llega con horas de retraso.
 const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
-const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',1,0,6);
+const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',2,0,6);
 const workerStartedAt=Date.now();
 // El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
 let budgetStartedAt=workerStartedAt;
@@ -172,7 +172,8 @@ try{
     }
     // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
     // cada grupo, los que llevan más tiempo sin revisarse.
-    // Relojes después de los bolsos y como mucho WATCH_MAX_PER_RUN por ejecución.
+    // Relojes después de los bolsos (nunca les quitan sitio: la cola no se salta tareas)
+    // y como mucho WATCH_MAX_PER_RUN (2) por ejecución, por nivel y antigüedad.
     const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN});
     runnable=plan.tasks;
     if(plan.deferred.length)console.log(`Relojes aplazados a la siguiente ejecución: ${plan.deferred.map(t=>t.task_name).join(', ')}.`);

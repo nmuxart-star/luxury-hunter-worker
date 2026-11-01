@@ -369,7 +369,7 @@ function saveEconomics(value){
 function roundMoney(n){ return Math.round((Number(n)+Number.EPSILON)*100)/100; }
 // Relojes (arancel propio): palabras genéricas de reloj en cada idioma y las
 // marcas/modelos que se buscan. Los bolsos de estas marcas no las llevan.
-const WATCH_ITEM_RE=/腕時計|ウォッチ|手表|腕表|機械表|机械表|시계|\bwristwatch|\bwatch\b|クロノグラフ|chronograph|speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|rolex|ロレックス|劳力士|롤렉스|tudor|チューダー|チュードル|帝舵|튜더|grand seiko|グランドセイコー|冠蓝狮|그랜드세이코|santos de cartier|cartier (santos|tank|ballon)|サントス|タンク(フランセーズ|マスト|ソロ)|山度士|坦克|蓝气球|오메가|オメガ|欧米茄/i;
+const WATCH_ITEM_RE=/腕時計|ウォッチ|手表|腕表|機械表|机械表|시계|\bwristwatch|\bwatch\b|クロノグラフ|chronograph|speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|rolex|ロレックス|劳力士|롤렉스|tudor|チューダー|チュードル|帝舵|튜더|grand seiko|グランドセイコー|冠蓝狮|그랜드세이코|santos de cartier|cartier (santos|tank|ballon)|tag heuer|タグホイヤー|泰格豪雅|태그호이어|サントス|タンク(フランセーズ|マスト|ソロ)|山度士|坦克|蓝气球|오메가|オメガ|欧米茄/i;
 function importEconomics(item, settings=getEconomics()){
   const product=finiteOr(item?.price_eur,0);
   const rawSource=String(item?.source||'').toLowerCase();
@@ -1011,6 +1011,14 @@ function assertAiBudget(){
 // Las verificaciones (búsqueda web + modelo potente, ~0,05-0,09 $ cada una)
 // tienen su propio tope diario para que nunca dejen sin presupuesto al
 // triaje y al análisis, que son los que encuentran oportunidades nuevas.
+function watchTaskIds(){return db.prepare('SELECT id,task_name FROM tasks').all().filter(t=>isWatchTask(t.task_name)).map(t=>Number(t.id));}
+// Análisis IA de hoy en tareas de relojes (sin contar los descartes del pre-filtro, que no gastan IA).
+function watchAnalysesToday(){
+  const ids=watchTaskIds();
+  if(!ids.length)return 0;
+  const since=new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z').toISOString();
+  return db.prepare(`SELECT COUNT(*) AS n FROM task_analyses WHERE task_id IN (${ids.map(()=>'?').join(',')}) AND updated_at>=? AND COALESCE(verification_json,'') NOT LIKE '%"prescreen"%'`).get(...ids,since).n;
+}
 function watchVerificationsToday(){
   const ids=db.prepare('SELECT id,task_name FROM tasks').all().filter(t=>isWatchTask(t.task_name)).map(t=>Number(t.id));
   if(!ids.length)return 0;
@@ -9740,7 +9748,7 @@ function importCostLines(x){
 // Relojes: se venden en Chrono24 como particular (CHRONO24_COMMISSION_PCT,
 // 6,5 % por defecto); los bolsos en Vestiaire (VESTIAIRE_COMMISSION_PCT, 20 %).
 // Igual que scripts/github-run-schedule.mjs (WATCH_TASK_RE).
-const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon)|\biwc\b|jaeger|breitling|patek|audemars|panerai|\breloj|\bwatch/i;
+const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon)|\biwc\b|jaeger|breitling|patek|audemars|panerai|tag heuer|\bheuer\b|\breloj|\bwatch/i;
 function isWatchTask(name){return WATCH_TASK_RE.test(String(name||''));}
 function resalePlatform(taskName){
   return isWatchTask(taskName)
@@ -10306,6 +10314,18 @@ async function executeTask(taskId, runId=null) {
         }
 
         pendingItems.push(item);
+      }
+
+      // Relojes: tope diario de análisis IA (WATCH_MAX_ANALYSES_PER_DAY, 60) entre
+      // todas las tareas de relojes, para no gastar el presupuesto de los bolsos.
+      // Lo que no cabe hoy queda sin analizar y se analiza en otra ejecución.
+      if(isWatchTask(task.task_name)){
+        const cap=Number(process.env.WATCH_MAX_ANALYSES_PER_DAY||60);
+        const room=Math.max(0,cap-watchAnalysesToday());
+        if(pendingItems.length>room){
+          console.log(`Relojes: tope diario de análisis (${cap}); se analizan ${room} de ${pendingItems.length} y el resto queda para otra ejecución.`);
+          pendingItems=pendingItems.slice(0,room);
+        }
       }
 
       result.status.prescreen={ok:true,...prescreenStats};
