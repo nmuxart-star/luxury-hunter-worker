@@ -367,6 +367,7 @@ function saveEconomics(value){
   return clean;
 }
 function roundMoney(n){ return Math.round((Number(n)+Number.EPSILON)*100)/100; }
+const WATCH_ITEM_RE=/speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|腕時計|手表|腕表|クロノグラフ/i;
 function importEconomics(item, settings=getEconomics()){
   const product=finiteOr(item?.price_eur,0);
   const rawSource=String(item?.source||'').toLowerCase();
@@ -393,8 +394,12 @@ function importEconomics(item, settings=getEconomics()){
   const cfg=settings.sources[sourceKey]||settings.sources.xianyu;
   const euInternal=cfg.euInternal===true;
   const textile=TEXTILE_BAG_RE.test(`${item?.title||''} ${item?.description||''}`);
+  // Relojes de pulsera (CN 9102): arancel propio, 4,5 % por defecto (WATCH_DUTY_PCT).
+  const watchItem=WATCH_ITEM_RE.test(`${item?.title||''} ${item?.description||''}`);
   const dutyPercent=euInternal
     ? 0
+    : watchItem
+      ? finiteOr(Number(process.env.WATCH_DUTY_PCT),4.5)
     : textile
       ? Math.max(finiteOr(cfg.customsDutyPercent,0),finiteOr(settings.textileDutyPercent,3.7))
       : finiteOr(cfg.customsDutyPercent,0);
@@ -1001,6 +1006,12 @@ function assertAiBudget(){
 // Las verificaciones (búsqueda web + modelo potente, ~0,05-0,09 $ cada una)
 // tienen su propio tope diario para que nunca dejen sin presupuesto al
 // triaje y al análisis, que son los que encuentran oportunidades nuevas.
+function watchVerificationsToday(){
+  const ids=db.prepare('SELECT id,task_name FROM tasks').all().filter(t=>isWatchTask(t.task_name)).map(t=>Number(t.id));
+  if(!ids.length)return 0;
+  const since=new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z').toISOString();
+  return db.prepare(`SELECT COUNT(*) AS n FROM task_analyses WHERE task_id IN (${ids.map(()=>'?').join(',')}) AND updated_at>=? AND verification_json LIKE '%"status":"verified"%'`).get(...ids,since).n;
+}
 function verifyBudgetLeftUsd(){
   if(manualAiStore.getStore())return Infinity;
   let budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
@@ -3978,7 +3989,7 @@ async function searchJapanRadarLive(opts){
 // POSITIVE MARKET VERIFICATION V1.6
 const CENTRAL_AI_INSTRUCTION = `You are the first-pass central AI screening engine for Luxury Hunter. Analyze this second-hand luxury handbag listing conservatively for resale in Europe. First verify that the listing appears to match the target product family; search-query similarity is not proof. The user's task requirements below are mandatory evaluation context. Never certify authenticity from photos alone.
 
-RESALE REFERENCE: when estimating the European resale price, use Vestiaire Collective prices as the primary reference (Nil resells against Vestiaire). Other resellers (Collector Square, The RealReal, Fashionphile, eBay...) are secondary evidence used to confirm or adjust.
+RESALE REFERENCE: when estimating the European resale price, use Vestiaire Collective prices as the primary reference (Nil resells against Vestiaire). Other resellers (Collector Square, The RealReal, Fashionphile, eBay...) are secondary evidence used to confirm or adjust. WATCHES are the exception: for watch tasks Nil resells on Chrono24 as a private seller, so Chrono24 prices for the exact reference (same reference number, similar year, condition and box/papers) are the primary resale reference; Watchfinder and similar dealers are secondary.
 
 EXOTIC SKIN POLICY (mandatory): if the title, description or photos indicate genuine exotic leather (crocodile, alligator, caiman, python or other snake, ostrich, lizard, stingray/galuchat, eel), decision MUST be REJECT with the reason "piel exótica (CITES)". Embossed/printed calf leather imitating these is NOT exotic.
 
@@ -4245,7 +4256,7 @@ function opportunitySheetRow(r){
     money(c.customsValueEur), c.customsDutyPercent, money(c.customsDutyEur), money(c.importVatEur),
     money(c.clearanceFeeEur), money(c.authenticationFeeEur), money(c.otherEur), money(c.importedTotalEur),
     Number.isFinite(low)&&low>0?Math.round(low):'', Number.isFinite(high)&&high>0?Math.round(high):'', suggested,
-    `=${col('Y')}*20/100`,
+    `=${col('Y')}*${resalePlatform(r.task_name).fee}/100`,
     `=(${col('Y')}-${col('V')}+ABS(${col('Y')}-${col('V')}))/2*21/121`,
     `=${col('Y')}-${col('V')}-${col('Z')}-${col('AA')}`,
     `=ROUND(${col('AB')}/${col('V')}*100)`
@@ -4294,7 +4305,7 @@ function priceStats(list){
 function vestiaireSheetTab(values,today){
   const head=(values[0]||[]).map(h=>String(h||'').trim().toLowerCase());
   const col=name=>head.indexOf(name);
-  const c={likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €')};
+  const c={likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
   if(c.ref<0||c.price<0)return null;
   const get=(row,i)=>i>=0?row[i]:'';
   const yes=v=>/^s[ií]|^yes|^true/i.test(String(v||'').trim());
@@ -4325,7 +4336,7 @@ function vestiaireSheetTab(values,today){
       likes:sheetNumber(get(row,c.likes)),
       notes:String(get(row,c.notes)||'').trim().slice(0,200),
       checked:String(get(row,c.checked)||'').trim(),
-      url:`https://es.vestiairecollective.com/${id}.shtml`,
+      url:/^https?:\/\//.test(String(get(row,c.url)||''))?String(get(row,c.url)).trim():`https://es.vestiairecollective.com/${id}.shtml`,
       sold,
       sold_price_eur:sold?soldPrice:null,
       sold_price_suspect:soldSuspect||undefined,
@@ -4419,7 +4430,10 @@ const sheetNorm=t=>String(t||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLower
 // "Talla / tipo" lleva el modelo: si el anuncio nombra alguno, solo valen esos.
 function vestiaireModelFilter(fichas,text){
   const t=sheetNorm(text);
-  const named=fichas.filter(f=>{const m=sheetNorm(f.size).trim();return m.length>=4&&!VESTIAIRE_SIZE_RE.some(([,re])=>re.test(m))&&t.includes(m);});
+  // Referencias de reloj: "3510.50" = "3510-50" = "351050".
+  const flat=v=>v.replace(/[.\-\s\/]/g,'');
+  const tf=flat(t);
+  const named=fichas.filter(f=>{const m=sheetNorm(f.size).trim();return m.length>=4&&!VESTIAIRE_SIZE_RE.some(([,re])=>re.test(m))&&(t.includes(m)||(/\d{3}/.test(m)&&flat(m).length>=5&&tf.includes(flat(m))));});
   return named.length?named:null;
 }
 function vestiaireMatchFichas(fichas,item){
@@ -4576,7 +4590,7 @@ function luxuryComparableValuationWeight(c){
 
   // Vestiaire Collective es la referencia principal de Nil para revender:
   // sus anuncios pesan el doble que los de otras webs (que siguen contando).
-  if(/(^|\.)vestiairecollective\.com/i.test(hostOf(url))){
+  if(/(^|\.)(vestiairecollective\.com|chrono24\.[a-z.]+)$/i.test(hostOf(url))){
     weight*=VESTIAIRE_VALUATION_WEIGHT;
   }
 
@@ -4985,7 +4999,10 @@ const TRUSTED_LUXURY_MARKET_DOMAINS=Object.freeze([
   'sellierknightsbridge.com',
   'luxurypromise.com',
   'handbagclinic.co.uk',
-  'resee.com'
+  'resee.com',
+  // Relojes: Chrono24 es el mercado de reventa de Nil para relojes.
+  'chrono24.com','chrono24.es','chrono24.de','chrono24.fr','chrono24.it','chrono24.co.uk','chrono24.ch','chrono24.at','chrono24.nl',
+  'watchfinder.co.uk','watchfinder.com','bobswatches.com','crownandcaliber.com','wristcheck.com','the1916company.com'
 ]);
 
 const SECONDARY_LUXURY_MARKET_DOMAINS=Object.freeze([
@@ -4999,6 +5016,7 @@ const SECONDARY_LUXURY_MARKET_DOMAINS=Object.freeze([
 
 const EUROPE_PRIORITY_LUXURY_MARKET_DOMAINS=Object.freeze([
   'vestiairecollective.com',
+  'chrono24.com','chrono24.es','chrono24.de','chrono24.fr','chrono24.it','chrono24.co.uk','chrono24.ch','chrono24.at','chrono24.nl','watchfinder.co.uk',
   'collectorsquare.com',
   'hardlyeverwornit.com',
   'saclab.com',
@@ -5121,7 +5139,11 @@ function trustedLuxuryMarketSourceName(value){
     'sellierknightsbridge.com':'Sellier Knightsbridge',
     'luxurypromise.com':'Luxury Promise',
     'handbagclinic.co.uk':'Handbag Clinic',
-    'resee.com':'ReSee'
+    'resee.com':'ReSee',
+    'chrono24.com':'Chrono24','chrono24.es':'Chrono24','chrono24.de':'Chrono24','chrono24.fr':'Chrono24','chrono24.it':'Chrono24',
+    'chrono24.co.uk':'Chrono24','chrono24.ch':'Chrono24','chrono24.at':'Chrono24','chrono24.nl':'Chrono24',
+    'watchfinder.co.uk':'Watchfinder','watchfinder.com':'Watchfinder','bobswatches.com':"Bob's Watches",
+    'crownandcaliber.com':'Crown & Caliber','wristcheck.com':'Wristcheck','the1916company.com':'The 1916 Company'
   };
 
   for(const [domain,label] of Object.entries(labels)){
@@ -7661,7 +7683,10 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const worthVerifying=['BUY','STRONG BUY'].includes(preliminaryDecision)||
     (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin)||
     bigMarginWatch;
-  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&worthVerifying&&verifyBudgetLeftUsd()<=0){
+  // Relojes: como mucho WATCH_VERIFY_MAX_PER_DAY verificaciones caras al día,
+  // para que nunca dejen sin presupuesto de verificación a los bolsos.
+  const watchQuotaOut=isWatchTask(task?.task_name)&&watchVerificationsToday()>=Number(process.env.WATCH_VERIFY_MAX_PER_DAY||3);
+  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&worthVerifying&&(verifyBudgetLeftUsd()<=0||watchQuotaOut)){
     // Candidato serio pero sin presupuesto de verificación hoy: se verifica
     // en cuanto haya presupuesto (mañana), en vez de perderlo.
     verification={
@@ -8748,7 +8773,9 @@ function noPriceVeto(item){
 const XIANYU_REPLICA_TERMS=[
   '高仿','复刻','精仿','仿品','仿款','a货','超a','m货','莆田','一比一','1:1','高版本','顶配','对版','肉眼无法辨别',
   '同款皮','原厂皮','原版皮','纯原','工厂货','厂家直','代工厂','同厂','微商','顶级天花板','天花板版本','高端店定制','定制款','原单','尾单',
-  'replica','super copy','supercopy','mirror quality'
+  'replica','super copy','supercopy','mirror quality',
+  // Relojes
+  '复刻表','超级复刻','clean厂','vs厂','zf厂','n厂','ar厂','noob','3a货','改装表','后配表盘','后配'
 ];
 // Garantías y negaciones que no indican réplica ("假一赔十", "非高仿"...).
 const XIANYU_REPLICA_SAFE=/假一赔\S*|假货?(包退|包赔|必究|十倍|赔)\S*|(非|不是|绝非|并非|拒绝|杜绝|不卖|不做|没有|无)\s*(高仿|复刻|精仿|仿品|a货|莆田|假货)/gi;
@@ -8778,11 +8805,41 @@ function xianyuTooCheapVeto(item,task){
   };
 }
 
+// RELOJES EN XIANYU (regla de Nil): además de 验货宝, solo vendedores
+// profesionales con buenas valoraciones. Si no se puede comprobar, se descarta.
+function xianyuWatchSellerVeto(item,task){
+  if(String(item?.source||'').toLowerCase()!=='xianyu'||!isWatchTask(task?.task_name))return null;
+  let si=null;try{si=JSON.parse(item?.raw_json||'{}')?.['卖家信息']||null;}catch{}
+  const env=(k,d)=>{const n=Number(process.env[k]);return Number.isFinite(n)&&n>0?n:d;};
+  const rate=parseFloat(String(si?.['好评率']??'').replace('%',''));
+  const sold=Number(si?.['卖家已售']);
+  const days=Number(si?.['卖家注册天数']);
+  const onSale=Number(si?.['卖家在售']);
+  const credit=String(si?.['芝麻信用']||'');
+  const fails=[];
+  if(!si)fails.push('sin datos del vendedor');
+  else{
+    if(!Number.isFinite(rate)||rate<env('WATCH_XIANYU_MIN_RATE',98))fails.push(`valoraciones ${Number.isFinite(rate)?rate+' %':'no visibles'} (mín. ${env('WATCH_XIANYU_MIN_RATE',98)} %)`);
+    if(!Number.isFinite(sold)||sold<env('WATCH_XIANYU_MIN_SOLD',100))fails.push(`${Number.isFinite(sold)?sold:0} ventas (mín. ${env('WATCH_XIANYU_MIN_SOLD',100)})`);
+    if(!Number.isFinite(days)||days<env('WATCH_XIANYU_MIN_DAYS',365))fails.push(`cuenta de ${Number.isFinite(days)?days:0} días (mín. ${env('WATCH_XIANYU_MIN_DAYS',365)})`);
+    if(!/信用极好|信用优秀/.test(credit))fails.push(`crédito "${credit||'sin dato'}"`);
+    if(Number.isFinite(onSale)&&Number.isFinite(sold)&&sold>0&&onSale/sold>env('WATCH_XIANYU_MAX_LISTED_PER_SALE',50))fails.push(`${onSale} anuncios para ${sold} ventas`);
+  }
+  if(!fails.length)return null;
+  return {
+    code:'watch_seller_not_pro',
+    term:fails[0],
+    reasons:[`Reloj en Xianyu de un vendedor que no cumple tu filtro de profesional: ${fails.join('; ')}.`]
+  };
+}
+
 function deterministicPrescreen(item,task=null){
   const noPrice=noPriceVeto(item);
   if(noPrice)return noPrice;
   const veto=xianyuVerificationVeto(item);
   if(veto)return veto;
+  const watchSeller=xianyuWatchSellerVeto(item,task);
+  if(watchSeller)return watchSeller;
   const replica=xianyuReplicaTerm(item);
   if(replica){
     return {
@@ -9464,7 +9521,7 @@ function negotiationReplyText({listing,price,fresh=false,vestiaireExact=null}){
     ...importCostLines({...listing,price_eur:newEur}),
     `Reventa estimada: ${eur0(low)} – ${eur0(high)}`,
     `Beneficio neto: <b>${eur0(pLow)}${pHigh!=null?` – ${eur0(pHigh)}`:''}</b> · margen ${Math.round(margin)} %`,
-    vestiaireProfitLine(low,high,landed),
+    vestiaireProfitLine(low,high,landed,task?.task_name),
     verdict,
     ...manualTrustLines(listing),
     verificationLine,
@@ -9479,7 +9536,7 @@ function negotiationReplyText({listing,price,fresh=false,vestiaireExact=null}){
     `Coste puesto en España: ${eur0(landed)} (antes ${eur0(before.importedTotalEur)})`,
     `Reventa estimada: ${eur0(low)} – ${eur0(high)}`,
     `Beneficio neto: <b>${eur0(pLow)}${pHigh!=null?` – ${eur0(pHigh)}`:''}</b> · margen ${Math.round(margin)} % (antes ${eur0(low-before.importedTotalEur)})`,
-    vestiaireProfitLine(low,high,landed),
+    vestiaireProfitLine(low,high,landed,task?.task_name),
     verdict,
     maxLocal!=null?`Precio máximo para que sea oportunidad clara: <b>${fmtMoney(maxLocal,listing.currency||'EUR')}</b> (≈ ${eur0(maxEur)})`:'',
     ...vestiaireDbLines(task?.task_name,{...listing,price_eur:newEur,model:a.model,_vestiaireExact:vestiaireExact}),
@@ -9675,15 +9732,25 @@ function importCostLines(x){
   return rows.map(([k,v])=>`   · ${k}: ${eur0(v)}`).concat([`   = Coste puesto: <b>${eur0(c.importedTotalEur)}</b>`]);
 }
 
-// Beneficio si se revende en Vestiaire: la reventa menos su comisión
-// (VESTIAIRE_COMMISSION_PCT, 20 % por defecto) y menos el coste puesto.
-function vestiaireProfitLine(resaleLow,resaleHigh,landed){
-  const fee=Number(process.env.VESTIAIRE_COMMISSION_PCT??20);
+// Relojes: se venden en Chrono24 como particular (CHRONO24_COMMISSION_PCT,
+// 6,5 % por defecto); los bolsos en Vestiaire (VESTIAIRE_COMMISSION_PCT, 20 %).
+const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|cartier (santos|tank)|\breloj|\bwatch/i;
+function isWatchTask(name){return WATCH_TASK_RE.test(String(name||''));}
+function resalePlatform(taskName){
+  return isWatchTask(taskName)
+    ?{name:'Chrono24',fee:Number(process.env.CHRONO24_COMMISSION_PCT??6.5)}
+    :{name:'Vestiaire',fee:Number(process.env.VESTIAIRE_COMMISSION_PCT??20)};
+}
+// Beneficio si se revende: la reventa menos la comisión de la plataforma y
+// menos el coste puesto.
+function vestiaireProfitLine(resaleLow,resaleHigh,landed,taskName=''){
+  const platform=resalePlatform(taskName);
+  const fee=platform.fee;
   const num=v=>v===null||v===undefined||v===''?NaN:Number(v);
   const net=r=>Number.isFinite(num(r))&&Number.isFinite(num(landed))?num(r)*(1-fee/100)-num(landed):null;
   const lo=net(resaleLow), hi=net(resaleHigh);
   if(lo==null&&hi==null)return '';
-  return `Beneficio en Vestiaire (−${fee} % comisión): <b>${eur0(lo)}${hi!=null?` – ${eur0(hi)}`:''}</b>`;
+  return `Beneficio en ${platform.name} (−${fee} % comisión): <b>${eur0(lo)}${hi!=null?` – ${eur0(hi)}`:''}</b>`;
 }
 // ── BASE DE VESTIAIRE: SOLO BOLSOS IGUALES ───────────────────────────────
 // Para cada aviso, la IA barata compara el anuncio (título, descripción, foto
@@ -9757,7 +9824,7 @@ function instantAlertText(x){
     ...importCostLines(x),
     `Reventa ${resale}`,
     `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
-    vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur),
+    vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur,x._task_name),
     ...vestiaireDbLines(x._task_name,x),
     String(x.source||'').startsWith('ebay-')?(()=>{let r={};try{r=JSON.parse(x.raw_json||'{}')}catch{};return r.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`;})():'',
     x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir en la app</a>`:''
