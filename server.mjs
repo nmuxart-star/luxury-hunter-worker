@@ -4403,23 +4403,117 @@ async function refreshVestiaireSheet({force=false}={}){
 }
 const VESTIAIRE_SIZE_RE=[['Nano',/\bnano\b/i],['Part Time',/part\s?time/i],['Mini',/\bmini\b|\bmicro\b/i],['Small',/\bsmall\b|\bpetit\b|\bpetite\b|\bpeque/i],['Medium',/\bmedium\b|\bmediano\b|\bmoyen\b|中号/i],['Large',/\blarge\b|\bgrande\b|\bgrand\b|大号/i],['Bandolera',/bandolera|crossbody|messenger|shoulder strap/i]];
 const VESTIAIRE_COLOR_RE=[['negro',/negro|black|noir|schwarz|黑/i],['blanco',/blanc|white|bianco|weiss|白/i],['marron',/marr[oó]n|brown|marron|braun|棕|咖/i],['azul',/azul|blue|bleu|blu|蓝/i],['rosa',/rosa|pink|rose|粉/i],['rojo',/rojo|red|rouge|rosso|红/i],['amarillo',/amarillo|yellow|jaune|giallo|黄/i],['verde',/verde|green|vert|verde|绿/i],['gris',/gris|grey|gray|grigio|灰/i],['plateado',/plateado|silver|argent|argento|银/i],['dorado',/dorado|gold|or\b|oro|金/i],['beige',/beige|crudo|nude|taupe|ecru|khaki|caqui/i]];
+// Anchura (la medida mayor) en cm a partir de "28*6*18cm", "25x15x6", "23,5x16x8,5"...
+function vestiaireWidthCm(text){
+  const m=String(text||'').match(/(\d{1,2}(?:[.,]\d)?)\s*(?:cm)?\s*[x×*✕]\s*(\d{1,2}(?:[.,]\d)?)(?:\s*(?:cm)?\s*[x×*✕]\s*(\d{1,2}(?:[.,]\d)?))?/i);
+  if(!m)return null;
+  const nums=[m[1],m[2],m[3]].filter(Boolean).map(v=>Number(v.replace(',','.'))).filter(n=>n>0&&n<80);
+  const w=nums.length?Math.max(...nums):null;
+  return w&&w>=8?w:null;
+}
+function vestiaireSizeLabel(text){
+  return (VESTIAIRE_SIZE_RE.find(([,re])=>re.test(String(text||'')))||[])[0]||null;
+}
+const sheetNorm=t=>String(t||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
+// En pestañas con varios modelos (Radar, Miu Miu, Murakami...) el campo
+// "Talla / tipo" lleva el modelo: si el anuncio nombra alguno, solo valen esos.
+function vestiaireModelFilter(fichas,text){
+  const t=sheetNorm(text);
+  const named=fichas.filter(f=>{const m=sheetNorm(f.size).trim();return m.length>=4&&!VESTIAIRE_SIZE_RE.some(([,re])=>re.test(m))&&t.includes(m);});
+  return named.length?named:null;
+}
 function vestiaireMatchFichas(fichas,item){
   const text=`${item?.title||''} ${item?.description||''}`;
-  const size=(VESTIAIRE_SIZE_RE.find(([,re])=>re.test(text))||[])[0];
+  const size=vestiaireSizeLabel(text);
+  const width=vestiaireWidthCm(text);
   const colorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(t))||[])[0];
   const itemColor=colorOf(text);
-  const price=Number(item?.price_eur)||0;
-  const scored=fichas.filter(f=>!f.excluded).map(f=>{
+  let pool=fichas.filter(f=>!f.excluded);
+  pool=vestiaireModelFilter(pool,text)||pool;
+  // Antes se ordenaba por cercanía al precio de COMPRA, que no dice nada del
+  // precio de reventa: ahora cuentan la talla (medidas o etiqueta) y el color.
+  const scored=pool.map(f=>{
     let score=0;
-    if(size&&f.size&&f.size.toLowerCase().startsWith(size.toLowerCase()))score+=3;
+    const fw=vestiaireWidthCm(f.dims);
+    if(width&&fw&&Math.abs(fw-width)/width<=0.12)score+=4;
+    else if(size&&vestiaireSizeLabel(`${f.size} ${f.notes}`)===size)score+=3;
     if(itemColor&&colorOf(String(f.color||''))===itemColor)score+=2;
     if(f.vintage&&/vintage|vintag|古着|빈티지/i.test(text))score+=1;
-    const dist=price>0?Math.abs(Number(f.price_eur)-price)/price:1;
+    const dist=width&&fw?Math.abs(fw-width)/width:1;
     return {f,score,dist};
   });
   scored.sort((a,b)=>b.score-a.score||a.dist-b.dist||(b.f.likes||0)-(a.f.likes||0));
   const strong=scored.filter(x=>x.score>0).slice(0,12);
   return strong.length?strong:scored.slice(0,8);
+}
+// PRECIO DE REVENTA ANCLADO EN LA BASE DE DATOS DE NIL
+// Con los anuncios de la misma talla (por medidas o etiqueta) y modelo de su
+// hoja de Vestiaire, y el % al que se venden de verdad frente al precio pedido
+// (ventas registradas en la hoja; 0,92 de media), sale una franja realista de
+// venta. Sirve de techo para que la reventa sugerida no se dispare.
+const VESTIAIRE_DEFAULT_REALIZATION=0.92;
+// Anchura (cm) de cada talla en los modelos principales, para cuando el
+// anuncio dice la talla ("中号", "ミニ", "Medium"...) pero no las medidas.
+const VESTIAIRE_FAMILY_SIZES=[
+  [/chanel|classic flap/i,[['Mini',/\bmini\b|ミニ|迷你/i,17,21],['Small',/\bsmall\b|小号|スモール/i,22,24],['Jumbo',/jumbo|ジャンボ|大号/i,29,31],['Maxi',/maxi|マキシ/i,32,35],['Medium',/medium|中号|ミディアム/i,25,27]]],
+  [/lady dior/i,[['Micro',/micro|マイクロ/i,11,13],['Mini',/\bmini\b|ミニ|迷你/i,16,18],['Small',/\bsmall\b|小号|スモール/i,19,21],['Medium',/medium|中号|ミディアム/i,23,25],['Large',/large|大号|ラージ/i,30,33]]],
+  [/evelyne/i,[['TPM',/tpm|\b1[67]\b|mini|ミニ/i,15,19],['PM',/\bpm\b|\b29\b/i,27,30],['GM',/\bgm\b|\b33\b/i,32,35]]],
+  [/saddle/i,[['Mini',/\bmini\b|ミニ|迷你/i,18,21],['Medium',/medium|中号|ミディアム|classic/i,24,27]]]
+];
+function vestiaireSheetAnchor(task,item,exact){
+  const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
+  if(!r||r.source!=='sheet'||!Array.isArray(r.fichas))return null;
+  const label=[exact?.brand,exact?.family,exact?.exact_variant_label,exact?.size].filter(Boolean).join(' ');
+  const text=`${item?.title||''} ${item?.description||''} ${label}`;
+  let pool=r.fichas.filter(f=>Number.isFinite(f.price_eur)&&f.price_eur>0);
+  const byModel=vestiaireModelFilter(pool,text);
+  // Radar mezcla muchos modelos: sin el modelo nombrado no hay ancla posible.
+  if(/radar/i.test(task.task_name)&&!byModel)return null;
+  if(byModel)pool=byModel;
+  // Fuera otras líneas que conviven en la pestaña (Trendy CC, WOC, Shopping,
+  // carteras...) salvo que el anuncio sea justamente de esa línea.
+  const otherRe=/trendy|wallet on chain|\bwoc\b|shopping|\btote\b|pochette|ri[nñ]onera|cartera|clutch|\bbelt\b|cintur/i;
+  const tnorm=sheetNorm(text);
+  pool=pool.filter(f=>{const m=otherRe.exec(sheetNorm(`${f.size} ${f.notes}`));return !m||tnorm.includes(m[0]);});
+  const width=vestiaireWidthCm(`${item?.title||''} ${item?.description||''}`);
+  const size=vestiaireSizeLabel(`${exact?.size||''} ${item?.title||''}`);
+  let basis='';
+  let matched=[];
+  if(width){
+    matched=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw&&Math.abs(fw-width)/width<=0.12;});
+    basis=`medidas ~${Math.round(width)} cm`;
+  }
+  const fam=(VESTIAIRE_FAMILY_SIZES.find(([re])=>re.test(task.task_name))||[])[1];
+  const famSize=!width&&fam?fam.find(([,re])=>re.test(`${exact?.size||''} ${item?.title||''}`)):null;
+  if(matched.length<4&&famSize){
+    const [name,re,lo,hi]=famSize;
+    matched=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw?fw>=lo&&fw<=hi:re.test(`${f.size} ${f.notes}`);});
+    basis=`talla ${name} (${lo}-${hi} cm)`;
+  }
+  if(matched.length<4&&size){
+    matched=pool.filter(f=>vestiaireSizeLabel(`${f.size} ${f.notes}`)===size);
+    basis=`talla ${size}`;
+  }
+  if(matched.length<4)return null;
+  const ratios=r.fichas.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)&&f.price_eur>0).map(f=>f.sold_price_eur/f.price_eur).filter(x=>x>0.4&&x<1.6).sort((a,b)=>a-b);
+  const ratio=ratios.length>=5?clampNum(ratios[Math.floor(ratios.length/2)],0.75,1):VESTIAIRE_DEFAULT_REALIZATION;
+  const values=[
+    ...matched.filter(f=>!f.excluded).map(f=>f.price_eur*ratio),
+    ...matched.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>f.sold_price_eur)
+  ].sort((a,b)=>a-b);
+  if(values.length<4)return null;
+  const q=p=>values[Math.min(values.length-1,Math.max(0,Math.round((values.length-1)*p)))];
+  return {n:values.length,basis,ratio:Math.round(ratio*100)/100,low:Math.round(q(0.25)),mid:Math.round(q(0.5)),high:Math.round(q(0.75))};
+}
+// Ajusta una franja de reventa al ancla de la hoja: nunca por encima de lo que
+// se vende de verdad (la baja no pasa de la mediana realista y la alta no pasa
+// del p75 realista). Si la evidencia propia es más baja, se respeta.
+function clampResaleToAnchor(low,high,anchor){
+  if(!anchor)return {low,high,changed:false};
+  const l=Number.isFinite(low)?Math.min(low,anchor.mid):anchor.low;
+  let h=Number.isFinite(high)?Math.min(high,anchor.high):anchor.high;
+  if(h<l)h=l;
+  return {low:roundMoney(l),high:roundMoney(h),changed:l!==low||h!==high};
 }
 function vestiaireFichasBlock(r,item){
   const picked=vestiaireMatchFichas(r?.fichas||[],item);
@@ -6748,7 +6842,7 @@ This is a RECALL fallback. The goal is to find genuine listings that a visual Go
     : null;
 
   const conditionHigh=valuationEntries.length
-    ? roundMoney(weightedPercentile(valuationEntries,0.90)??0)||null
+    ? roundMoney(weightedPercentile(valuationEntries,0.75)??0)||null
     : null;
 
   const conditionConservative=valuationEntries.length
@@ -7316,21 +7410,21 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
           ).toUpperCase()
         : 'LOW';
 
-  const conservative=
+  let conservative=
     resaleEstimateSource==='MARKET_ANALYSIS'
       ? marketConservative
       : resaleEstimateSource==='AI_ESTIMATE'
         ? aiLow
         : null;
 
-  const low=
+  let low=
     resaleEstimateSource==='MARKET_ANALYSIS'
       ? marketConservative
       : resaleEstimateSource==='AI_ESTIMATE'
         ? aiLow
         : null;
 
-  const high=
+  let high=
     resaleEstimateSource==='MARKET_ANALYSIS'
       ? (
           Number.isFinite(marketHigh)
@@ -7340,6 +7434,16 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
       : resaleEstimateSource==='AI_ESTIMATE'
         ? aiHigh
         : null;
+
+  // Techo con la base de Vestiaire de Nil (misma talla/modelo, precio al que
+  // de verdad se vende): evita reventas infladas por precios de tienda o p90.
+  const anchor=market?.sheet_anchor||null;
+  let anchorNote='';
+  if(anchor&&Number.isFinite(low)){
+    const c=clampResaleToAnchor(low,high,anchor);
+    if(c.changed)anchorNote=`Reventa ajustada con tu base de Vestiaire (${anchor.n} anuncios, ${anchor.basis}; se venden al ${Math.round(anchor.ratio*100)} % del precio pedido): venta realista ${anchor.low}-${anchor.high} EUR.`;
+    low=c.low;high=c.high;conservative=c.low;
+  }
 
   const profit=
     Number.isFinite(conservative)
@@ -7400,6 +7504,7 @@ function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketpl
   if(marketplaceStatus==='PASSED')reasons.push(`${marketplaceVerification.service}: verificacion superada segun evidencia estructurada del marketplace; es una senal positiva adicional, no una garantia absoluta de autenticidad.`);
   else if(marketplaceStatus==='AVAILABLE')reasons.push(`${marketplaceVerification.service}: disponible para este anuncio; reduce el riesgo operativo de compra, pero no demuestra por si sola la autenticidad.`);
   if(compN)reasons.push(`${compN} comparables exactos/cercanos en ${sourceN} fuentes independientes; confianza de mercado ${mconf}.`);
+  if(anchorNote)reasons.push(anchorNote);
   if(
     Number.isFinite(conservative) &&
     resaleEstimateSource==='MARKET_ANALYSIS'
@@ -7716,6 +7821,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
           'Aplicando mercado, condición, costes y beneficio'
         );
 
+        try{market.sheet_anchor=vestiaireSheetAnchor(task,item,exact);}catch(e){market.sheet_anchor=null;}
         const final=finalizeVerifiedOpportunity(
           a,
           exact,
@@ -7750,6 +7856,19 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
       a.decision_reasons_es=[`La primera pasada detecto ${preliminaryDecision}, pero el chequeo exacto de modelo/mercado fallo.`,'No se publica como WATCH/BUY/STRONG BUY hasta que la verificacion se complete.'];
       a.notes=[a.notes,`Market verification error: ${e?.message||String(e)}`].filter(Boolean).join(' ');
     }
+  }
+  // Primera pasada sin verificación completa: mismo techo con la base de Vestiaire.
+  if(task&&verification?.status!=='verified'&&Number.isFinite(Number(a.resale_low_eur))){
+    try{
+      const anchor=vestiaireSheetAnchor(task,item,{brand:a.brand,family:a.model});
+      const c=anchor?clampResaleToAnchor(Number(a.resale_low_eur),Number(a.resale_high_eur),anchor):null;
+      if(c?.changed){
+        const landed=Number(a.landed_cost_eur)||Number(economics.importedTotalEur)||0;
+        a.resale_low_eur=c.low;a.resale_high_eur=c.high;
+        if(landed){a.net_profit_low_eur=roundMoney(c.low-landed);a.net_profit_high_eur=roundMoney(c.high-landed);}
+        a.decision_reasons_es=[...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[]),`Reventa ajustada con tu base de Vestiaire (${anchor.n} anuncios, ${anchor.basis}): venta realista ${anchor.low}-${anchor.high} EUR.`].slice(0,5);
+      }
+    }catch{}
   }
   a.market_verification=verification;
   const now=new Date().toISOString();
@@ -7811,7 +7930,7 @@ function effectivePlan(basePlan, taskOrBody={}) {
 // Tareas "Radar ...": recorren por turnos una lista larga de modelos. Cada
 // ejecución empieza la lista por los siguientes modelos de cada web, porque
 // solo se usan las primeras búsquedas (1 en Xianyu, 2 en Japón, 2 en Corea).
-const RADAR_STEP={xianyu:1,japan:2,bunjang:2};
+const RADAR_STEP={xianyu:2,japan:2,bunjang:2};
 function radarRotatePlan(plan,taskId){
   if(!taskId)return plan;
   const task=db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId);
