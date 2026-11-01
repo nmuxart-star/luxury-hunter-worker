@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import {shouldRunAllTasks,isDue as due,nextDueTask} from './github-run-schedule.mjs';
+import {shouldRunAllTasks,isDue as due,nextDueTask,planCycle} from './github-run-schedule.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -72,6 +72,7 @@ const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
 // una ejecución vacía no encadena la siguiente y el bot se quedaba parado
 // hasta el cron de GitHub, que llega con horas de retraso.
 const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
+const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',1,0,6);
 const workerStartedAt=Date.now();
 // El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
 let budgetStartedAt=workerStartedAt;
@@ -171,8 +172,10 @@ try{
     }
     // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
     // cada grupo, los que llevan más tiempo sin revisarse.
-    const priority=t=>Number(t.interval_minutes)||Infinity;
-    runnable.sort((a,b)=>(priority(a)-priority(b))||((Date.parse(a.last_run_at||'')||0)-(Date.parse(b.last_run_at||'')||0)));
+    // Relojes después de los bolsos y como mucho WATCH_MAX_PER_RUN por ejecución.
+    const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN});
+    runnable=plan.tasks;
+    if(plan.deferred.length)console.log(`Relojes aplazados a la siguiente ejecución: ${plan.deferred.map(t=>t.task_name).join(', ')}.`);
     const estimate=taskMinutesEstimate();
     let started=0;
     const canStart=task=>{

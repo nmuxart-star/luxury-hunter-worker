@@ -367,7 +367,9 @@ function saveEconomics(value){
   return clean;
 }
 function roundMoney(n){ return Math.round((Number(n)+Number.EPSILON)*100)/100; }
-const WATCH_ITEM_RE=/speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|腕時計|手表|腕表|クロノグラフ/i;
+// Relojes (arancel propio): palabras genéricas de reloj en cada idioma y las
+// marcas/modelos que se buscan. Los bolsos de estas marcas no las llevan.
+const WATCH_ITEM_RE=/腕時計|ウォッチ|手表|腕表|機械表|机械表|시계|\bwristwatch|\bwatch\b|クロノグラフ|chronograph|speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|rolex|ロレックス|劳力士|롤렉스|tudor|チューダー|チュードル|帝舵|튜더|grand seiko|グランドセイコー|冠蓝狮|그랜드세이코|santos de cartier|cartier (santos|tank|ballon)|サントス|タンク(フランセーズ|マスト|ソロ)|山度士|坦克|蓝气球|오메가|オメガ|欧米茄/i;
 function importEconomics(item, settings=getEconomics()){
   const product=finiteOr(item?.price_eur,0);
   const rawSource=String(item?.source||'').toLowerCase();
@@ -395,7 +397,10 @@ function importEconomics(item, settings=getEconomics()){
   const euInternal=cfg.euInternal===true;
   const textile=TEXTILE_BAG_RE.test(`${item?.title||''} ${item?.description||''}`);
   // Relojes de pulsera (CN 9102): arancel propio, 4,5 % por defecto (WATCH_DUTY_PCT).
-  const watchItem=WATCH_ITEM_RE.test(`${item?.title||''} ${item?.description||''}`);
+  // Solo el título: en descripciones coreanas "시계" sale en textos de la tienda.
+  const titleText=String(item?.title||'');
+  // Títulos de bolsos con listas de marcas de relleno ("劳力士" sin ser reloj) no cuentan.
+  const watchItem=WATCH_ITEM_RE.test(titleText)&&!(/包|バッグ|가방|\bbags?\b|鞋|打火机/i.test(titleText)&&!/腕時計|手表|腕表|ウォッチ|시계|\bwatch/i.test(titleText));
   const dutyPercent=euInternal
     ? 0
     : watchItem
@@ -9734,7 +9739,8 @@ function importCostLines(x){
 
 // Relojes: se venden en Chrono24 como particular (CHRONO24_COMMISSION_PCT,
 // 6,5 % por defecto); los bolsos en Vestiaire (VESTIAIRE_COMMISSION_PCT, 20 %).
-const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|cartier (santos|tank)|\breloj|\bwatch/i;
+// Igual que scripts/github-run-schedule.mjs (WATCH_TASK_RE).
+const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon)|\biwc\b|jaeger|breitling|patek|audemars|panerai|\breloj|\bwatch/i;
 function isWatchTask(name){return WATCH_TASK_RE.test(String(name||''));}
 function resalePlatform(taskName){
   return isWatchTask(taskName)
