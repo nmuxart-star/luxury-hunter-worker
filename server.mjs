@@ -8742,11 +8742,57 @@ function noPriceVeto(item){
   };
 }
 
-function deterministicPrescreen(item){
+// XIANYU: RÉPLICAS. En Xianyu abundan las réplicas: se descartan sin IA las
+// que usan jerga de réplica en el título O en la descripción, y las que cuestan
+// menos del 30 % de lo que se vende de verdad ese modelo (hoja de Vestiaire).
+const XIANYU_REPLICA_TERMS=[
+  '高仿','复刻','精仿','仿品','仿款','a货','超a','m货','莆田','一比一','1:1','高版本','顶配','对版','肉眼无法辨别',
+  '同款皮','原厂皮','原版皮','纯原','工厂货','厂家直','代工厂','同厂','微商','顶级天花板','天花板版本','高端店定制','定制款','原单','尾单',
+  'replica','super copy','supercopy','mirror quality'
+];
+// Garantías y negaciones que no indican réplica ("假一赔十", "非高仿"...).
+const XIANYU_REPLICA_SAFE=/假一赔\S*|假货?(包退|包赔|必究|十倍|赔)\S*|(非|不是|绝非|并非|拒绝|杜绝|不卖|不做|没有|无)\s*(高仿|复刻|精仿|仿品|a货|莆田|假货)/gi;
+function xianyuReplicaTerm(item){
+  if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
+  // Frases de garantía ("如为仿品，全额退款", "假一赔十"...) no cuentan.
+  const text=`${item?.title||''} ${item?.description||''}`.toLowerCase().replace(XIANYU_REPLICA_SAFE,' ')
+    .split(/[。！!？?；;※\n]/).filter(seg=>!/退款|退货|包退|赔|refund/.test(seg)).join(' ');
+  return XIANYU_REPLICA_TERMS.find(t=>text.includes(t))||null;
+}
+const XIANYU_MIN_PRICE_SHARE=0.30;
+function xianyuTooCheapVeto(item,task){
+  if(String(item?.source||'').toLowerCase()!=='xianyu'||!task?.task_name)return null;
+  const price=Number(item?.price_eur);
+  const r=vestiaireRefs().tasks?.[task.task_name];
+  if(!Number.isFinite(price)||price<=0||!r)return null;
+  // En pestañas con varios modelos (Radar...) vale el modelo nombrado si lo hay.
+  const named=Array.isArray(r.fichas)?vestiaireModelFilter(r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)),`${item?.title||''} ${item?.description||''}`):null;
+  const base=named&&named.length>=4?priceStats(named.map(f=>f.price_eur)).p25:r.all?.p25;
+  if(!Number.isFinite(base)||base<=0)return null;
+  const floor=Math.round(base*VESTIAIRE_DEFAULT_REALIZATION*XIANYU_MIN_PRICE_SHARE);
+  if(price>=floor)return null;
+  return {
+    code:'xianyu_too_cheap',
+    term:`${Math.round(price)}<${floor}`,
+    reasons:[`Precio irrealmente bajo para un original: ${Math.round(price)} € frente a un mínimo de ${floor} € (30 % de lo que se vende de verdad este modelo en Vestiaire). En Xianyu suele ser réplica.`]
+  };
+}
+
+function deterministicPrescreen(item,task=null){
   const noPrice=noPriceVeto(item);
   if(noPrice)return noPrice;
   const veto=xianyuVerificationVeto(item);
   if(veto)return veto;
+  const replica=xianyuReplicaTerm(item);
+  if(replica){
+    return {
+      code:'counterfeit_title',
+      term:replica,
+      reasons:[`El anuncio de Xianyu contiene "${replica}", jerga de réplica o artículo no original.`]
+    };
+  }
+  const cheap=xianyuTooCheapVeto(item,task);
+  if(cheap)return cheap;
   const bj=bunjangTrustVeto(item);
   if(bj)return bj;
   const title=String(item?.title||'').toLowerCase();
@@ -10147,7 +10193,7 @@ async function executeTask(taskId, runId=null) {
         ).get(taskId,item.id);
 
         if(!existingAnalysis){
-          const pre=deterministicPrescreen(item);
+          const pre=deterministicPrescreen(item,task);
           if(pre){
             storePrescreenReject(taskId,item,pre);
             prescreenStats.rejected++;
