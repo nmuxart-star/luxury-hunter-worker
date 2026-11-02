@@ -57,7 +57,7 @@ const envInt=(name,fallback,min,max)=>{
   return Number.isFinite(n)?Math.max(min,Math.min(max,Math.trunc(n))):fallback;
 };
 // Varias tareas a la vez: un ciclo completo pasa de ~45 min a ~15-20 min.
-const TASK_CONCURRENCY=envInt('TASK_CONCURRENCY',3,1,6);
+const TASK_CONCURRENCY=envInt('TASK_CONCURRENCY',4,1,6);
 // Modo bucle: repite ciclos durante LOOP_MINUTES (0 = una sola pasada).
 const LOOP_MINUTES=envInt('LOOP_MINUTES',0,0,340);
 const CYCLE_MIN_MINUTES=envInt('CYCLE_MIN_MINUTES',20,5,180);
@@ -172,8 +172,8 @@ try{
     }
     // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
     // cada grupo, los que llevan más tiempo sin revisarse.
-    // Relojes después de los bolsos (nunca les quitan sitio: la cola no se salta tareas)
-    // y como mucho WATCH_MAX_PER_RUN (2) por ejecución, por nivel y antigüedad.
+    // Bolsos de 60 min siempre primero; luego se alternan reloj y bolso de menos
+    // prioridad. Como mucho WATCH_MAX_PER_RUN (2) relojes por ejecución, por nivel y antigüedad.
     const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN});
     runnable=plan.tasks;
     if(plan.deferred.length)console.log(`Relojes aplazados a la siguiente ejecución: ${plan.deferred.map(t=>t.task_name).join(', ')}.`);

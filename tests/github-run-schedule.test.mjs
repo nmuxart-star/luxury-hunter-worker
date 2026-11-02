@@ -43,7 +43,7 @@ test('watches never take the place of bags: bags first, at most one watch per ru
     {task_name:'Chanel Classic Flap',interval_minutes:60,last_run_at:ago(90)}
   ];
   const plan=planCycle(runnable,{maxWatches:1});
-  assert.deepEqual(plan.tasks.map(t=>t.task_name),['Chanel Classic Flap','Lady Dior','Celine Luggage','Rolex Datejust']);
+  assert.deepEqual(plan.tasks.map(t=>t.task_name),['Chanel Classic Flap','Lady Dior','Rolex Datejust','Celine Luggage']);
   assert.deepEqual(plan.deferred.map(t=>t.task_name),['Omega Speedmaster']);
   assert.equal(planCycle(runnable,{maxWatches:0}).tasks.some(t=>isWatchTaskName(t.task_name)),false);
 });
@@ -64,4 +64,19 @@ test('watch tiers: the higher tier goes first even if a lower tier waited longer
   assert.deepEqual(plan.tasks.map(t=>t.task_name),['Lady Dior','Omega Seamaster 300M']);
   assert.deepEqual(plan.deferred.map(t=>t.task_name),['Tudor','Rolex vintage']);
   assert.equal(isWatchTaskName('TAG Heuer Monaco y Carrera'),true);
+});
+
+test('watches alternate with non-priority bags; 60-min bags always go first',()=>{
+  const runnable=[
+    {task_name:'Celine Luggage',interval_minutes:180,last_run_at:ago(400)},
+    {task_name:'Radar oportunidades',interval_minutes:360,last_run_at:ago(700)},
+    {task_name:'Omega Speedmaster',description:'TIER: 1',interval_minutes:240,last_run_at:ago(300)},
+    {task_name:'Tudor',description:'TIER: 2',interval_minutes:240,last_run_at:ago(300)},
+    {task_name:'Lady Dior',interval_minutes:60,last_run_at:ago(70)},
+    {task_name:'Loewe Puzzle',interval_minutes:180,last_run_at:ago(200)},
+    {task_name:'Chanel Classic Flap',interval_minutes:60,last_run_at:ago(90)}
+  ];
+  const plan=planCycle(runnable,{maxWatches:2});
+  assert.deepEqual(plan.tasks.map(t=>t.task_name),['Chanel Classic Flap','Lady Dior','Omega Speedmaster','Celine Luggage','Tudor','Loewe Puzzle','Radar oportunidades']);
+  assert.deepEqual(plan.deferred,[]);
 });

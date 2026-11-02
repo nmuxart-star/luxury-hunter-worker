@@ -82,7 +82,7 @@ jobs:
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
       PORT: '8200'
       # Velocidad: tareas en paralelo y ciclos repetidos dentro de cada ejecución.
-      TASK_CONCURRENCY: ${{ vars.TASK_CONCURRENCY || '3' }}
+      TASK_CONCURRENCY: ${{ vars.TASK_CONCURRENCY || '4' }}
       LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '0' }}
       # Cada ejecución, como mucho 38 min de tareas (+~6 min de preparación).
       RUN_BUDGET_MINUTES: ${{ vars.RUN_BUDGET_MINUTES || '38' }}
