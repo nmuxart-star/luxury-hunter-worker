@@ -912,14 +912,25 @@ function aiMonthlyAllowanceTodayUsd(){
   // Lo gastado antes de hoy = mes - hoy (lo de hoy ya contado en el mes).
   const todaySinceReset=Math.max(0,getAiSpend().usd-Number(month.todayAtReset||0));
   const beforeToday=Math.max(0,Number(month.usd||0)-todaySinceReset);
-  // Sin repartir: el día puede llegar a AI_DAILY_BUDGET_USD mientras quede
-  // presupuesto del mes; al llegar a los 20 $ del mes, se para.
+  // Lo que queda del mes antes de hoy; aiMonthSpreadTodayUsd lo reparte por días.
   return Math.max(0,cap-beforeToday);
+}
+// Reparto del mes: lo que queda del tope mensual se divide entre los días que
+// faltan (hoy incluido). Un día que gasta poco deja más para los siguientes y
+// uno que gasta mucho deja menos, así el bot no se queda sin IA a mitad de mes.
+// AI_MONTH_SPREAD=off vuelve al modo anterior (hasta el tope diario sin repartir).
+function aiMonthSpreadTodayUsd(){
+  const left=aiMonthlyAllowanceTodayUsd();
+  if(!Number.isFinite(left)||String(process.env.AI_MONTH_SPREAD||'').toLowerCase()==='off')return left;
+  const now=new Date();
+  const daysInMonth=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+1,0)).getUTCDate();
+  const daysLeft=Math.max(1,daysInMonth-now.getUTCDate()+1);
+  return left/daysLeft;
 }
 function aiDailyBudgetUsd(){
   const n=Number(process.env.AI_DAILY_BUDGET_USD??1);
   const daily=Number.isFinite(n)&&n>0?n:Infinity;
-  return Math.min(daily,aiMonthlyAllowanceTodayUsd());
+  return Math.min(daily,aiMonthSpreadTodayUsd());
 }
 // Ajuste manual del gasto de hoy (una sola vez por valor): variable
 // AI_SPEND_RESET="AAAA-MM-DD:usd" → el contador de ese día pasa a "usd".
