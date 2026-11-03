@@ -94,9 +94,12 @@ if [ "${ONEMAP_SKIP_REMOTE_AUTH:-0}" = 1 ]; then
   echo 'Puente local preparado. Falta autorizar la clave SSH en el VPS desde un terminal interactivo.'
 else
   echo "Conectando por SSH para autorizar solo el túnel de este Mac. Escribe la contraseña del VPS en el terminal cuando se solicite."
-  printf 'restrict,port-forwarding,permitlisten="127.0.0.1:8210",command="/bin/false" %s\n' "$(cat "$KEY_FILE.pub")" |
-    ssh -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
-      'umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; read -r key; grep -Fqx "$key" ~/.ssh/authorized_keys || printf "%s\n" "$key" >> ~/.ssh/authorized_keys'
+  # Keep stdin connected to the terminal: some VPS SSH setups close sessions
+  # that do not request a TTY, even when the password is correct.
+  KEY_LINE="restrict,port-forwarding,permitlisten=\"127.0.0.1:8210\",command=\"/bin/false\" $(cat "$KEY_FILE.pub")"
+  KEY_B64="$(printf '%s' "$KEY_LINE" | base64 | tr -d '\n')"
+  ssh -tt -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
+    "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; key=\$(printf '%s' '$KEY_B64' | base64 -d); grep -Fqx \"\$key\" ~/.ssh/authorized_keys || printf '%s\\n' \"\$key\" >> ~/.ssh/authorized_keys"
   echo 'Clave SSH autorizada en el VPS.'
 fi
 echo "Carga extension/onemap-mac en chrome://extensions/ y pega allí la clave de $TOKEN_FILE."
