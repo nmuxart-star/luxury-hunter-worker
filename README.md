@@ -1,5 +1,11 @@
 # Luxury Hunter v1.4.3
 
+## Yahoo Auctions Japan vía One Map
+
+Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas públicas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). La búsqueda pública no necesita credenciales de One Map. La cuenta personal sirve para entrar y pujar manualmente.
+
+El bot solo recomienda una puja máxima cuando encuentra comparables del mismo modelo y talla en la base de Vestiaire de Luxury Hunter. Calcula el límite para conservar al menos 300 € de beneficio neto (`AUCTION_MIN_PROFIT_EUR`), después de la compra, proxy, envíos, aduana, IVA de importación, comisión de reventa e IVA del margen. Si faltan comparables, la subasta queda en revisión sin precio máximo ni aviso de puja. Las cifras de envío y aduana son estimaciones editables en Ajustes → Costes → Yahoo Auctions vía One Map; confirma el coste final en One Map antes de pujar. El bot no presenta pujas automáticamente.
+
 ## Novedad: coste importado a España
 
 Cada anuncio muestra ahora dos precios separados:
