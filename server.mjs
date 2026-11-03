@@ -2115,6 +2115,86 @@ function ebayLargeImage(url){
   return String(url||'').replace(/s-l\d+\.(jpg|jpeg|png|webp)/i,'s-l1600.$1');
 }
 
+const AUCTION_MAX_HOURS=Math.max(1,Number(process.env.AUCTION_MAX_HOURS||72));
+// Datos de subasta de un anuncio (de su raw_json), con live=true si aún no ha terminado.
+// ── SUBASTAS: PUJA MÁXIMA ───────────────────────────────────────────────
+// La puja máxima es el precio más alto que aún deja AUCTION_MIN_PROFIT_EUR
+// (300 € por defecto) limpios vendiendo a la reventa conservadora (la de los
+// anuncios parecidos de la base de Nil si los hay): con todos los costes de
+// importación, la comisión de la plataforma y el IVA del margen (REBU), como
+// en la hoja de oportunidades.
+const AUCTION_MIN_PROFIT_EUR=Math.max(0,Number(process.env.AUCTION_MIN_PROFIT_EUR??300));
+function auctionNetProfit(item,priceEur,resaleEur,taskName){
+  const landed=Number(importEconomics({...item,price_eur:priceEur}).importedTotalEur);
+  const fee=resalePlatform(taskName).fee/100;
+  return {landed,net:resaleEur-landed-resaleEur*fee-Math.max(0,resaleEur-landed)*21/121};
+}
+function auctionMaxBidEur(item,resaleEur,taskName){
+  if(!(resaleEur>0)||auctionNetProfit(item,0,resaleEur,taskName).net<AUCTION_MIN_PROFIT_EUR)return null;
+  let lo=0,hi=resaleEur;
+  for(let i=0;i<40;i++){const mid=(lo+hi)/2;if(auctionNetProfit(item,mid,resaleEur,taskName).net>=AUCTION_MIN_PROFIT_EUR)lo=mid;else hi=mid;}
+  return lo;
+}
+// Puja máxima en la moneda de la subasta, redondeada hacia abajo.
+function auctionLocalBid(eur,currency){
+  const v=eurTo(eur,currency);
+  if(!Number.isFinite(v))return null;
+  const step=currency==='JPY'?1000:currency==='KRW'?10000:5;
+  return Math.floor(v/step)*step;
+}
+function listingAuction(row){
+  let raw=row?.raw;
+  if(!raw){try{raw=JSON.parse(row?.raw_json||'{}');}catch{raw={};}}
+  const a=raw?.auction;
+  if(!a?.endsAt)return null;
+  const end=Date.parse(a.endsAt);
+  return {...a,endMs:end,live:Number.isFinite(end)&&end>Date.now()};
+}
+// Guarda un anuncio de la búsqueda de eBay. En las subastas el precio es la
+// puja actual (no el precio final) y se guardan el fin y el número de pujas.
+function ebayUpsertItem(it,mp,currency,sessionId,product){
+  const auction=(it?.buyingOptions||[]).includes('AUCTION')&&!!it?.itemEndDate;
+  const money=auction&&it?.currentBidPrice?.value!=null?it.currentBidPrice:(it?.price||it?.currentBidPrice||{});
+  const cur=money.currency||currency;
+  const price=Number(money.value);
+  const pe=toEur(price,cur);
+  if(!Number.isFinite(price)||pe==null)return false;
+  const country=String(it?.itemLocation?.country||'').toUpperCase();
+  // Lo que decide la aduana es desde dónde se envía, no el marketplace.
+  const source=`ebay-${(country||mp.slice(5)).toLowerCase()}`;
+  const images=[it?.image?.imageUrl,...(it?.additionalImages||[]).map(x=>x?.imageUrl)].filter(Boolean).map(ebayLargeImage);
+  upsertListing({
+    source,
+    source_id:it.itemId,
+    url:it.itemWebUrl,
+    title:it.title,
+    description:[it.condition,it.shortDescription].filter(Boolean).join(' · '),
+    original_price:price,
+    currency:cur,
+    price_eur:pe,
+    // Sin nombre de usuario del vendedor: no guardamos datos personales
+    // de usuarios de eBay (exención de Marketplace Account Deletion).
+    seller_name:'',
+    seller_sales:it?.seller?.feedbackScore??null,
+    seller_reviews:it?.seller?.feedbackPercentage!=null?Number(it.seller.feedbackPercentage):null,
+    image_url:images[0]||'',
+    status:(it.buyingOptions||[]).join('+'),
+    purchase_via:EU_COUNTRIES.has(country)?'eBay (UE, sin aduana)':`eBay (${country||mp})`,
+    raw:{
+      ...it,
+      image:undefined,
+      additionalImages:undefined,
+      seller:it?.seller?{feedbackScore:it.seller.feedbackScore,feedbackPercentage:it.seller.feedbackPercentage,sellerAccountType:it.seller.sellerAccountType}:undefined,
+      thumbnailImages:undefined,
+      images,
+      publishedAt:it.itemCreationDate||null,
+      marketplace:mp,
+      authenticityGuarantee:(it.qualifiedPrograms||[]).includes('AUTHENTICITY_GUARANTEE'),
+      auction:auction?{endsAt:it.itemEndDate,bids:Number(it.bidCount)||0,currentBid:price,currency:cur}:undefined
+    }
+  },sessionId,product);
+  return true;
+}
 async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
   if(!ebayConfigured())return {ok:false,state:'not_configured',error:'Faltan EBAY_CLIENT_ID / EBAY_CLIENT_SECRET'};
   const marketplaces=String(process.env.EBAY_MARKETPLACES||'EBAY_DE,EBAY_FR,EBAY_IT,EBAY_ES,EBAY_GB,EBAY_US')
@@ -2155,47 +2235,45 @@ async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
     }
     let count=0;
     for(const it of body.itemSummaries||[]){
-      const cur=it?.price?.currency||it?.currentBidPrice?.currency||currency;
-      const price=Number(it?.price?.value??it?.currentBidPrice?.value);
-      const pe=toEur(price,cur);
-      if(!Number.isFinite(price)||pe==null)continue;
-      const country=String(it?.itemLocation?.country||'').toUpperCase();
-      // Lo que decide la aduana es desde dónde se envía, no el marketplace.
-      const source=`ebay-${(country||mp.slice(5)).toLowerCase()}`;
-      const images=[it?.image?.imageUrl,...(it?.additionalImages||[]).map(x=>x?.imageUrl)].filter(Boolean).map(ebayLargeImage);
-      upsertListing({
-        source,
-        source_id:it.itemId,
-        url:it.itemWebUrl,
-        title:it.title,
-        description:[it.condition,it.shortDescription].filter(Boolean).join(' · '),
-        original_price:price,
-        currency:cur,
-        price_eur:pe,
-        // Sin nombre de usuario del vendedor: no guardamos datos personales
-        // de usuarios de eBay (exención de Marketplace Account Deletion).
-        seller_name:'',
-        seller_sales:it?.seller?.feedbackScore??null,
-        seller_reviews:it?.seller?.feedbackPercentage!=null?Number(it.seller.feedbackPercentage):null,
-        image_url:images[0]||'',
-        status:(it.buyingOptions||[]).join('+'),
-        purchase_via:EU_COUNTRIES.has(country)?'eBay (UE, sin aduana)':`eBay (${country||mp})`,
-        raw:{
-          ...it,
-          image:undefined,
-          additionalImages:undefined,
-          seller:it?.seller?{feedbackScore:it.seller.feedbackScore,feedbackPercentage:it.seller.feedbackPercentage,sellerAccountType:it.seller.sellerAccountType}:undefined,
-          thumbnailImages:undefined,
-          images,
-          publishedAt:it.itemCreationDate||null,
-          marketplace:mp,
-          authenticityGuarantee:(it.qualifiedPrograms||[]).includes('AUTHENTICITY_GUARANTEE')
-        }
-      },sessionId,product);
-      count++;
-      kept++;
+      if(ebayUpsertItem(it,mp,currency,sessionId,product))count++;
     }
+    kept+=count;
     perMarketplace.push({marketplace:mp,count,total:body.total??null});
+    await sleep(400);
+  }
+  // Subastas: la búsqueda normal de eBay solo devuelve anuncios con "Cómpralo
+  // ya". Aparte se piden las subastas de vendedores de los países de
+  // EBAY_AUCTION_LOCATIONS (por defecto Japón) que terminan en los próximos
+  // días; el bot calcula después la puja máxima con la base de Vestiaire.
+  const auctionLocations=String(process.env.EBAY_AUCTION_LOCATIONS??'JP').split(',').map(s=>s.trim().toUpperCase()).filter(c=>/^[A-Z]{2}$/.test(c));
+  for(const cc of auctionLocations){
+    const params=new URLSearchParams({
+      q:String(product||'').slice(0,100),
+      sort:'endingSoonest',
+      limit:'40',
+      filter:`buyingOptions:{AUCTION},conditionIds:{2990|3000|3010},itemLocationCountry:${cc}`
+    });
+    try{
+      const r=await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,{
+        headers:{authorization:`Bearer ${token}`,'X-EBAY-C-MARKETPLACE-ID':'EBAY_US'},
+        signal:AbortSignal.timeout(25000)
+      });
+      const body=await r.json().catch(()=>({}));
+      if(!r.ok){perMarketplace.push({marketplace:`AUCTION_${cc}`,count:0,error:body?.errors?.[0]?.message||`HTTP ${r.status}`});continue;}
+      const maxMs=Date.now()+AUCTION_MAX_HOURS*3600e3;
+      let count=0;
+      for(const it of body.itemSummaries||[]){
+        const end=Date.parse(it?.itemEndDate||'');
+        // Solo las que acaban dentro del horizonte y con margen para pujar.
+        if(!Number.isFinite(end)||end>maxMs||end<Date.now()+30*60e3)continue;
+        if(ebayUpsertItem(it,'EBAY_US','USD',sessionId,product))count++;
+      }
+      kept+=count;
+      console.log(`eBay subastas ${cc}: ${count} terminan en las próximas ${AUCTION_MAX_HOURS} h (de ${body.total??0}).`);
+      perMarketplace.push({marketplace:`AUCTION_${cc}`,count,total:body.total??null});
+    }catch(e){
+      perMarketplace.push({marketplace:`AUCTION_${cc}`,count:0,error:e.message});
+    }
     await sleep(400);
   }
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('ebay','live-search',`Marketplaces ${perMarketplace.length}; kept ${kept}`,new Date().toISOString());
@@ -4257,6 +4335,16 @@ const OPPORTUNITY_SOURCE_LABELS={
   'yahoo-auctions-jp':'Yahoo! Auctions','yahoo-fleamarket-jp':'Yahoo! Flea Market',
   '2ndstreet-jp':'2nd Street','komehyo-jp':'Komehyo','rakuten-jp':'Rakuten'
 };
+// En las subastas, el título lleva delante la puja máxima y cuándo termina.
+function opportunityAuctionPrefix(r){
+  let plan=null;try{plan=JSON.parse(r.verification_json||'{}')?.auction||null;}catch{}
+  if(!plan)return '';
+  const ends=Date.parse(plan.ends_at||'');
+  const when=Number.isFinite(ends)?new Date(ends).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'';
+  return plan.max_bid_eur>0
+    ? `🔨 SUBASTA · puja máx. ${plan.max_bid_local!=null?`${plan.max_bid_local} ${plan.currency}`:''} (≈${Math.round(plan.max_bid_eur)} €)${when?` · termina ${when}`:''} · `
+    : '🔨 SUBASTA (sin puja rentable) · ';
+}
 function opportunitySheetRow(r){
   const c=importEconomics(r);
   const text=v=>{const s=String(v??'').replace(/\s+/g,' ').trim();return /^[=+\-@]/.test(s)?`'${s}`:s;};
@@ -4272,7 +4360,7 @@ function opportunitySheetRow(r){
   const origin=Number(r.original_price);
   return [
     `${p.day}/${p.month}/${p.year} ${p.hour}:${p.minute}`,
-    text(r.task_name), text(web), String(r.url||''), text(String(r.title||'').slice(0,140)),
+    text(r.task_name), text(web), String(r.url||''), text(`${opportunityAuctionPrefix(r)}${String(r.title||'')}`.slice(0,160)),
     Number(r.opportunity_score)||'', text(r.decision), text(r.authenticity_risk),
     Number.isFinite(origin)&&origin>0?text(`${origin.toLocaleString('es-ES')} ${r.currency||''}`):'',
     money(c.productPriceEur), money(c.domesticShippingEur), money(c.agentFeeEur),
@@ -4291,7 +4379,7 @@ async function syncOpportunitiesSheet(){
   if(!id||!googleSheetsSaRaw())return {added:0,reason:'not_configured'};
   const since=new Date(Date.now()-72*3600e3).toISOString();
   const rows=db.prepare(`SELECT l.*,a.task_id,t.task_name,a.decision,a.opportunity_score,a.authenticity_risk,
-      a.resale_low_eur,a.resale_high_eur,a.updated_at AS analyzed_at
+      a.resale_low_eur,a.resale_high_eur,a.updated_at AS analyzed_at,a.verification_json
     FROM task_analyses a JOIN listings l ON l.id=a.listing_id JOIN tasks t ON t.id=a.task_id
     WHERE a.opportunity_score>? AND a.updated_at>=? AND COALESCE(l.price_eur,0)>0
       AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.listing_id=l.id AND n.kind='sheet')
@@ -7756,7 +7844,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task,item)}`:'';
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
-  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}${negotiated?`\nPRICE NOTE: ITEM PRICE EUR is the purchase price the reseller has already negotiated with the seller (the listing shows ${row.price_eur} EUR). Use the negotiated price as the purchase price.`:''}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
+  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}${negotiated?`\nPRICE NOTE: ITEM PRICE EUR is the purchase price the reseller has already negotiated with the seller (the listing shows ${row.price_eur} EUR). Use the negotiated price as the purchase price.`:''}${listingAuction(item)?.live?`\nAUCTION NOTE: this is an AUCTION. ITEM PRICE EUR is only the current bid (${listingAuction(item).bids} bids, ends ${listingAuction(item).endsAt}); the final price will be higher. Focus on exact model, authenticity, condition and a realistic European resale; Luxury Hunter computes the maximum profitable bid from your resale estimate.`:''}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
   reportProgress(
     8,
     'Cargando imágenes',
@@ -8032,6 +8120,37 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
         a.decision_reasons_es=[...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[]),note].slice(0,5);
       }
     }catch{}
+  }
+  // Subastas: el precio del anuncio es la puja actual, no lo que acabará
+  // costando. Se calcula la puja máxima rentable y el beneficio a esa puja.
+  const auc=task?listingAuction(item):null;
+  if(auc&&Number.isFinite(Number(a.resale_low_eur))){
+    try{
+      let comps=verification?.market?.sheet_comps;
+      if(comps===undefined)comps=vestiaireComparables(task,{...item,model:a.model},{brand:a.brand,family:a.model});
+      const fromDb=comps&&(comps.tier==='iguales'||comps.tier==='misma_talla');
+      const resale=fromDb?Number(comps.low):Number(a.resale_low_eur);
+      const maxEur=auctionMaxBidEur(item,resale,task.task_name);
+      const current=Number(item.price_eur);
+      const plan={ends_at:auc.endsAt,bids:auc.bids,currency:auc.currency,current_bid:auc.currentBid,current_bid_eur:roundMoney(current),
+        resale_eur:roundMoney(resale),resale_from_db:!!fromDb,min_profit_eur:AUCTION_MIN_PROFIT_EUR,
+        max_bid_eur:maxEur!=null?roundMoney(maxEur):null,max_bid_local:maxEur!=null?auctionLocalBid(maxEur,auc.currency):null};
+      verification={...(verification||{}),auction:plan};
+      if(maxEur==null||current>=maxEur){
+        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REJECT';
+        a.decision_reasons_es=[maxEur==null
+          ? `Subasta: ni pujando muy bajo deja ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €.`
+          : `Subasta: la puja actual (${Math.round(current)} €) ya supera la puja máxima rentable (${Math.round(maxEur)} €).`,
+          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
+      }else{
+        const atMax=auctionNetProfit(item,maxEur,resale,task.task_name);
+        a.landed_cost_eur=roundMoney(atMax.landed);
+        a.net_profit_low_eur=roundMoney(Number(a.resale_low_eur)-atMax.landed);
+        if(Number.isFinite(Number(a.resale_high_eur)))a.net_profit_high_eur=roundMoney(Number(a.resale_high_eur)-atMax.landed);
+        a.decision_reasons_es=[`Subasta: puja como máximo ${plan.max_bid_local??Math.round(maxEur)} ${plan.max_bid_local!=null?auc.currency:'€'} (≈ ${Math.round(maxEur)} €) para ganar al menos ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €${fromDb?' (anuncios parecidos de tu base)':' (pronóstico)'}.`,
+          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
+      }
+    }catch(e){console.error('Subasta, puja máxima:',e.message);}
   }
   a.market_verification=verification;
   const now=new Date().toISOString();
@@ -8533,6 +8652,12 @@ function enforceFreshPublicationWindow(sessionId,hours=24){
     const publishedMs=listingPublishedAtMs(row);
     let reason=null;
 
+    // Una subasta sigue siendo actual hasta que termina, aunque se publicara hace días.
+    if(listingAuction(row)?.live){
+      stats.kept++;
+      stats.bySource[source].kept++;
+      continue;
+    }
     if(publishedMs===null){
       // Sin fecha de publicación (Komehyo, Rakuma...): si Luxury Hunter
       // lo vio por primera vez dentro de la ventana, es nuevo para nosotros.
@@ -9982,6 +10107,10 @@ async function sendInstantAlerts(task,runId,items){
   if(['0','false','off','no'].includes(String(process.env.INSTANT_ALERTS||'').toLowerCase())){
     return {sent:0,reason:'disabled'};
   }
+  // Las subastas en curso van por su propio aviso, con la puja máxima.
+  const auctionItems=(items||[]).filter(x=>listingAuction(x)?.live);
+  if(auctionItems.length)await sendAuctionAlerts(task,runId,auctionItems).catch(e=>console.error('Avisos de subasta:',e.message));
+  items=(items||[]).filter(x=>!listingAuction(x)?.live);
   const decisions=envList('INSTANT_ALERT_DECISIONS',['STRONG BUY','BUY']);
   const minProfit=process.env.INSTANT_ALERT_MIN_PROFIT_EUR!=null&&process.env.INSTANT_ALERT_MIN_PROFIT_EUR!==''
     ? Number(process.env.INSTANT_ALERT_MIN_PROFIT_EUR)
@@ -10075,6 +10204,54 @@ async function sendInstantAlerts(task,runId,items){
   for(const x of fresh)mark.run(Number(task.id),Number(x.id),Number(runId)||null,channels.join('+'),now);
   console.log(`Task ${task.id}: aviso inmediato enviado (${channels.join('+')}) para ${fresh.length} oportunidad(es).`);
   return {sent:fresh.length,channels,errors,soft};
+}
+
+// ── AVISOS DE SUBASTA ───────────────────────────────────────────────────
+// Una subasta se avisa una vez, con la puja máxima rentable, si el modelo y
+// el riesgo son buenos y la puja actual va al menos un 10 % por debajo de ese
+// máximo. Como mucho AUCTION_ALERT_TASK_DAILY_MAX (3) por modelo cada 24 h.
+function auctionAlertText(x,plan){
+  const auc=listingAuction(x)||{};
+  const left=Number.isFinite(auc.endMs)?Math.max(0,(auc.endMs-Date.now())/3600e3):null;
+  const ends=Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
+  const maxLocal=plan.max_bid_local!=null?fmtMoney(plan.max_bid_local,plan.currency):eur0(plan.max_bid_eur);
+  return [
+    `🔨 <b>Subasta · puja como máximo ${maxLocal}</b> · ${htmlEsc(x._task_name||'')}`,
+    `<b>${htmlEsc(x.model||x.title||'')}</b>`,
+    `${htmlEsc(x.purchase_via||x.source||'')} · puja actual ${fmtMoney(plan.current_bid,plan.currency)} (≈ ${eur0(x.price_eur)}) · ${plan.bids||0} puja${plan.bids===1?'':'s'}`,
+    `⏰ Termina el ${ends}${left!=null?` (en ${left<1?`${Math.round(left*60)} min`:`${Math.round(left)} h`})`:''}`,
+    `💰 <b>Puja máxima: ${maxLocal}</b> (≈ ${eur0(plan.max_bid_eur)})`,
+    `Con esa puja: coste puesto en España ${eur0(x.landed_cost_eur)} · vendiendo a ${eur0(plan.resale_eur)}${plan.resale_from_db?' (anuncios parecidos de tu base)':' (🔮 pronóstico)'} te quedan al menos <b>${eur0(plan.min_profit_eur)}</b> limpios (comisión de ${resalePlatform(x._task_name).name} e IVA del margen incluidos).`,
+    `Score ${x.opportunity_score??'—'} · riesgo de autenticidad ${htmlEsc(x.authenticity_risk||'—')}`,
+    ...vestiaireDbLines(x._task_name,x),
+    x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir la subasta</a>`:''
+  ].filter(Boolean).join('\n');
+}
+async function sendAuctionAlerts(task,runId,items){
+  if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
+  const already=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind='auction' LIMIT 1`);
+  const picks=(items||[]).filter(x=>{
+    let plan=null;try{plan=JSON.parse(x.verification_json||'{}')?.auction||null;}catch{}
+    if(!plan||!(Number(plan.max_bid_eur)>0))return false;
+    if(!['STRONG BUY','BUY','WATCH'].includes(String(x.decision||'').toUpperCase()))return false;
+    if(String(x.authenticity_risk||'').toUpperCase()==='HIGH')return false;
+    if(!(Number(plan.max_bid_eur)>=Number(x.price_eur)*1.1))return false;
+    if(listingFeedback(x.id)==='not_interested')return false;
+    x._auction=plan;x._task_name=task.task_name;
+    return !already.get(Number(x.id));
+  }).sort((a,b)=>(b._auction.max_bid_eur-Number(b.price_eur))-(a._auction.max_bid_eur-Number(a.price_eur)));
+  const limited=limitTaskAlerts(task,picks,{kinds:['auction'],max:Number(process.env.AUCTION_ALERT_TASK_DAILY_MAX||3)});
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'auction','telegram',?)`);
+  let sent=0;
+  for(const x of limited){
+    try{
+      await telegramSendListing(auctionAlertText(x,x._auction),x);
+      mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
+      sent++;
+    }catch(e){console.error('Aviso de subasta:',e.message);}
+  }
+  if(sent)console.log(`Task ${task.id}: ${sent} subasta(s) avisada(s) por Telegram con puja máxima.`);
+  return {sent};
 }
 
 // ── SOFT ALERTS V1 ──────────────────────────────────────────────────────
