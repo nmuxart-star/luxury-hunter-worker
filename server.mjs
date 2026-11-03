@@ -13,6 +13,7 @@ import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
 import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearchIntervalMs,
   XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
+import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -324,6 +325,9 @@ const DEFAULT_ECONOMICS = {
     xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0, paymentFeePercent:3, verificationFeeCny:80 },
     bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
+    // One Map: ¥500 de servicio, envío nacional/internacional estimado,
+    // autenticación opcional y tasa UE de 2 € por código HS desde 2026-11-01.
+    onemap: { label:'One Map / Yahoo Auctions', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:4, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:10, authenticationFeeEur:15, otherEur:2 },
     rakuten: { label:'Rakuten / Japón', domesticShippingEur:6, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     // Dentro de la UE no hay aduana ni IVA de importación; sí conviene autenticar.
     ebay_eu: { label:'eBay / UE', euInternal:true, domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:15, customsDutyPercent:0, clearanceFeeEur:0, authenticationFeeEur:30, otherEur:0 },
@@ -378,15 +382,14 @@ function importEconomics(item, settings=getEconomics()){
     'buyee-jp',
     'mercari-jp',
     'rakuma-jp',
-    'jdirectitems-auction',
     'jdirectitems-fleamarket',
-    'yahoo-auctions-jp',
     'yahoo-fleamarket-jp',
     '2ndstreet-jp',
     'komehyo-jp'
   ]);
   let sourceKey='xianyu';
   if(['xianyu','bunjang'].includes(rawSource))sourceKey=rawSource;
+  else if(['yahoo-auctions-jp','jdirectitems-auction'].includes(rawSource))sourceKey='onemap';
   else if(japanEconomicSources.has(rawSource))sourceKey='buyee';
   else if(rawSource==='rakuten-jp')sourceKey='rakuten';
   else if(rawSource.startsWith('ebay-')){
@@ -3091,18 +3094,6 @@ const JAPAN_HTTP_HEADERS={
 
 const JAPAN_RADAR_SPECS=[
   {
-    id:'yahoo-auctions-jp',
-    label:'Yahoo! Auctions Japan',
-    purchaseVia:'Buyee',
-    mode:'browser',
-    base:'https://buyee.jp',
-    cap:50,
-    searchWaitMs:5000,
-    detailWaitMs:1200,
-    searchUrl:q=>`https://buyee.jp/item/search/query/${encodeURIComponent(q)}?lang=en`,
-    accepts:u=>/^\/item\/jdirectitems\/auction\/[^/]+/i.test(u.pathname)
-  },
-  {
     id:'mercari-jp',
     label:'Mercari Japan',
     purchaseVia:'Direct',
@@ -3165,6 +3156,63 @@ const JAPAN_RADAR_SPECS=[
   }
 ];
 
+// One Map muestra las subastas de Yahoo Japón sin iniciar sesión. Una cuenta
+// personal sirve para pujar manualmente; el radar solo lee y recomienda.
+async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null,sessionId},browserContext){
+  if(!browserContext)return {ok:false,kept:0,error:'Playwright browser unavailable'};
+  const selected=normalizeLines(queries||[]).slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4));
+  const detailLimit=clampInt(process.env.ONEMAP_DETAIL_LIMIT||8,8,1,20);
+  const perQueryLimit=Math.max(1,Math.ceil(detailLimit/Math.max(1,selected.length)));
+  const perQuery=[];
+  const seen=new Set();
+  let kept=0,detailErrors=0;
+  const spec={id:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',detailWaitMs:1000};
+  for(const q of selected){
+    const searchUrl=oneMapSearchUrl(q);
+    try{
+      const snap=await japanBrowserSnapshot(browserContext,searchUrl,4000);
+      if(snap.status>=400||!/JDirectItems Auction/i.test(snap.title)||!/Search Results:/i.test(snap.body)){
+        throw new Error(`One Map no devolvió resultados accesibles (HTTP ${snap.status})`);
+      }
+      const cards=parseOneMapAuctions(snap.html)
+        .filter(c=>c.timeLeftMs>=5*60e3&&c.timeLeftMs<=AUCTION_MAX_HOURS*3600e3)
+        .filter(c=>{
+          const eur=toEur(c.currentBid,'JPY');
+          return eur!=null&&
+            (minEur==null||eur>=Number(minEur))&&
+            (maxEur==null||eur<=Number(maxEur));
+        })
+        .sort((a,b)=>a.timeLeftMs-b.timeLeftMs);
+      let local=0;
+      for(const card of cards){
+        if(kept>=detailLimit||local>=perQueryLimit||kept>=Number(maxItems))break;
+        if(seen.has(card.id))continue;
+        seen.add(card.id);
+        try{
+          const item=await japanEnrichCandidate(spec,{
+            href:card.url,title:card.title,blob:card.title,price:card.currentBid,img:card.image||''
+          },{query:q,searchUrl},browserContext);
+          if(item.status==='sold')continue;
+          const bid=Math.max(Number(item.original_price)||0,card.currentBid);
+          const end=card.endsAt;
+          item.source_id=card.id;
+          item.original_price=bid;
+          item.price_eur=toEur(bid,'JPY');
+          item.purchase_via='One Map / FROM JAPAN';
+          item.raw={...item.raw,auction:{endsAt:end,bids:card.bids,currentBid:bid,currency:'JPY',buyNow:card.buyNow,provider:'One Map',requiresDatabase:true}};
+          upsertListing(item,sessionId,q);
+          kept++;local++;
+        }catch(e){detailErrors++;console.warn(`One Map ${card.id}: ${e.message}`);}
+      }
+      perQuery.push({query:q,count:local,candidates:cards.length,searchUrl});
+    }catch(e){perQuery.push({query:q,count:0,error:e.message,searchUrl});}
+  }
+  const ok=perQuery.length>0&&perQuery.some(x=>!x.error);
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)')
+    .run('onemap','live-search',`Queries ${perQuery.length}; kept ${kept}; detail errors ${detailErrors}`,new Date().toISOString());
+  return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',kept,detailErrors,perQuery,...(!ok?{error:perQuery[0]?.error||'No se pudo leer One Map'}:{})};
+}
+
 function parseYen(text){
   const s=String(text||'').replace(/\s+/g,' ');
   const patterns=[
@@ -3225,7 +3273,8 @@ function japanSourceId(source,href){
     let m=null;
 
     if(source==='yahoo-auctions-jp'){
-      m=u.pathname.match(/\/auction\/([^/?#]+)/i);
+      m=u.pathname.match(/\/auction\/yahoo\/input\/([^/?#]+)/i)
+        ||u.pathname.match(/\/auction\/([^/?#]+)/i);
       if(m)return m[1];
     }
 
@@ -3676,6 +3725,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
   }
 
   const $=loadHtml(snap.html);
+  const oneMap=spec.id==='yahoo-auctions-jp'?parseOneMapDetail(snap.html):null;
   const product=japanFindJsonLdProduct($);
   const offer=japanOffer(product);
 
@@ -3753,11 +3803,13 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
     source_id:sourceId,
     url:candidate.href,
     title,
-    description,
+    description:oneMap?.condition?`${description}\nItem condition: ${oneMap.condition}`:description,
     original_price:price,
     currency:'JPY',
     price_eur:price==null?null:toEur(price,'JPY'),
-    seller_name:seller,
+    seller_name:seller||oneMap?.seller||'',
+    seller_reviews:oneMap?.positiveRatings!=null||oneMap?.negativeRatings!=null
+      ? Number(oneMap.positiveRatings||0)+Number(oneMap.negativeRatings||0):null,
     image_url:image,
     status,
     purchase_via:spec.purchaseVia,
@@ -3767,6 +3819,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
       searchUrl:searchMeta.searchUrl,
       searchMode:spec.mode,
       sourceLabel:spec.label,
+      oneMapSeller:oneMap?{type:oneMap.sellerType,positiveRatings:oneMap.positiveRatings,negativeRatings:oneMap.negativeRatings}:null,
       purchaseVia:spec.purchaseVia,
       detailHttpStatus:snap.status,
       finalUrl:snap.finalUrl,
@@ -4002,28 +4055,30 @@ async function searchJapanRadarLive(opts){
   let browserContext=null;
   let browserError=null;
 
-  const needsBrowser=JAPAN_RADAR_SPECS.some(
-    x=>x.mode==='browser'
-  );
+  // One Map necesita un navegador para cargar las subastas con JavaScript.
+  try{
+    const {chromium}=await import('playwright');
 
-  if(needsBrowser){
-    try{
-      const {chromium}=await import('playwright');
+    browser=await chromium.launch({
+      headless:true
+    });
 
-      browser=await chromium.launch({
-        headless:true
-      });
-
-      browserContext=await browser.newContext({
-        locale:'ja-JP',
-        userAgent:JAPAN_HTTP_HEADERS['user-agent']
-      });
-    }catch(e){
-      browserError=e.message;
-    }
+    browserContext=await browser.newContext({
+      locale:'ja-JP',
+      userAgent:JAPAN_HTTP_HEADERS['user-agent']
+    });
+  }catch(e){
+    browserError=e.message;
   }
 
   try{
+    try{
+      const result=await searchOneMapAuctions(opts,browserContext);
+      perSource['yahoo-auctions-jp']=result;
+      kept+=Number(result.kept||0);
+    }catch(e){
+      perSource['yahoo-auctions-jp']={ok:false,kept:0,error:e.message};
+    }
     for(const spec of JAPAN_RADAR_SPECS){
       try{
         const result=await searchJapanSource(
@@ -4385,7 +4440,19 @@ async function syncOpportunitiesSheet(){
       AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.listing_id=l.id AND n.kind='sheet')
     ORDER BY a.updated_at LIMIT 200`).all(OPPORTUNITY_SHEET_MIN_SCORE,since);
   const seen=new Set();
-  const picks=rows.filter(r=>!seen.has(r.id)&&seen.add(r.id));
+  const picks=rows.filter(r=>{
+    if(seen.has(r.id))return false;
+    if(r.source==='yahoo-auctions-jp'){
+      const auction=listingAuction(r);
+      let plan=null;
+      try{plan=JSON.parse(r.verification_json||'{}')?.auction||null;}catch{}
+      if(!auction?.live||!plan?.resale_from_db||
+        !(Number(plan.max_bid_local)>Number(auction.currentBid))||
+        !['STRONG BUY','BUY','WATCH'].includes(String(r.decision||'').toUpperCase()))return false;
+    }
+    seen.add(r.id);
+    return true;
+  });
   if(!picks.length)return {ok:true,added:0};
   const auth=await googleSheetsAuth(true);
   const url=`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(id)}/values/${encodeURIComponent('Oportunidades!A1')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
@@ -8124,19 +8191,46 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   // Subastas: el precio del anuncio es la puja actual, no lo que acabará
   // costando. Se calcula la puja máxima rentable y el beneficio a esa puja.
   const auc=task?listingAuction(item):null;
-  if(auc&&Number.isFinite(Number(a.resale_low_eur))){
+  if(auc){
     try{
-      let comps=verification?.market?.sheet_comps;
-      if(comps===undefined)comps=vestiaireComparables(task,{...item,model:a.model},{brand:a.brand,family:a.model});
-      const fromDb=comps&&(comps.tier==='iguales'||comps.tier==='misma_talla');
-      const resale=fromDb?Number(comps.low):Number(a.resale_low_eur);
-      const maxEur=auctionMaxBidEur(item,resale,task.task_name);
+      const ident=verification?.exact||{brand:a.brand,family:a.model};
+      const comparableItem={...item,model:a.model};
+      const comps=verification?.market?.sheet_comps??vestiaireComparables(task,comparableItem,ident);
+      const anchor=verification?.market?.sheet_anchor??vestiaireSheetAnchor(task,comparableItem,ident);
+      const sameSize=comps&&(comps.tier==='iguales'||comps.tier==='misma_talla');
+      const dbLow=sameSize?Number(comps.low):anchor?Number(anchor.low):null;
+      const fromDb=Number.isFinite(dbLow)&&dbLow>0;
+      const estimate=Number(a.resale_low_eur);
+      const requiresDatabase=auc.requiresDatabase===true;
+      const resale=requiresDatabase
+        ? fromDb?(estimate>0?Math.min(dbLow,estimate):dbLow):null
+        : sameSize?Number(comps.low):estimate;
       const current=Number(item.price_eur);
+      const usable=auc.live&&resale>0&&(!requiresDatabase||fromDb);
+      const rawMax=usable?auctionMaxBidEur(item,resale,task.task_name):null;
+      const maxLocal=rawMax!=null?auctionLocalBid(rawMax,auc.currency):null;
+      const maxEur=maxLocal!=null?toEur(maxLocal,auc.currency):null;
       const plan={ends_at:auc.endsAt,bids:auc.bids,currency:auc.currency,current_bid:auc.currentBid,current_bid_eur:roundMoney(current),
-        resale_eur:roundMoney(resale),resale_from_db:!!fromDb,min_profit_eur:AUCTION_MIN_PROFIT_EUR,
-        max_bid_eur:maxEur!=null?roundMoney(maxEur):null,max_bid_local:maxEur!=null?auctionLocalBid(maxEur,auc.currency):null};
+        resale_eur:resale>0?roundMoney(resale):null,resale_from_db:!!fromDb,db_comparables:fromDb?(sameSize?comps.n:anchor.n):null,
+        db_basis:fromDb?(sameSize?comps.basis:anchor.basis):null,requires_database:requiresDatabase,
+        min_profit_eur:AUCTION_MIN_PROFIT_EUR,max_bid_eur:maxEur!=null?roundMoney(maxEur):null,max_bid_local:maxLocal};
       verification={...(verification||{}),auction:plan};
-      if(maxEur==null||current>=maxEur){
+      if(requiresDatabase&&!fromDb){
+        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REVIEW';
+        a.opportunity_score=null;
+        a.decision_reasons_es=['Subasta: no hay comparables suficientes del mismo modelo y talla en la base de Luxury Hunter; no se propone una puja máxima.',
+          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
+      }else if(!auc.live){
+        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REVIEW';
+        a.opportunity_score=null;
+        a.decision_reasons_es=['Subasta finalizada; la puja ya no está disponible.',
+          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
+      }else if(!(resale>0)){
+        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REVIEW';
+        a.opportunity_score=null;
+        a.decision_reasons_es=['Subasta: no hay un precio de reventa conservador para calcular una puja máxima.',
+          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
+      }else if(maxEur==null||maxLocal<=Number(auc.currentBid)||current>=maxEur){
         if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REJECT';
         a.decision_reasons_es=[maxEur==null
           ? `Subasta: ni pujando muy bajo deja ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €.`
@@ -8145,8 +8239,8 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
       }else{
         const atMax=auctionNetProfit(item,maxEur,resale,task.task_name);
         a.landed_cost_eur=roundMoney(atMax.landed);
-        a.net_profit_low_eur=roundMoney(Number(a.resale_low_eur)-atMax.landed);
-        if(Number.isFinite(Number(a.resale_high_eur)))a.net_profit_high_eur=roundMoney(Number(a.resale_high_eur)-atMax.landed);
+        a.net_profit_low_eur=roundMoney(atMax.net);
+        if(Number(a.resale_high_eur)>0)a.net_profit_high_eur=roundMoney(auctionNetProfit(item,maxEur,Number(a.resale_high_eur),task.task_name).net);
         a.decision_reasons_es=[`Subasta: puja como máximo ${plan.max_bid_local??Math.round(maxEur)} ${plan.max_bid_local!=null?auc.currency:'€'} (≈ ${Math.round(maxEur)} €) para ganar al menos ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €${fromDb?' (anuncios parecidos de tu base)':' (pronóstico)'}.`,
           ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
       }
@@ -8263,7 +8357,11 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
     searchCommand:`bunjang-cli --json --preferred-transport browser search ${JSON.stringify(q)} --pages ${pages} --max-items ${maxItems}`,
     detailCommand:'bunjang-cli --json item list --ids <IDs encontrados, lotes de 40>'
   }));
-  const japanCalls=JAPAN_RADAR_SPECS.flatMap(spec=>
+  const oneMapCalls=jQueries.slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4)).map(q=>({
+    source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',
+    mode:'browser',query:q,method:'BROWSER GET',url:oneMapSearchUrl(q)
+  }));
+  const japanCalls=[...oneMapCalls,...JAPAN_RADAR_SPECS.flatMap(spec=>
     jQueries.map(q=>({
       source:spec.id,
       label:spec.label,
@@ -8273,7 +8371,7 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
       method:spec.mode==='browser'?'BROWSER GET':'GET',
       url:spec.searchUrl(q)
     }))
-  );
+  )];
   let liveStatus={};
   try { liveStatus=JSON.parse(session?.source_status_json||run?.source_status_json||'{}'); } catch {}
   return {
@@ -8282,7 +8380,9 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
     run:run?{id:run.id,status:run.status,started_at:run.started_at,finished_at:run.finished_at,session_id:run.session_id,error:run.error||null}:null,
     searchSession:session?{id:session.id,status:session.status,started_at:session.started_at,finished_at:session.finished_at}:null,
     queryPlan:{generatedBy:plan?.generatedBy||'unknown',xianyu:plan?.xianyu||[],bunjang:plan?.bunjang||[],japan:plan?.japan||[]},
-    effectiveLimits:{xianyuMaxQueries:xLimit,bunjangMaxQueries:bLimit,japanMaxQueries:jLimit,pages,maxItemsPerQuery:maxItems},
+    effectiveLimits:{xianyuMaxQueries:xLimit,bunjangMaxQueries:bLimit,japanMaxQueries:jLimit,
+      oneMapMaxQueries:clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4),
+      oneMapDetailsPerRun:clampInt(process.env.ONEMAP_DETAIL_LIMIT||8,8,1,20),pages,maxItemsPerQuery:maxItems},
     filters:{minEur,maxEur,newPublishOption:task.new_publish_option||null,personalOnly:!!task.personal_only,freeShipping:!!task.free_shipping,region:task.region||null,accountStrategy:task.account_strategy||'auto',accountStateFile:task.account_state_file||null},
     connectors:{
       xianyu:{enabled:sources.includes('xianyu'),baseUrl:XIANYU_BASE_URL,queriesExecuted:xQueries,calls:xianyuCalls},
