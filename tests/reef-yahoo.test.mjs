@@ -13,6 +13,7 @@ test('ReefAPI usa una sola búsqueda y convierte subastas a enlaces de One Map',
       listing_format:'auction',seller_type:'individual,store',sort:'ending_soon',limit:50});
     return {ok:true,status:200,json:async()=>({ok:true,data:{items:[
       {auction_id:'s1234567890',title:'Lady Dior',price:120000,
+        image:'https://auc-pctr.c.yimg.jp/i/auctions.c.yimg.jp/images.auctions.yahoo.co.jp/image/dr000/auc0205/user/abc123/i-img740x740-123abc.jpg?pri=l&w=300',
         end_time:new Date(now+3600000).toISOString(),bid_count:4,
         listing_type:'individual',is_fixed_price:false,seller:{id:'seller',positive_percent:99}},
       {auction_id:'s1111111111',title:'Precio fijo',price:10000,
@@ -27,6 +28,8 @@ test('ReefAPI usa una sola búsqueda y convierte subastas a enlaces de One Map',
   assert.equal(result.items[0].url,
     'https://www.fromjapan.co.jp/japan/en/auction/yahoo/input/s1234567890/');
   assert.equal(result.items[0].sellerPositivePercent,99);
+  assert.equal(result.items[0].image,
+    'https://cdnyauction.buyee.jp/image/dr000/auc0205/user/abc123/i-img740x740-123abc.jpg');
   assert.equal(result.items[1].sellerPositivePercent,null);
 });
 

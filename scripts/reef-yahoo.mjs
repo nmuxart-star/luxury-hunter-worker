@@ -1,3 +1,5 @@
+import {yahooAuctionImageUrl} from './yahoo-auction-image.mjs';
+
 const ENDPOINT='https://api.reefapi.com/yahoo-auctions/v1/search';
 
 export function reefAuctionCard(row,now=Date.now()){
@@ -19,7 +21,7 @@ export function reefAuctionCard(row,now=Date.now()){
     timeLeftMs:endMs-now,
     buyNow:row?.buy_now_price!=null&&Number.isFinite(Number(row.buy_now_price))
       ?Number(row.buy_now_price):null,
-    image:/^https:\/\//i.test(String(row?.image||''))?row.image:null,
+    image:yahooAuctionImageUrl(row?.image),
     condition:String(row?.condition||'').trim()||null,
     sellerId:String(row?.seller?.id||'').trim()||null,
     sellerPositivePercent:row?.seller?.positive_percent!=null&&Number.isFinite(Number(row.seller.positive_percent))
