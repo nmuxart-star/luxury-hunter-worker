@@ -203,6 +203,7 @@ jobs:
           ONEMAP_STORAGE_STATE_B64: ${{ secrets.ONEMAP_STORAGE_STATE_B64 }}
         shell: bash
         run: |
+          echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
           if [ -z "${ONEMAP_STORAGE_STATE_B64:-}" ]; then
             echo "ONEMAP_SESSION_STATUS=public" >> "$GITHUB_ENV"
             echo "One Map: public searches (no account session configured)."
@@ -219,7 +220,6 @@ jobs:
           if ONEMAP_HEADED=1 xvfb-run -a node scripts/onemap-session-check.mjs .onemap/storage-state.json; then
             echo "ONEMAP_SESSION_STATUS=ok" >> "$GITHUB_ENV"
             echo "ONEMAP_STORAGE_STATE_FILE=$PWD/.onemap/storage-state.json" >> "$GITHUB_ENV"
-            echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
           else
             STATUS=$?
             if [ "$STATUS" -eq 2 ]; then
@@ -228,7 +228,6 @@ jobs:
               rm -f .onemap/storage-state.json
             else
               echo "ONEMAP_SESSION_STATUS=unverified" >> "$GITHUB_ENV"
-              echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
               rm -f .onemap/storage-state.json
               echo "::warning::One Map account session could not be verified; public searches will continue."
             fi
