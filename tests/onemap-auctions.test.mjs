@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {oneMapSearchUrl,oneMapTimeLeftMs,parseOneMapAuctions} from '../scripts/onemap-auctions.mjs';
+import {oneMapSearchUrl,oneMapTimeLeftMs,parseOneMapAuctions,parseOneMapDetail} from '../scripts/onemap-auctions.mjs';
 
 const NOW=Date.parse('2026-11-03T12:00:00.000Z');
 
@@ -32,4 +32,16 @@ test('parses visible auction cards and ignores invalid or duplicated ones',()=>{
     endsAt:'2026-11-04T02:08:27.000Z',timeLeftMs:(14*3600+8*60+27)*1000,
     buyNow:80000,image:'https://example.com/s1250673988.jpg'
   }]);
+});
+
+test('reads condition and seller reputation from an auction page',()=>{
+  const row=(label,value)=>`<div class="vx-row"><div class="vx-col">${label}</div><div class="vx-col">${value}</div></div>`;
+  const html=row('Item condition','Visibly Used')+
+    row('Seller','<a>ヒトトキネット</a>')+
+    row('Seller type','Personal')+
+    row('Overall rating','<a><span>510</span></a> (<span class="pl-1 font-medium">510</span><span class="pl-1 font-medium">0</span>)');
+  assert.deepEqual(parseOneMapDetail(html),{
+    seller:'ヒトトキネット',sellerType:'Personal',condition:'Visibly Used',
+    positiveRatings:510,negativeRatings:0
+  });
 });

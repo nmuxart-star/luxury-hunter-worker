@@ -52,3 +52,20 @@ export function parseOneMapAuctions(html,now=Date.now()){
   });
   return items;
 }
+
+export function parseOneMapDetail(html){
+  const $=loadHtml(html);
+  const field=label=>$('.vx-row').filter((_,el)=>
+    $(el).children('.vx-col').first().text().replace(/\s+/g,' ').trim()===label
+  ).first().children('.vx-col').eq(1);
+  const ratings=field('Overall rating').find('span.pl-1.font-medium').map((_,el)=>
+    Number($(el).text().replaceAll(',',''))
+  ).get();
+  return {
+    seller:field('Seller').find('a').first().text().replace(/\s+/g,' ').trim()||null,
+    sellerType:field('Seller type').text().replace(/\s+/g,' ').trim()||null,
+    condition:field('Item condition').text().replace(/\s+/g,' ').trim()||null,
+    positiveRatings:Number.isFinite(ratings[0])?ratings[0]:null,
+    negativeRatings:Number.isFinite(ratings[1])?ratings[1]:null
+  };
+}

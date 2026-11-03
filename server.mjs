@@ -13,7 +13,7 @@ import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
 import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearchIntervalMs,
   XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
-import {oneMapSearchUrl,parseOneMapAuctions} from './scripts/onemap-auctions.mjs';
+import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -3725,6 +3725,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
   }
 
   const $=loadHtml(snap.html);
+  const oneMap=spec.id==='yahoo-auctions-jp'?parseOneMapDetail(snap.html):null;
   const product=japanFindJsonLdProduct($);
   const offer=japanOffer(product);
 
@@ -3802,11 +3803,13 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
     source_id:sourceId,
     url:candidate.href,
     title,
-    description,
+    description:oneMap?.condition?`${description}\nItem condition: ${oneMap.condition}`:description,
     original_price:price,
     currency:'JPY',
     price_eur:price==null?null:toEur(price,'JPY'),
-    seller_name:seller,
+    seller_name:seller||oneMap?.seller||'',
+    seller_reviews:oneMap?.positiveRatings!=null||oneMap?.negativeRatings!=null
+      ? Number(oneMap.positiveRatings||0)+Number(oneMap.negativeRatings||0):null,
     image_url:image,
     status,
     purchase_via:spec.purchaseVia,
@@ -3816,6 +3819,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
       searchUrl:searchMeta.searchUrl,
       searchMode:spec.mode,
       sourceLabel:spec.label,
+      oneMapSeller:oneMap?{type:oneMap.sellerType,positiveRatings:oneMap.positiveRatings,negativeRatings:oneMap.negativeRatings}:null,
       purchaseVia:spec.purchaseVia,
       detailHttpStatus:snap.status,
       finalUrl:snap.finalUrl,
