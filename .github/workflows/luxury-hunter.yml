@@ -190,6 +190,50 @@ jobs:
       - name: Install Chromium for Bunjang
         run: npx playwright install --with-deps chromium
 
+      - name: Ensure virtual display for One Map
+        shell: bash
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y xvfb >/dev/null
+          fi
+
+      - name: Load One Map account session
+        env:
+          ONEMAP_STORAGE_STATE_B64: ${{ secrets.ONEMAP_STORAGE_STATE_B64 }}
+        shell: bash
+        run: |
+          if [ -z "${ONEMAP_STORAGE_STATE_B64:-}" ]; then
+            echo "ONEMAP_SESSION_STATUS=public" >> "$GITHUB_ENV"
+            echo "One Map: public searches (no account session configured)."
+            exit 0
+          fi
+          mkdir -p -m 700 .onemap
+          if ! printf '%s' "$ONEMAP_STORAGE_STATE_B64" | base64 --decode > .onemap/storage-state.json; then
+            rm -f .onemap/storage-state.json
+            echo "ONEMAP_SESSION_STATUS=invalid" >> "$GITHUB_ENV"
+            echo "::warning::One Map account session could not be decoded; public searches will continue."
+            exit 0
+          fi
+          chmod 600 .onemap/storage-state.json
+          if ONEMAP_HEADED=1 xvfb-run -a node scripts/onemap-session-check.mjs .onemap/storage-state.json; then
+            echo "ONEMAP_SESSION_STATUS=ok" >> "$GITHUB_ENV"
+            echo "ONEMAP_STORAGE_STATE_FILE=$PWD/.onemap/storage-state.json" >> "$GITHUB_ENV"
+            echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
+          else
+            STATUS=$?
+            if [ "$STATUS" -eq 2 ]; then
+              echo "ONEMAP_SESSION_STATUS=expired" >> "$GITHUB_ENV"
+              echo "::warning::One Map account session has expired; public searches will continue."
+              rm -f .onemap/storage-state.json
+            else
+              echo "ONEMAP_SESSION_STATUS=unverified" >> "$GITHUB_ENV"
+              echo "ONEMAP_STORAGE_STATE_FILE=$PWD/.onemap/storage-state.json" >> "$GITHUB_ENV"
+              echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
+              echo "::warning::One Map account session could not be verified; it will be tried for searches."
+            fi
+          fi
+
       - name: Start Xianyu connector when encrypted state is configured
         env:
           XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
@@ -299,7 +343,7 @@ jobs:
 
       - name: Run due tasks
         id: run_due_tasks
-        run: node scripts/github-run.mjs
+        run: xvfb-run -a node scripts/github-run.mjs
 
       # Si Goofish dio la sesión por caducada o bloqueó la búsqueda, se envía
       # un QR a Telegram para renovarla escaneando con la app (máx. 1 vez / 20 h).
@@ -326,6 +370,30 @@ jobs:
           TEXT="🔑 La sesión de tu cuenta de Xianyu ha caducado en la nube y sus turnos no pueden buscar. Para renovarla, en tu Mac pídele a Claude «inicia sesión en Xianyu» (o ejecuta: cd ~/luxury-hunter && npm run xianyu:login)."
           curl -s -o /dev/null -w "Telegram notice HTTP %{http_code}\n" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TEXT" || echo "Could not send the renewal notice"
 
+      - name: One Map session renewal notice
+        if: always()
+        shell: bash
+        run: |
+          if [ "${ONEMAP_SESSION_STATUS:-}" != "expired" ] && [ "${ONEMAP_SESSION_STATUS:-}" != "invalid" ] && [ "${ONEMAP_SESSION_STATUS:-}" != "unverified" ]; then exit 0; fi
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
+          LAST=0
+          [ -f .state/onemap-notice-last ] && LAST=$(cat .state/onemap-notice-last)
+          [[ "$LAST" =~ ^[0-9]+$ ]] || LAST=0
+          NOW=$(date +%s)
+          mkdir -p lh-upload
+          echo "$LAST" > lh-upload/onemap-notice-last
+          if [ $((NOW-LAST)) -lt 72000 ]; then exit 0; fi
+          if [ "${ONEMAP_SESSION_STATUS:-}" = "unverified" ]; then
+            TEXT="⚠️ Luxury Hunter no pudo verificar tu sesión de One Map desde GitHub. El bot intentará usarla y, si falla, buscará sin cuenta. Revisa la ejecución de GitHub Actions; si la sesión ha caducado, renueva el secreto ONEMAP_STORAGE_STATE_B64."
+          else
+            TEXT="🔑 La sesión de One Map de Luxury Hunter ha caducado. Las búsquedas públicas siguen funcionando, pero el bot ya no usa tu cuenta. Renueva la sesión en tu Mac con npm run onemap:login y actualiza el secreto ONEMAP_STORAGE_STATE_B64 de GitHub."
+          fi
+          if curl -fsS -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TEXT"; then
+            echo "$NOW" > lh-upload/onemap-notice-last
+          else
+            echo "::warning::Could not send the One Map renewal notice."
+          fi
+
       - name: Collect persistent state
         if: always()
         shell: bash
@@ -347,6 +415,9 @@ jobs:
           done
           if [ ! -f lh-upload/xianyu-qr-last ] && [ -f .state/xianyu-qr-last ]; then
             cp .state/xianyu-qr-last lh-upload/
+          fi
+          if [ ! -f lh-upload/onemap-notice-last ] && [ -f .state/onemap-notice-last ]; then
+            cp .state/onemap-notice-last lh-upload/
           fi
 
       - name: Save persistent state
