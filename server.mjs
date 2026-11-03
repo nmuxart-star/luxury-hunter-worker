@@ -28,6 +28,8 @@ if (fs.existsSync(envPath)) {
 }
 
 const PORT = Number(process.env.PORT || 8200);
+let oneMapAccountStatus=process.env.ONEMAP_SESSION_STATUS||
+  (process.env.ONEMAP_STORAGE_STATE_FILE?'configured':'public');
 const XIANYU_BASE_URL = String(process.env.XIANYU_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 const DB_PATH = path.join(__dirname, 'data', 'luxury-hunter.sqlite3');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -4054,27 +4056,46 @@ async function searchJapanRadarLive(opts){
   let browser=null;
   let browserContext=null;
   let browserError=null;
+  let usingOneMapAccount=false;
+  const contextOptions={locale:'ja-JP',userAgent:JAPAN_HTTP_HEADERS['user-agent']};
+  const oneMapStateFile=String(process.env.ONEMAP_STORAGE_STATE_FILE||'').trim();
 
   // One Map necesita un navegador para cargar las subastas con JavaScript.
   try{
     const {chromium}=await import('playwright');
 
     browser=await chromium.launch({
-      headless:true
+      headless:process.env.ONEMAP_HEADED!=='1'
     });
 
-    browserContext=await browser.newContext({
-      locale:'ja-JP',
-      userAgent:JAPAN_HTTP_HEADERS['user-agent']
-    });
+    if(oneMapStateFile){
+      try{
+        browserContext=await browser.newContext({...contextOptions,storageState:oneMapStateFile});
+        usingOneMapAccount=true;
+      }catch(e){
+        console.warn(`One Map account session could not be loaded: ${e.message}`);
+        oneMapAccountStatus='unavailable';
+      }
+    }
+    if(!browserContext)browserContext=await browser.newContext(contextOptions);
   }catch(e){
     browserError=e.message;
   }
 
   try{
     try{
-      const result=await searchOneMapAuctions(opts,browserContext);
-      perSource['yahoo-auctions-jp']=result;
+      let result=await searchOneMapAuctions(opts,browserContext);
+      if(!result.ok&&usingOneMapAccount&&browser&&browserContext){
+        console.warn(`One Map account search failed: ${result.error||'unknown error'}; trying public search.`);
+        oneMapAccountStatus='unavailable';
+        await browserContext.close().catch(()=>{});
+        browserContext=await browser.newContext(contextOptions);
+        result=await searchOneMapAuctions(opts,browserContext);
+      }
+      perSource['yahoo-auctions-jp']={
+        ...result,
+        accountStatus:oneMapAccountStatus
+      };
       kept+=Number(result.kept||0);
     }catch(e){
       perSource['yahoo-auctions-jp']={ok:false,kept:0,error:e.message};
@@ -12618,6 +12639,7 @@ function statusPayload() {
   return {
     app:'Luxury Hunter v1.7.1', port:PORT, xianyuBaseUrl:XIANYU_BASE_URL,
     xianyuProvider:xianyuProvider(),justOneApiConfigured:!!String(process.env.JUSTONEAPI_TOKEN||'').trim(),
+    oneMapAccountStatus,
     bunjangCliExists:fs.existsSync(bunjangCli), geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
     listingCount:db.prepare('SELECT COUNT(*) n FROM listings').get().n,
     taskCount:db.prepare('SELECT COUNT(*) n FROM tasks').get().n,

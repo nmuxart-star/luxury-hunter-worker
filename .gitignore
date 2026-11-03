@@ -11,6 +11,7 @@ cloud/*.tmp
 *.bak
 .xianyu-profile/
 .xianyu-profile-*/
+.onemap/
 .xianyu-tmp/
 .upload/
 lh-upload/

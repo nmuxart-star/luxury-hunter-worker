@@ -2,7 +2,13 @@
 
 ## Yahoo Auctions Japan vía One Map
 
-Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas públicas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). La búsqueda pública no necesita credenciales de One Map. La cuenta personal sirve para entrar y pujar manualmente.
+Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). Si se configura una sesión personal, el bot la usa para consultar One Map; si no está disponible o caduca, continúa con las búsquedas públicas. La cuenta personal también sirve para pujar manualmente; el bot no presenta pujas.
+
+### Vincular la cuenta personal de One Map
+
+En el Mac, ejecuta `npm run onemap:login`. Inicia sesión tú mismo en la ventana de One Map y completa cualquier verificación. Al volver al terminal y pulsar Enter, el script comprueba que se puede abrir el área privada en un navegador nuevo. Guarda la sesión en `.onemap/storage-state.json`, con permisos de lectura solo para el usuario; el directorio está excluido de Git.
+
+Para activar la sesión en GitHub Actions, guarda el contenido de ese archivo codificado en Base64 como secreto del repositorio `ONEMAP_STORAGE_STATE_B64`. Nunca subas el JSON ni su Base64 a un commit, una incidencia o un chat: cualquiera que tenga la sesión podría acceder a la cuenta. El workflow comprueba la sesión en Chromium con una pantalla virtual antes de cada ejecución; One Map responde HTTP 403 en Chromium sin pantalla en las pruebas locales. Si caduca, envía un aviso por Telegram como máximo una vez cada 20 horas y sigue buscando sin cuenta; renueva el secreto repitiendo el inicio de sesión. El estado de la cuenta se muestra en `/api/status` como `oneMapAccountStatus`.
 
 El bot solo recomienda una puja máxima cuando encuentra comparables del mismo modelo y talla en la base de Vestiaire de Luxury Hunter. Calcula el límite para conservar al menos 300 € de beneficio neto (`AUCTION_MIN_PROFIT_EUR`), después de la compra, proxy, envíos, aduana, IVA de importación, comisión de reventa e IVA del margen. Si faltan comparables, la subasta queda en revisión sin precio máximo ni aviso de puja. Las cifras de envío y aduana son estimaciones editables en Ajustes → Costes → Yahoo Auctions vía One Map; confirma el coste final en One Map antes de pujar. El bot no presenta pujas automáticamente.
 
