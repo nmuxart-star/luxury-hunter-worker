@@ -15,6 +15,8 @@ import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearch
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
+import {searchReefYahoo} from './scripts/reef-yahoo.mjs';
+import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -3192,7 +3194,11 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
             (maxEur==null||eur<=Number(maxEur));
         })
         .sort((a,b)=>a.timeLeftMs-b.timeLeftMs);
+      if(!cards.length&&/Search Results:\s*([1-9][\d,]*)\s*Items?/i.test(snap.body)){
+        throw new Error('One Map muestra anuncios pero no se pudieron leer las tarjetas');
+      }
       let local=0;
+      let queryDetailErrors=0;
       for(const card of cards){
         if(kept>=detailLimit||local>=perQueryLimit||kept>=Number(maxItems))break;
         if(seen.has(card.id))continue;
@@ -3211,15 +3217,77 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
           item.raw={...item.raw,auction:{endsAt:end,bids:card.bids,currentBid:bid,currency:'JPY',buyNow:card.buyNow,provider:'One Map',requiresDatabase:true}};
           upsertListing(item,sessionId,q);
           kept++;local++;
-        }catch(e){detailErrors++;console.warn(`One Map ${card.id}: ${e.message}`);}
+        }catch(e){detailErrors++;queryDetailErrors++;console.warn(`One Map ${card.id}: ${e.message}`);}
       }
-      perQuery.push({query:q,count:local,candidates:cards.length,searchUrl});
+      perQuery.push({query:q,count:local,candidates:cards.length,searchUrl,
+        ...(local===0&&queryDetailErrors>0?{error:`Fallaron ${queryDetailErrors} fichas de One Map`}:{})});
     }catch(e){perQuery.push({query:q,count:0,error:e.message,searchUrl});}
   }
   const ok=perQuery.length>0&&perQuery.some(x=>!x.error);
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)')
     .run('onemap','live-search',`Queries ${perQuery.length}; kept ${kept}; detail errors ${detailErrors}`,new Date().toISOString());
   return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',kept,detailErrors,perQuery,...(!ok?{error:perQuery[0]?.error||'No se pudo leer One Map'}:{})};
+}
+
+db.exec(`CREATE TABLE IF NOT EXISTS reef_search_usage (
+  month TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0
+)`);
+
+function reserveReefSearch(){
+  const limit=Math.min(500,Math.max(0,Math.floor(Number(process.env.REEF_MONTHLY_SEARCH_LIMIT||500))));
+  const month=xianyuBudgetMonth();
+  db.prepare('INSERT OR IGNORE INTO reef_search_usage(month,attempts) VALUES(?,0)').run(month);
+  return db.prepare('UPDATE reef_search_usage SET attempts=attempts+1 WHERE month=? AND attempts<?')
+    .run(month,limit).changes>0;
+}
+
+async function searchReefAuctions({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
+  const selected=normalizeLines(queries||[]).slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4));
+  const detailLimit=clampInt(process.env.ONEMAP_DETAIL_LIMIT||8,8,1,20);
+  const perQueryLimit=Math.max(1,Math.ceil(detailLimit/Math.max(1,selected.length)));
+  const perQuery=[];
+  const seen=new Set();
+  let kept=0;
+  for(const q of selected){
+    try{
+      if(!reserveReefSearch())throw new Error('Límite mensual de búsquedas ReefAPI alcanzado');
+      const {items}=await searchReefYahoo(q,{apiKey:process.env.REEF_API_KEY,limit:100});
+      const cards=items
+        .filter(c=>c.timeLeftMs>=5*60e3&&c.timeLeftMs<=AUCTION_MAX_HOURS*3600e3)
+        .filter(c=>{
+          const eur=toEur(c.currentBid,'JPY');
+          return eur!=null&&(minEur==null||eur>=Number(minEur))&&
+            (maxEur==null||eur<=Number(maxEur));
+        })
+        .sort((a,b)=>a.timeLeftMs-b.timeLeftMs);
+      let local=0;
+      for(const card of cards){
+        if(kept>=detailLimit||local>=perQueryLimit||kept>=Number(maxItems))break;
+        if(seen.has(card.id))continue;
+        seen.add(card.id);
+        const item={source:'yahoo-auctions-jp',source_id:card.id,url:card.url,
+          title:card.title,description:card.condition?`Item condition: ${card.condition}`:'',
+          original_price:card.currentBid,currency:'JPY',price_eur:toEur(card.currentBid,'JPY'),
+          seller_name:card.sellerId||'',seller_reviews:null,image_url:card.image||'',status:'',
+          purchase_via:'One Map / FROM JAPAN',
+          raw:{query:q,searchUrl:oneMapSearchUrl(q),searchMode:'api',sourceLabel:'Yahoo! Auctions Japan',
+            dataProvider:'ReefAPI',sellerPositivePercent:card.sellerPositivePercent,
+            shippingFeeJpy:card.shippingFee,purchaseVia:'One Map / FROM JAPAN',
+            auction:{endsAt:card.endsAt,bids:card.bids,currentBid:card.currentBid,
+              currency:'JPY',buyNow:card.buyNow,provider:'ReefAPI',requiresDatabase:true}}};
+        upsertListing(item,sessionId,q);
+        kept++;local++;
+      }
+      perQuery.push({query:q,count:local,candidates:cards.length,provider:'ReefAPI',creditsReserved:2});
+    }catch(e){perQuery.push({query:q,count:0,error:e.message,provider:'ReefAPI'});}
+  }
+  const ok=perQuery.length>0&&perQuery.some(x=>!x.error);
+  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)')
+    .run('reefapi','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
+  return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',
+    purchaseVia:'One Map / FROM JAPAN',mode:'api',kept,detailErrors:0,perQuery,
+    ...(!ok?{error:perQuery[0]?.error||'ReefAPI no devolvió resultados'}:{})};
 }
 
 function parseYen(text){
@@ -3599,6 +3667,7 @@ async function japanHttpSnapshot(url){
 }
 
 async function japanBrowserSnapshot(context,url,waitMs=1000,scrollSteps=0,apiPattern=null){
+  if(context?.macBridgeToken)return macOneMapSnapshot(url,context.macBridgeToken);
   const page=await context.newPage();
   // Respuestas JSON de la propia web que cumplen apiPattern (Mercari: precio
   // en yenes aunque fuera de Japón la página lo enseñe convertido a euros).
@@ -4091,18 +4160,41 @@ async function searchJapanRadarLive(opts){
 
   try{
     try{
-      let result=await searchOneMapAuctions(opts,browserContext);
-      if(!result.ok&&usingOneMapAccount&&browser&&browserContext){
-        console.warn(`One Map account search failed: ${result.error||'unknown error'}; trying public search.`);
-        oneMapAccountStatus='unavailable';
-        await browserContext.close().catch(()=>{});
-        browserContext=await browser.newContext(contextOptions);
+      const bridgeToken=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
+      const reefKey=String(process.env.REEF_API_KEY||'').trim();
+      const macReady=bridgeToken&&await macOneMapReady(bridgeToken);
+      let result;
+      if(macReady){
+        result=await searchOneMapAuctions(opts,{macBridgeToken:bridgeToken});
+        result.mode='mac-chrome';
+        if(reefKey){
+          const failed=(result.perQuery||[]).filter(x=>x.error).map(x=>x.query);
+          if(failed.length){
+            const backup=await searchReefAuctions({...opts,queries:failed});
+            const byQuery=new Map(backup.perQuery.map(x=>[x.query,x]));
+            result={...result,mode:'mac-chrome+api',kept:result.kept+backup.kept,
+              perQuery:result.perQuery.map(x=>x.error&&byQuery.has(x.query)
+                ?{...byQuery.get(x.query),localError:x.error}:x)};
+            result.ok=result.perQuery.some(x=>!x.error);
+            result.error=result.ok?undefined:result.perQuery[0]?.error;
+          }
+        }
+      }else if(reefKey){
+        result=await searchReefAuctions(opts);
+      }else{
         result=await searchOneMapAuctions(opts,browserContext);
+        if(!result.ok&&usingOneMapAccount&&browser&&browserContext){
+          console.warn(`One Map account search failed: ${result.error||'unknown error'}; trying public search.`);
+          oneMapAccountStatus='unavailable';
+          await browserContext.close().catch(()=>{});
+          browserContext=await browser.newContext(contextOptions);
+          result=await searchOneMapAuctions(opts,browserContext);
+        }
       }
-      if(!result.ok)console.warn(`One Map public search failed: ${result.error||'unknown error'}`);
+      if(!result.ok)console.warn(`Yahoo Auctions search failed: ${result.error||'unknown error'}`);
       perSource['yahoo-auctions-jp']={
         ...result,
-        accountStatus:oneMapAccountStatus
+        accountStatus:macReady?'mac-chrome':oneMapAccountStatus
       };
       kept+=Number(result.kept||0);
     }catch(e){
@@ -8388,7 +8480,9 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
   }));
   const oneMapCalls=jQueries.slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4)).map(q=>({
     source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',
-    mode:'browser',query:q,method:'BROWSER GET',url:oneMapSearchUrl(q)
+    mode:'mac-chrome-or-api',query:q,method:'MAC CHROME GET; REEFAPI POST if offline or failed',
+    url:oneMapSearchUrl(q),fallbackUrl:'https://api.reefapi.com/yahoo-auctions/v1/search',
+    fallbackCreditsPerSearch:2
   }));
   const japanCalls=[...oneMapCalls,...JAPAN_RADAR_SPECS.flatMap(spec=>
     jQueries.map(q=>({

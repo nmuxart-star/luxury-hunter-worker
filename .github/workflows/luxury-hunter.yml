@@ -64,6 +64,10 @@ jobs:
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       JUSTONEAPI_TOKEN: ${{ secrets.JUSTONEAPI_TOKEN }}
+      # Yahoo Auctions: Chrome del Mac primero; ReefAPI solo cuando no responde.
+      ONEMAP_MAC_BRIDGE_TOKEN: ${{ secrets.ONEMAP_MAC_BRIDGE_TOKEN }}
+      REEF_API_KEY: ${{ secrets.REEF_API_KEY }}
+      REEF_MONTHLY_SEARCH_LIMIT: ${{ vars.REEF_MONTHLY_SEARCH_LIMIT || '500' }}
       XIANYU_BASE_URL: http://127.0.0.1:8000
       # justoneapi, direct (cuenta de Nil) o alternate (una búsqueda con cada uno).
       XIANYU_PROVIDER: ${{ (vars.XIANYU_PROVIDER == 'direct' || vars.XIANYU_PROVIDER == 'alternate') && vars.XIANYU_PROVIDER || 'justoneapi' }}

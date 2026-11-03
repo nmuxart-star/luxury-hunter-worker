@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Luxury Hunter One Map local",
+  "version": "0.1.0",
+  "description": "Consulta subastas de One Map desde el Chrome del Mac para Luxury Hunter.",
+  "minimum_chrome_version": "116",
+  "permissions": ["alarms", "scripting", "storage", "tabs"],
+  "host_permissions": [
+    "https://www.fromjapan.co.jp/*",
+    "http://127.0.0.1:8210/*"
+  ],
+  "background": {"service_worker": "worker.js"},
+  "options_page": "options.html"
+}
