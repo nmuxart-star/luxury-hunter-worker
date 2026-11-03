@@ -1,10 +1,18 @@
 # Luxury Hunter v1.4.3
 
-## Yahoo Auctions Japan vía One Map
+## Yahoo Auctions Japan: Mac primero, ReefAPI de reserva
 
-Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). Si se configura una sesión personal, el bot la usa para consultar One Map; si no está disponible o caduca, continúa con las búsquedas públicas. La cuenta personal también sirve para pujar manualmente; el bot no presenta pujas.
+Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). Cuando el Mac está despierto y Chrome con la extensión responde, usa esa búsqueda local. Si el Mac no está disponible o una consulta local falla, usa la búsqueda de ReefAPI para esa consulta. La reserva de ReefAPI solo lee resultados de búsqueda; no consume créditos en fichas detalladas. El bot no presenta pujas.
 
-### Vincular la cuenta personal de One Map
+### Configuración del Mac
+
+Ejecuta `bash scripts/install-onemap-mac.sh` en el Mac. El instalador crea un token local y una clave SSH restringida al túnel hacia el VPS; tendrás que escribir la contraseña del VPS en el terminal una vez. Instala dos LaunchAgents para iniciar el puente local y el túnel automáticamente al entrar en macOS. El token se guarda en `.onemap/bridge-token` (excluido de Git) y como secreto `ONEMAP_MAC_BRIDGE_TOKEN` en GitHub Actions si `gh` está disponible. No publiques el token.
+
+En Chrome abre `chrome://extensions/`, activa «Modo de desarrollador», pulsa «Cargar descomprimida» y selecciona la carpeta `extension/onemap-mac`. Abre las opciones de la extensión, pega el contenido de `.onemap/bridge-token` y guarda. Chrome y el Mac deben permanecer encendidos y con acceso a One Map; si el equipo duerme, la siguiente tarea pasa a ReefAPI. No se copian cookies ni contraseñas de One Map al VPS.
+
+Guarda la clave de ReefAPI como secreto `REEF_API_KEY` del repositorio de GitHub. `REEF_MONTHLY_SEARCH_LIMIT` limita los intentos a 500 por mes por defecto, hasta 1.000 créditos de búsqueda a la tarifa actual de 2 créditos por llamada correcta. Este contador se conserva con el estado SQLite del bot; si se pierde ese estado, se reinicia el contador. El saldo real y los cargos se consultan en ReefAPI. Si no se configura la clave, el bot conserva la búsqueda pública anterior como último recurso.
+
+### Sesión personal de One Map (legado)
 
 En el Mac, ejecuta `npm run onemap:login`. Inicia sesión tú mismo en la ventana de One Map y completa cualquier verificación. Al volver al terminal y pulsar Enter, el script comprueba que se puede abrir el área privada en un navegador nuevo. Guarda la sesión en `.onemap/storage-state.json`, con permisos de lectura solo para el usuario; el directorio está excluido de Git.
 
