@@ -14,6 +14,7 @@ import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearch
   XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
+import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -239,6 +240,11 @@ function ensureColumn(table, name, definition) {
   if (!cols.includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 ensureColumn('listings', 'purchase_via', 'TEXT');
+const updateYahooImage=db.prepare('UPDATE listings SET image_url=? WHERE id=?');
+for(const row of db.prepare("SELECT id,image_url FROM listings WHERE source='yahoo-auctions-jp' AND image_url<>''").all()){
+  const image=yahooAuctionImageUrl(row.image_url);
+  if(image!==row.image_url)updateYahooImage.run(image||'',row.id);
+}
 ensureColumn('search_sessions', 'task_id', 'INTEGER');
 ensureColumn('tasks', 'interval_minutes', 'INTEGER');
 ensureColumn('tasks', 'run_if_missed', 'INTEGER NOT NULL DEFAULT 1');
@@ -615,7 +621,8 @@ function upsertListing(x, sessionId=null, sourceQuery='') {
     Number.isFinite(Number(x.original_price)) ? Number(x.original_price) : null,
     x.currency || '', Number.isFinite(Number(x.price_eur)) ? Number(x.price_eur) : null,
     x.seller_name || '', x.seller_items ?? null, x.seller_sales ?? null, x.seller_reviews ?? null,
-    x.image_url || '', x.status || '', JSON.stringify(x.raw || {}), now, now, x.purchase_via || ''
+    x.source==='yahoo-auctions-jp'?yahooAuctionImageUrl(x.image_url)||'':x.image_url||'',
+    x.status || '', JSON.stringify(x.raw || {}), now, now, x.purchase_via || ''
   );
   const row = db.prepare('SELECT id FROM listings WHERE source=? AND source_id=?').get(x.source, String(x.source_id));
   if (sessionId && row?.id) {
