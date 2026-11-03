@@ -228,9 +228,9 @@ jobs:
               rm -f .onemap/storage-state.json
             else
               echo "ONEMAP_SESSION_STATUS=unverified" >> "$GITHUB_ENV"
-              echo "ONEMAP_STORAGE_STATE_FILE=$PWD/.onemap/storage-state.json" >> "$GITHUB_ENV"
               echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
-              echo "::warning::One Map account session could not be verified; it will be tried for searches."
+              rm -f .onemap/storage-state.json
+              echo "::warning::One Map account session could not be verified; public searches will continue."
             fi
           fi
 
