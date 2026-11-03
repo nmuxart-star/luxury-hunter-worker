@@ -34,6 +34,21 @@ test('parses visible auction cards and ignores invalid or duplicated ones',()=>{
   }]);
 });
 
+test('lee la puja en JPY cuando One Map muestra EUR como moneda principal',()=>{
+  const html=`<div class="shop-item">
+    <div class="item-box"><a href="/japan/en/auction/yahoo/input/s1250673988/"><img src="https://auctions.c.yimg.jp/images.auctions.yahoo.co.jp/image/dr000/auc0205/user/abc123/i-img740x740-123abc.jpg"></a></div>
+    <a href="/japan/en/auction/yahoo/input/s1250673988/"><span class="title-height">Lady Dior</span></a>
+    <div class="leading-tight mb-2"><p>≈ 755.20 EUR</p><span>( 128,000 JPY)</span></div>
+    <div>Buy It Now price <p>≈ 790.00 EUR</p><span>( 134,000 JPY)</span></div>
+    <span><div class="bidrealtime"></div>1</span><span><svg class="feather-clock"></svg>01:15:00</span>
+  </div>`;
+  const [item]=parseOneMapAuctions(html,NOW);
+  assert.equal(item.currentBid,128000);
+  assert.equal(item.buyNow,134000);
+  assert.equal(item.image,
+    'https://cdnyauction.buyee.jp/image/dr000/auc0205/user/abc123/i-img740x740-123abc.jpg');
+});
+
 test('reads condition and seller reputation from an auction page',()=>{
   const row=(label,value)=>`<div class="vx-row"><div class="vx-col">${label}</div><div class="vx-col">${value}</div></div>`;
   const html=row('Item condition','Visibly Used')+
