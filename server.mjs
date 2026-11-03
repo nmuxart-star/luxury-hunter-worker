@@ -4092,6 +4092,7 @@ async function searchJapanRadarLive(opts){
         browserContext=await browser.newContext(contextOptions);
         result=await searchOneMapAuctions(opts,browserContext);
       }
+      if(!result.ok)console.warn(`One Map public search failed: ${result.error||'unknown error'}`);
       perSource['yahoo-auctions-jp']={
         ...result,
         accountStatus:oneMapAccountStatus
