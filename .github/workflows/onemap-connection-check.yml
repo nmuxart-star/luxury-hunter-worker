@@ -1,0 +1,38 @@
+name: Check One Map account connection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ vars.LH_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install dependencies and browser
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Check account session without running searches
+        env:
+          ONEMAP_STORAGE_STATE_B64: ${{ secrets.ONEMAP_STORAGE_STATE_B64 }}
+        shell: bash
+        run: |
+          if [ -z "${ONEMAP_STORAGE_STATE_B64:-}" ]; then
+            echo 'One Map account secret is missing.' >&2
+            exit 1
+          fi
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y xvfb >/dev/null
+          fi
+          mkdir -p -m 700 .onemap
+          printf '%s' "$ONEMAP_STORAGE_STATE_B64" | base64 --decode > .onemap/storage-state.json
+          chmod 600 .onemap/storage-state.json
+          ONEMAP_HEADED=1 xvfb-run -a node scripts/onemap-session-check.mjs .onemap/storage-state.json
