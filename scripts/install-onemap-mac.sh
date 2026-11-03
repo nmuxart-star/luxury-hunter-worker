@@ -4,7 +4,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE="$ROOT/.onemap"
+STATE="$HOME/Library/Application Support/LuxuryHunter/OneMap"
+LEGACY_STATE="$ROOT/.onemap"
 TOKEN_FILE="$STATE/bridge-token"
 KEY_FILE="$STATE/mac-bridge-ssh"
 HOST="${ONEMAP_VPS_HOST:-vps-bea32034.vps.ovh.net}"
@@ -17,6 +18,11 @@ TUNNEL_LABEL="com.luxuryhunter.onemap-mac-tunnel"
 
 mkdir -p "$STATE" "$PLIST_DIR" "$LOG_DIR"
 chmod 700 "$STATE"
+for FILE in bridge-token mac-bridge-ssh mac-bridge-ssh.pub; do
+  if [ -f "$LEGACY_STATE/$FILE" ] && [ ! -f "$STATE/$FILE" ]; then
+    cp "$LEGACY_STATE/$FILE" "$STATE/$FILE"
+  fi
+done
 if [ ! -f "$TOKEN_FILE" ]; then
   openssl rand -hex 32 > "$TOKEN_FILE"
 fi
@@ -25,17 +31,14 @@ if [ ! -f "$KEY_FILE" ]; then
   ssh-keygen -q -t ed25519 -N '' -C luxury-hunter-onemap-mac -f "$KEY_FILE"
 fi
 chmod 600 "$KEY_FILE"
-
-echo "Conectando por SSH para autorizar solo el túnel de este Mac. Escribe la contraseña del VPS en el terminal cuando se solicite."
-printf 'restrict,port-forwarding,permitlisten="127.0.0.1:8210",command="/bin/false" %s\n' "$(cat "$KEY_FILE.pub")" |
-  ssh -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
-    'umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; read -r key; grep -Fqx "$key" ~/.ssh/authorized_keys || printf "%s\n" "$key" >> ~/.ssh/authorized_keys'
+cp "$ROOT/scripts/onemap-mac-bridge.mjs" "$STATE/onemap-mac-bridge.mjs"
+chmod 600 "$STATE/onemap-mac-bridge.mjs"
 
 cat > "$STATE/run-bridge.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export ONEMAP_MAC_BRIDGE_TOKEN="\$(cat '$TOKEN_FILE')"
-exec '$NODE' '$ROOT/scripts/onemap-mac-bridge.mjs'
+exec '$NODE' '$STATE/onemap-mac-bridge.mjs'
 EOF
 chmod 700 "$STATE/run-bridge.sh"
 
@@ -85,6 +88,15 @@ if [ -n "$GH" ]; then
   "$GH" secret set ONEMAP_MAC_BRIDGE_TOKEN -R nmuxart-star/luxury-hunter-worker < "$TOKEN_FILE"
   echo 'Se ha guardado ONEMAP_MAC_BRIDGE_TOKEN en GitHub Actions.'
 else
-  echo 'Falta gh: guarda el contenido de .onemap/bridge-token como secreto ONEMAP_MAC_BRIDGE_TOKEN de GitHub Actions.'
+  echo "Falta gh: guarda $TOKEN_FILE como secreto ONEMAP_MAC_BRIDGE_TOKEN de GitHub Actions."
 fi
-echo 'Puente y túnel instalados. Carga extension/onemap-mac en chrome://extensions/ y pega allí la clave de .onemap/bridge-token.'
+if [ "${ONEMAP_SKIP_REMOTE_AUTH:-0}" = 1 ]; then
+  echo 'Puente local preparado. Falta autorizar la clave SSH en el VPS desde un terminal interactivo.'
+else
+  echo "Conectando por SSH para autorizar solo el túnel de este Mac. Escribe la contraseña del VPS en el terminal cuando se solicite."
+  printf 'restrict,port-forwarding,permitlisten="127.0.0.1:8210",command="/bin/false" %s\n' "$(cat "$KEY_FILE.pub")" |
+    ssh -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
+      'umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; read -r key; grep -Fqx "$key" ~/.ssh/authorized_keys || printf "%s\n" "$key" >> ~/.ssh/authorized_keys'
+  echo 'Clave SSH autorizada en el VPS.'
+fi
+echo "Carga extension/onemap-mac en chrome://extensions/ y pega allí la clave de $TOKEN_FILE."
