@@ -9139,13 +9139,15 @@ function xianyuVerificationVeto(item){
   if(String(item?.source||'').toLowerCase().startsWith('ebay-')&&!['0','false','off','no'].includes(String(process.env.EBAY_REQUIRE_AUTHENTICITY||'').toLowerCase())){
     let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
     if(raw.authenticityGuarantee===true)return null;
-    // Excepción: vendedores con muchísimas ventas y valoraciones casi perfectas.
+    // Excepción (regla de Nil): vendedores con ≥500 valoraciones y ≥99 %
+    // positivas. La garantía es la de autenticidad (programa
+    // AUTHENTICITY_GUARANTEE de eBay), no la de devolución.
     const fb=Number(item?.seller_sales), pct=Number(item?.seller_reviews);
-    if(fb>=Number(process.env.EBAY_TRUSTED_MIN_FEEDBACK||2000)&&pct>=Number(process.env.EBAY_TRUSTED_MIN_PCT||99.5))return null;
+    if(fb>=Number(process.env.EBAY_TRUSTED_MIN_FEEDBACK||500)&&pct>=Number(process.env.EBAY_TRUSTED_MIN_PCT||99))return null;
     return {
       code:'no_ebay_authenticity_guarantee',
       term:'sin garantía',
-      reasons:['El anuncio de eBay no tiene la Garantía de Autenticidad de eBay ni es de un vendedor con muchas ventas y valoraciones casi perfectas. Descartado por política.']
+      reasons:['El anuncio de eBay no tiene la Garantía de Autenticidad de eBay ni es de un vendedor con al menos 500 valoraciones y un 99 % positivas. Descartado por política.']
     };
   }
   if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
