@@ -63,7 +63,11 @@ export function parseOneMapDetail(html){
   const ratings=field('Overall rating').find('span.pl-1.font-medium').map((_,el)=>
     Number($(el).text().replaceAll(',',''))
   ).get();
+  // Galería de la ficha (hasta 10 fotos), pasadas al espejo accesible desde Europa.
+  const images=[...new Set($('.gallery-top .swiper-slide img').map((_,el)=>$(el).attr('src')||$(el).attr('data-src')||'').get()
+    .map(yahooAuctionImageUrl).filter(Boolean))];
   return {
+    images,
     seller:field('Seller').find('a').first().text().replace(/\s+/g,' ').trim()||null,
     sellerType:field('Seller type').text().replace(/\s+/g,' ').trim()||null,
     condition:field('Item condition').text().replace(/\s+/g,' ').trim()||null,

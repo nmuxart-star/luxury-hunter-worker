@@ -14,7 +14,7 @@ import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearch
   XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
-import {sameModelRows} from './scripts/vestiaire-model.mjs';
+import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {searchReefYahoo} from './scripts/reef-yahoo.mjs';
 import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
@@ -3899,6 +3899,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
       searchMode:spec.mode,
       sourceLabel:spec.label,
       oneMapSeller:oneMap?{type:oneMap.sellerType,positiveRatings:oneMap.positiveRatings,negativeRatings:oneMap.negativeRatings}:null,
+      images:oneMap?.images?.length?oneMap.images:undefined,
       purchaseVia:spec.purchaseVia,
       detailHttpStatus:snap.status,
       finalUrl:snap.finalUrl,
@@ -4736,7 +4737,7 @@ function vestiaireMatchFichas(fichas,item,taskName=''){
   const colorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(t))||[])[0];
   const itemColor=colorOf(text);
   // Solo el mismo modelo que el anuncio; si no se sabe cuál es, ninguno.
-  const pool=sameModelRows(taskName,fichas.filter(f=>!f.excluded),vestiaireItemTexts(item,null))?.rows||[];
+  const pool=vestiaireSameModel(taskName,fichas.filter(f=>!f.excluded),item,null)?.rows||[];
   // Antes se ordenaba por cercanía al precio de COMPRA, que no dice nada del
   // precio de reventa: ahora cuentan la talla (medidas o etiqueta) y el color.
   const scored=pool.map(f=>{
@@ -4771,7 +4772,7 @@ function vestiaireSheetAnchor(task,item,exact){
   const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
   if(!r||r.source!=='sheet'||!Array.isArray(r.fichas))return null;
   // Solo el mismo modelo que el anuncio; si no se sabe cuál es, no hay ancla.
-  const m=sameModelRows(task.task_name,r.fichas.filter(f=>Number.isFinite(f.price_eur)&&f.price_eur>0),vestiaireItemTexts(item,exact));
+  const m=vestiaireSameModel(task.task_name,r.fichas.filter(f=>Number.isFinite(f.price_eur)&&f.price_eur>0),item,exact);
   if(!m)return null;
   const pool=m.rows;
   const width=vestiaireWidthCm(`${item?.title||''} ${item?.description||''}`);
@@ -4834,6 +4835,15 @@ function vestiaireItemTexts(item,exact){
     description:String(item?.description||'')
   };
 }
+// Filas del mismo modelo y, en bolsos, del mismo tipo de material que el
+// anuncio: piel, tela/sintético o piel exótica no se mezclan (regla de Nil).
+function vestiaireSameModel(tab,rows,item,exact,opts){
+  const m=sameModelRows(tab,rows,vestiaireItemTexts(item,exact),opts);
+  if(!m||isWatchTask(tab))return m;
+  const known=v=>v&&!/unknown|desconocid/i.test(String(v));
+  const mat=sameMaterialRows(m.rows,known(exact?.material)?exact.material:item?.title);
+  return mat.rows.length?{...m,rows:mat.rows,material:mat.material}:null;
+}
 function vestiaireComparables(task,item,exact){
   const refs=vestiaireRefs().tasks||{};
   const taskName=task?.task_name||'';
@@ -4843,12 +4853,11 @@ function vestiaireComparables(task,item,exact){
   const usable=f=>Number.isFinite(f.price_eur)&&f.price_eur>0;
   // Solo anuncios del MISMO modelo (regla de Nil): otro color, material o
   // talla valen; otro modelo de la misma pestaña, no.
-  const texts=vestiaireItemTexts(item,exact);
   const own=refs[taskName];
-  let pool=[],tab=taskName,model=null;
+  let pool=[],tab=taskName,model=null,matClass=null;
   if(own?.source==='sheet'&&Array.isArray(own.fichas)){
-    const m=sameModelRows(taskName,own.fichas.filter(usable),texts);
-    if(m){pool=m.rows;model=m.key;}
+    const m=vestiaireSameModel(taskName,own.fichas.filter(usable),item,exact);
+    if(m){pool=m.rows;model=m.key;matClass=m.material||null;}
   }
   // Si la pestaña de la tarea no tiene ese modelo, se busca en las demás del
   // mismo tipo, solo si el anuncio lo nombra.
@@ -4856,10 +4865,10 @@ function vestiaireComparables(task,item,exact){
     let best=null;
     for(const [name,r] of Object.entries(refs)){
       if(name===taskName||r?.source!=='sheet'||!Array.isArray(r.fichas)||isWatchTask(name)!==watch)continue;
-      const m=sameModelRows(name,r.fichas.filter(usable),texts,{requireNamed:true});
+      const m=vestiaireSameModel(name,r.fichas.filter(usable),item,exact,{requireNamed:true});
       if(m&&(!best||m.rows.length>best.rows.length))best={name,...m};
     }
-    if(best){pool=best.rows;model=best.key;tab=best.name;}
+    if(best){pool=best.rows;model=best.key;tab=best.name;matClass=best.material||null;}
   }
   if(!pool.length)return null;
   const ratios=(refs[tab]?.fichas||[]).filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)&&f.price_eur>0).map(f=>f.sold_price_eur/f.price_eur).filter(x=>x>0.4&&x<1.6).sort((a,b)=>a-b);
@@ -4901,12 +4910,12 @@ function vestiaireComparables(task,item,exact){
     .sort((x,y)=>(y.sold-x.sold)||Math.abs(realistic(x)-b.mid)-Math.abs(realistic(y)-b.mid))
     .slice(0,5)
     .map(f=>({url:f.url,size:f.size,dims:f.dims,material:f.material,color:f.color,condition:f.condition,price_eur:f.price_eur,sold:!!f.sold,sold_price_eur:f.sold_price_eur??null,likes:Number.isFinite(f.likes)?f.likes:null}));
-  return {tier,tab,model,cross:tab!==taskName,basis,colour:itemColor,material:itemMat,ratio:Math.round(ratio*100)/100,...b,picks};
+  return {tier,tab,model,materialClass:matClass,cross:tab!==taskName,basis,colour:itemColor,material:itemMat,ratio:Math.round(ratio*100)/100,...b,picks};
 }
 function vestiaireComparablesNote(c){
   if(!c)return '';
   const what=c.tier==='iguales'?`iguales (${c.basis}, ${c.colour}, ${c.material})`:c.tier==='misma_talla'?`de la ${c.basis}`:'en otras tallas';
-  return `Reventa según tu base de Vestiaire: ${c.n} anuncios del modelo ${c.model||'del anuncio'} ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
+  return `Reventa según tu base de Vestiaire: ${c.n} anuncios del modelo ${c.model||'del anuncio'}${c.materialClass?` en ${c.materialClass}`:''} ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
 }
 function vestiaireFichasBlock(r,item,taskName=''){
   const picked=vestiaireMatchFichas(r?.fichas||[],item,taskName);
@@ -4935,7 +4944,7 @@ function vestiaireSnapshotBlock(task,item){
   let out='';
   // Solo el mismo modelo que el anuncio: la pestaña mezcla variantes y formatos.
   const active=Array.isArray(r.fichas)?r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)):[];
-  const same=r.source==='sheet'?sameModelRows(task.task_name,active,vestiaireItemTexts(item,null)):null;
+  const same=r.source==='sheet'?vestiaireSameModel(task.task_name,active,item,null):null;
   const list=same?.rows||(r.source==='sheet'?[]:null);
   const all=list?priceStats(list.map(f=>f.price_eur)):r.all;
   if(all?.n>=3){
@@ -9272,7 +9281,7 @@ function xianyuTooCheapVeto(item,task){
   const r=vestiaireRefs().tasks?.[task.task_name];
   if(!Number.isFinite(price)||price<=0||!r)return null;
   // Mínimo según el mismo modelo si se reconoce; si no, el de toda la pestaña.
-  const named=Array.isArray(r.fichas)?sameModelRows(task.task_name,r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)),vestiaireItemTexts(item,null))?.rows:null;
+  const named=Array.isArray(r.fichas)?vestiaireSameModel(task.task_name,r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)),item,null)?.rows:null;
   const base=named&&named.length>=4?priceStats(named.map(f=>f.price_eur)).p25:r.all?.p25;
   if(!Number.isFinite(base)||base<=0)return null;
   const floor=Math.round(base*VESTIAIRE_DEFAULT_REALIZATION*XIANYU_MIN_PRICE_SHARE);
@@ -9356,7 +9365,8 @@ function deterministicPrescreen(item,task=null){
       reasons:[`El título indica que solo se vende un accesorio ("${accessory}"), no el bolso.`]
     };
   }
-  const nonBag=nonBagTitleTerm(item);
+  // En las tareas de relojes "時計" / "시계" es justo lo que se busca.
+  const nonBag=isWatchTask(task?.task_name)?null:nonBagTitleTerm(item);
   if(nonBag){
     return {
       code:'not_a_bag',
@@ -10241,7 +10251,7 @@ function vestiaireDbLines(taskName,item){
   if(!r?.fichas?.length)return [];
   const c=vestiaireCompsFor(taskName,item);
   if(!c)return ['🔮 <b>Pronóstico</b>: no hay anuncios del mismo modelo en tu base de Vestiaire; la reventa es una estimación.'];
-  const mdl=c.model?` · modelo ${htmlEsc(c.model)}`:'';
+  const mdl=c.model?` · modelo ${htmlEsc(c.model)}${c.materialClass?` en ${htmlEsc(c.materialClass)}`:''}`:'';
   const head=c.tier==='iguales'
     ? `📚 <b>Precio según ${c.n} iguales de tu base</b> (${htmlEsc(c.basis)}, ${htmlEsc(c.colour)}, ${htmlEsc(c.material)})${mdl}`
     : c.tier==='misma_talla'

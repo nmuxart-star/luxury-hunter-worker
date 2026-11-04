@@ -56,7 +56,18 @@ test('reads condition and seller reputation from an auction page',()=>{
     row('Seller type','Personal')+
     row('Overall rating','<a><span>510</span></a> (<span class="pl-1 font-medium">510</span><span class="pl-1 font-medium">0</span>)');
   assert.deepEqual(parseOneMapDetail(html),{
+    images:[],
     seller:'ヒトトキネット',sellerType:'Personal',condition:'Visibly Used',
     positiveRatings:510,negativeRatings:0
   });
+});
+
+test('reads the photo gallery of an auction page',()=>{
+  const img=n=>`https://image.fromjapan.co.jp/image.php?path=https://auctions.c.yimg.jp/images.auctions.yahoo.co.jp/image/dr000/auc0201/user/abc/i-img1080x1080-${n}.jpg`;
+  const slides=[1,2,3,4,5].map(n=>`<div class="swiper-slide"><img class="responsive" src="${img(n)}"></div>`).join('');
+  const html=`<div class="swiper-container gallery-top"><div class="swiper-wrapper">${slides}</div></div>
+    <div class="swiper-container gallery-thumbs"><div class="swiper-wrapper">${slides}</div></div>`;
+  const {images}=parseOneMapDetail(html);
+  assert.equal(images.length,5);
+  assert.equal(images[0],'https://cdnyauction.buyee.jp/image/dr000/auc0201/user/abc/i-img1080x1080-1.jpg');
 });

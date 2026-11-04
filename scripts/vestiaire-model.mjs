@@ -150,3 +150,22 @@ export function sameModelRows(tab,rows,texts={},{requireNamed=false}={}){
   const same=list.filter(x=>x.key===key).map(x=>x.f);
   return same.length?{key,explicit,rows:same}:null;
 }
+
+// MISMO TIPO DE MATERIAL (regla de Nil): un bolso de tela o sintético (lona,
+// nylon, Cannage de tela...) no se compara con uno de piel, que vale mucho más,
+// ni con piel exótica. Lo de imitación y las mezclas tela+piel cuentan como tela.
+const MATERIAL_CLASSES=[
+  ['tela',/imitaci|faux|sint[eé]tic|synthetic|lona|canvas|toile|\btela\b|fabric|nylon|nailon|poliamid|polyamid|polyest|seda|silk|satin|terciopelo|velvet|denim|vaquero|algod|cotton|\blino\b|linen|\blana\b|wool|tweed|lentejuel|sequin|crochet|raf+ia|jacquard|monogram|帆布|尼龙|ナイロン|キャンバス|ツイード|ベロア|나일론|캔버스/i],
+  ['exotica',/cocodril|croc|alligator|caim[aá]n|pit[oó]n|python|avestruz|ostrich|lagart|lizard|ex[oó]tic|serpiente|snake|鳄鱼|蟒|鸵鸟|蜥蜴|クロコ|パイソン|オーストリッチ|リザード|악어|파이톤/i],
+  ['piel',/cuero|piel|leather|cuir|pelle|leder|charol|patent|vernis|\bante\b|suede|daim|cordero|lambskin|calfskin|caviar|becerro|ternera|vachetta|羊皮|牛皮|皮革|漆皮|レザー|ラムスキン|カーフ|エナメル|가죽|램스킨/i]
+];
+export function materialClass(text){
+  return (MATERIAL_CLASSES.find(([,re])=>re.test(String(text||'')))||[])[0]||null;
+}
+// Filas con el mismo tipo de material que el anuncio. Sin material conocido en
+// el anuncio no se filtra; las filas sin material no cuentan si sí se conoce.
+export function sameMaterialRows(rows,itemMaterialText){
+  const cls=materialClass(itemMaterialText);
+  if(!cls)return {material:null,rows:rows||[]};
+  return {material:cls,rows:(rows||[]).filter(f=>materialClass(String(f?.material||'').trim()||f?.notes)===cls)};
+}

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {rowModelKey,sameModelRows} from '../scripts/vestiaire-model.mjs';
+import * as MAT from '../scripts/vestiaire-model.mjs';
 
 const keyOf=(tab,rows,texts,opts)=>sameModelRows(tab,rows,texts,opts)?.key??null;
 
@@ -57,4 +58,21 @@ test('para buscar en otras pestañas hace falta que el anuncio nombre el modelo'
   const rows=[{size:'Saddle'},{size:'Mini'}];
   assert.equal(sameModelRows('Dior Saddle',rows,{title:'Dior Saddle mini oblique'},{requireNamed:true}).key,'Saddle');
   assert.equal(sameModelRows('Dior Saddle',rows,{title:'Dior Book Tote'},{requireNamed:true}),null);
+});
+
+test('material: tela/sintético, piel y piel exótica no se mezclan',()=>{
+  const {materialClass,sameMaterialRows}=MAT;
+  assert.equal(materialClass('Cuero'),'piel');
+  assert.equal(materialClass('Charol'),'piel');
+  assert.equal(materialClass('Lona y cuero'),'tela');
+  assert.equal(materialClass('Piel de potro de imitación'),'tela');
+  assert.equal(materialClass('Cannage nylon black'),'tela');
+  assert.equal(materialClass('レディディオール ナイロン'),'tela');
+  assert.equal(materialClass('Avestruz'),'exotica');
+  assert.equal(materialClass('lambskin'),'piel');
+  assert.equal(materialClass(''),null);
+  const rows=[{material:'Cuero'},{material:'Lona'},{material:'Charol'},{material:'',notes:'Bolso Lady Dior de Cuero'},{material:''}];
+  assert.equal(sameMaterialRows(rows,'nylon').rows.length,1);
+  assert.equal(sameMaterialRows(rows,'lambskin').rows.length,3);
+  assert.equal(sameMaterialRows(rows,'').rows.length,5);
 });
