@@ -9138,11 +9138,12 @@ function xianyuVerificationVeto(item){
   // revisa el bolso antes de enviarlo). El resto se descarta sin IA.
   if(String(item?.source||'').toLowerCase().startsWith('ebay-')&&!['0','false','off','no'].includes(String(process.env.EBAY_REQUIRE_AUTHENTICITY||'').toLowerCase())){
     let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
-    if(raw.authenticityGuarantee===true)return null;
+    const fb=Number(item?.seller_sales), pct=Number(item?.seller_reviews);
+    // Con la garantía también hace falta un vendedor con reseñas (regla de Nil).
+    if(raw.authenticityGuarantee===true)return fewSellerReviewsVeto('eBay',fb);
     // Excepción (regla de Nil): vendedores con ≥500 valoraciones y ≥99 %
     // positivas. La garantía es la de autenticidad (programa
     // AUTHENTICITY_GUARANTEE de eBay), no la de devolución.
-    const fb=Number(item?.seller_sales), pct=Number(item?.seller_reviews);
     if(fb>=Number(process.env.EBAY_TRUSTED_MIN_FEEDBACK||500)&&pct>=Number(process.env.EBAY_TRUSTED_MIN_PCT||99))return null;
     return {
       code:'no_ebay_authenticity_guarantee',
@@ -9158,6 +9159,19 @@ function xianyuVerificationVeto(item){
     reasons:['El anuncio de Xianyu no muestra la etiqueta oficial 验货宝. Descartado por política.']
   };
 }
+// VENDEDORES SIN RESEÑAS O CON POCAS (regla de Nil): fuera aunque el anuncio
+// tenga sello de verificación o garantía (eBay, Bunjang Care, Yahoo). Si la
+// plataforma no da el número de reseñas, no se puede comprobar.
+const SELLER_MIN_REVIEWS=Number(process.env.SELLER_MIN_REVIEWS||20);
+function fewSellerReviewsVeto(platform,reviews){
+  const n=Number(reviews);
+  if(reviews===null||reviews===undefined||reviews===''||!Number.isFinite(n)||n>=SELLER_MIN_REVIEWS)return null;
+  return {
+    code:'seller_few_reviews',
+    term:`${n} reseñas`,
+    reasons:[`${platform}: el vendedor tiene ${n} reseñas (mínimo ${SELLER_MIN_REVIEWS}), aunque el anuncio tenga sello o garantía. Descartado por política.`]
+  };
+}
 // Bunjang (regla de Nil): solo anuncios con 번개케어 o de vendedores con buena
 // nota y suficientes reseñas. Si no se pudo comprobar, decide la IA.
 function bunjangTrustVeto(item){
@@ -9165,7 +9179,7 @@ function bunjangTrustVeto(item){
   let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
   const t=raw.luxuryHunterTrust;
   if(!t)return null;
-  if(t.care===true)return null;
+  if(t.care===true)return fewSellerReviewsVeto('Bunjang',t.reviewCount);
   const minRating=Number(process.env.BUNJANG_MIN_RATING||4.5);
   const minReviews=Number(process.env.BUNJANG_MIN_REVIEWS||20);
   if(Number(t.rating)>=minRating&&Number(t.reviewCount)>=minReviews)return null;
@@ -9328,6 +9342,10 @@ function deterministicPrescreen(item,task=null){
   if(noPrice)return noPrice;
   const veto=xianyuVerificationVeto(item);
   if(veto)return veto;
+  if(String(item?.source||'')==='yahoo-auctions-jp'){
+    const few=fewSellerReviewsVeto('Yahoo! Auctions',item?.seller_reviews);
+    if(few)return few;
+  }
   const watchSeller=xianyuWatchSellerVeto(item,task);
   if(watchSeller)return watchSeller;
   const replica=xianyuReplicaTerm(item);
