@@ -14,6 +14,7 @@ import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearch
   XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
+import {sameModelRows} from './scripts/vestiaire-model.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {searchReefYahoo} from './scripts/reef-yahoo.mjs';
 import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
@@ -4605,7 +4606,7 @@ function priceStats(list){
 function vestiaireSheetTab(values,today){
   const head=(values[0]||[]).map(h=>String(h||'').trim().toLowerCase());
   const col=name=>head.indexOf(name);
-  const c={likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
+  const c={brand:col('marca'),model:col('modelo'),likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
   if(c.ref<0||c.price<0)return null;
   const get=(row,i)=>i>=0?row[i]:'';
   const yes=v=>/^s[ií]|^yes|^true/i.test(String(v||'').trim());
@@ -4622,6 +4623,8 @@ function vestiaireSheetTab(values,today){
     if(soldSuspect)soldPrice=null;
     fichas.push({
       id,
+      brand:String(get(row,c.brand)||'').trim(),
+      model:String(get(row,c.model)||'').trim(),
       size:String(get(row,c.size)||'').trim(),
       dims:String(get(row,c.dims)||'').trim(),
       material:String(get(row,c.material)||'').trim(),
@@ -4726,24 +4729,14 @@ function vestiaireSizeLabel(text){
   return (VESTIAIRE_SIZE_RE.find(([,re])=>re.test(String(text||'')))||[])[0]||null;
 }
 const sheetNorm=t=>String(t||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
-// En pestañas con varios modelos (Radar, Miu Miu, Murakami...) el campo
-// "Talla / tipo" lleva el modelo: si el anuncio nombra alguno, solo valen esos.
-function vestiaireModelFilter(fichas,text){
-  const t=sheetNorm(text);
-  // Referencias de reloj: "3510.50" = "3510-50" = "351050".
-  const flat=v=>v.replace(/[.\-\s\/]/g,'');
-  const tf=flat(t);
-  const named=fichas.filter(f=>{const m=sheetNorm(f.size).trim();return m.length>=4&&!VESTIAIRE_SIZE_RE.some(([,re])=>re.test(m))&&(t.includes(m)||(/\d{3}/.test(m)&&flat(m).length>=5&&tf.includes(flat(m))));});
-  return named.length?named:null;
-}
-function vestiaireMatchFichas(fichas,item){
+function vestiaireMatchFichas(fichas,item,taskName=''){
   const text=`${item?.title||''} ${item?.description||''}`;
   const size=vestiaireSizeLabel(text);
   const width=vestiaireWidthCm(text);
   const colorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(t))||[])[0];
   const itemColor=colorOf(text);
-  let pool=fichas.filter(f=>!f.excluded);
-  pool=vestiaireModelFilter(pool,text)||pool;
+  // Solo el mismo modelo que el anuncio; si no se sabe cuál es, ninguno.
+  const pool=sameModelRows(taskName,fichas.filter(f=>!f.excluded),vestiaireItemTexts(item,null))?.rows||[];
   // Antes se ordenaba por cercanía al precio de COMPRA, que no dice nada del
   // precio de reventa: ahora cuentan la talla (medidas o etiqueta) y el color.
   const scored=pool.map(f=>{
@@ -4777,18 +4770,10 @@ const VESTIAIRE_FAMILY_SIZES=[
 function vestiaireSheetAnchor(task,item,exact){
   const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
   if(!r||r.source!=='sheet'||!Array.isArray(r.fichas))return null;
-  const label=[exact?.brand,exact?.family,exact?.exact_variant_label,exact?.size].filter(Boolean).join(' ');
-  const text=`${item?.title||''} ${item?.description||''} ${label}`;
-  let pool=r.fichas.filter(f=>Number.isFinite(f.price_eur)&&f.price_eur>0);
-  const byModel=vestiaireModelFilter(pool,text);
-  // Radar mezcla muchos modelos: sin el modelo nombrado no hay ancla posible.
-  if(/radar/i.test(task.task_name)&&!byModel)return null;
-  if(byModel)pool=byModel;
-  // Fuera otras líneas que conviven en la pestaña (Trendy CC, WOC, Shopping,
-  // carteras...) salvo que el anuncio sea justamente de esa línea.
-  const otherRe=/trendy|wallet on chain|\bwoc\b|shopping|\btote\b|pochette|ri[nñ]onera|cartera|clutch|\bbelt\b|cintur/i;
-  const tnorm=sheetNorm(text);
-  pool=pool.filter(f=>{const m=otherRe.exec(sheetNorm(`${f.size} ${f.notes}`));return !m||tnorm.includes(m[0]);});
+  // Solo el mismo modelo que el anuncio; si no se sabe cuál es, no hay ancla.
+  const m=sameModelRows(task.task_name,r.fichas.filter(f=>Number.isFinite(f.price_eur)&&f.price_eur>0),vestiaireItemTexts(item,exact));
+  if(!m)return null;
+  const pool=m.rows;
   const width=vestiaireWidthCm(`${item?.title||''} ${item?.description||''}`);
   const size=vestiaireSizeLabel(`${exact?.size||''} ${item?.title||''}`);
   let basis='';
@@ -4840,46 +4825,43 @@ function clampResaleToAnchor(low,high,anchor){
 const VESTIAIRE_MATERIAL_RE=[['exotica',/croc|cocodril|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|鳄鱼|蟒/i],['charol',/charol|patent|vernis|verniz|漆皮/i],['ante',/\bante\b|suede|daim|scamosciato|麂皮|翻毛/i],['tweed',/tweed|粗花呢/i],['seda',/\bseda\b|silk|satin|raso|丝绸/i],['lona',/lona|canvas|toile|\btela\b|fabric|nylon|nailon|monogram|jacquard|denim|raf+ia|帆布|老花|尼龙/i],['piel',/piel|cuero|leather|cuir|pelle|leder|lambskin|calfskin|caviar|cordero|becerro|ternera|vachetta|羊皮|牛皮|小牛皮/i]];
 const vestiaireMaterialOf=t=>(VESTIAIRE_MATERIAL_RE.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 const vestiaireColorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
+// Textos con los que se reconoce el modelo del anuncio: el título y lo que
+// identificaron la verificación y el análisis (marca, modelo, variante).
+function vestiaireItemTexts(item,exact){
+  return {
+    title:String(item?.title||''),
+    label:[exact?.brand,exact?.family,exact?.exact_variant_label,item?.model].filter(Boolean).join(' '),
+    description:String(item?.description||'')
+  };
+}
 function vestiaireComparables(task,item,exact){
   const refs=vestiaireRefs().tasks||{};
   const taskName=task?.task_name||'';
   const watch=isWatchTask(taskName);
   const raw=`${item?.title||''} ${item?.description||''}`;
   const label=[exact?.brand,exact?.family,exact?.exact_variant_label,exact?.size].filter(Boolean).join(' ');
-  const text=`${raw} ${item?.model||''} ${label}`;
   const usable=f=>Number.isFinite(f.price_eur)&&f.price_eur>0;
+  // Solo anuncios del MISMO modelo (regla de Nil): otro color, material o
+  // talla valen; otro modelo de la misma pestaña, no.
+  const texts=vestiaireItemTexts(item,exact);
   const own=refs[taskName];
-  let pool=[],named=false,tab=taskName;
+  let pool=[],tab=taskName,model=null;
   if(own?.source==='sheet'&&Array.isArray(own.fichas)){
-    const all=own.fichas.filter(usable);
-    const byModel=vestiaireModelFilter(all,text);
-    // En las pestañas de un solo modelo, "Talla / tipo" lleva el modelo de la
-    // pestaña ("City", "Lady Dior") o la talla ("Medium"): ahí nombrar el
-    // modelo no filtra nada. Solo filtran los submodelos ("Jackie 1961") y las
-    // pestañas con varios modelos (Radar, Miu Miu Wander/Arcadie, relojes).
-    const tabN=sheetNorm(taskName);
-    const inTabName=f=>{const m=sheetNorm(f.size).trim();return m.length>=4&&tabN.includes(m);};
-    const counts={};for(const f of all)if(inTabName(f)){const m=sheetNorm(f.size).trim();counts[m]=(counts[m]||0)+1;}
-    const multi=watch||/radar/i.test(taskName)||Object.values(counts).filter(n=>n>=5).length>=2;
-    if(byModel&&(multi||!byModel.every(inTabName))&&(byModel.length>=6||multi)){pool=byModel;named=true;}
-    // Radar mezcla muchos modelos: sin el modelo nombrado no vale la pestaña entera.
-    else pool=/radar/i.test(taskName)?[]:all;
+    const m=sameModelRows(taskName,own.fichas.filter(usable),texts);
+    if(m){pool=m.rows;model=m.key;}
   }
+  // Si la pestaña de la tarea no tiene ese modelo, se busca en las demás del
+  // mismo tipo, solo si el anuncio lo nombra.
   if(!pool.length){
     let best=null;
     for(const [name,r] of Object.entries(refs)){
       if(name===taskName||r?.source!=='sheet'||!Array.isArray(r.fichas)||isWatchTask(name)!==watch)continue;
-      const m=vestiaireModelFilter(r.fichas.filter(usable),text);
-      if(m&&(!best||m.length>best.list.length))best={name,list:m};
+      const m=sameModelRows(name,r.fichas.filter(usable),texts,{requireNamed:true});
+      if(m&&(!best||m.rows.length>best.rows.length))best={name,...m};
     }
-    if(best){pool=best.list;named=true;tab=best.name;}
+    if(best){pool=best.rows;model=best.key;tab=best.name;}
   }
   if(!pool.length)return null;
-  // Fuera otras líneas que conviven en la pestaña (Trendy CC, WOC, Shopping,
-  // carteras...) salvo que el anuncio sea justamente de esa línea.
-  const otherRe=/trendy|wallet on chain|\bwoc\b|shopping|\btote\b|pochette|ri[nñ]onera|cartera|clutch|\bbelt\b|cintur/i;
-  const tnorm=sheetNorm(text);
-  pool=pool.filter(f=>{const m=otherRe.exec(sheetNorm(`${f.size} ${f.notes}`));return !m||tnorm.includes(m[0]);});
   const ratios=(refs[tab]?.fichas||[]).filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)&&f.price_eur>0).map(f=>f.sold_price_eur/f.price_eur).filter(x=>x>0.4&&x<1.6).sort((a,b)=>a-b);
   const ratio=ratios.length>=5?clampNum(ratios[Math.floor(ratios.length/2)],0.75,1):VESTIAIRE_DEFAULT_REALIZATION;
   const realistic=f=>f.sold&&Number.isFinite(f.sold_price_eur)?f.sold_price_eur:(!f.excluded?f.price_eur*ratio:null);
@@ -4896,7 +4878,9 @@ function vestiaireComparables(task,item,exact){
   const sizeLbl=vestiaireSizeLabel(sizeText);
   let sized=null,basis='';
   // Relojes: la "talla" es la referencia; si el anuncio la da, solo valen esas filas.
-  const refRows=watch&&named?pool.filter(f=>/\d{3}/.test(String(f.size||''))):[];
+  const flatRef=v=>sheetNorm(v).replace(/[.\-\s\/]/g,'');
+  const rawFlat=flatRef(`${raw} ${label}`);
+  const refRows=watch?pool.filter(f=>{const r=flatRef(f.size);return /\d{3}/.test(r)&&r.length>=5&&rawFlat.includes(r);}):[];
   if(refRows.length){sized=refRows;basis='misma referencia';}
   if(!sized&&width){sized=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw&&Math.abs(fw-width)/width<=0.12;});basis=`medidas ~${Math.round(width)} cm`;}
   if((!sized||band(sized).n<4)&&famSize){const [name,re,lo,hi]=famSize;sized=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw?fw>=lo&&fw<=hi:re.test(`${f.size} ${f.notes}`);});basis=`talla ${name}`;}
@@ -4917,27 +4901,27 @@ function vestiaireComparables(task,item,exact){
     .sort((x,y)=>(y.sold-x.sold)||Math.abs(realistic(x)-b.mid)-Math.abs(realistic(y)-b.mid))
     .slice(0,5)
     .map(f=>({url:f.url,size:f.size,dims:f.dims,material:f.material,color:f.color,condition:f.condition,price_eur:f.price_eur,sold:!!f.sold,sold_price_eur:f.sold_price_eur??null,likes:Number.isFinite(f.likes)?f.likes:null}));
-  return {tier,tab,cross:tab!==taskName,basis,colour:itemColor,material:itemMat,ratio:Math.round(ratio*100)/100,...b,picks};
+  return {tier,tab,model,cross:tab!==taskName,basis,colour:itemColor,material:itemMat,ratio:Math.round(ratio*100)/100,...b,picks};
 }
 function vestiaireComparablesNote(c){
   if(!c)return '';
-  const what=c.tier==='iguales'?`iguales (${c.basis}, ${c.colour}, ${c.material})`:c.tier==='misma_talla'?`de la ${c.basis}`:'del mismo modelo en otras tallas';
-  return `Reventa según tu base de Vestiaire: ${c.n} anuncios ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
+  const what=c.tier==='iguales'?`iguales (${c.basis}, ${c.colour}, ${c.material})`:c.tier==='misma_talla'?`de la ${c.basis}`:'en otras tallas';
+  return `Reventa según tu base de Vestiaire: ${c.n} anuncios del modelo ${c.model||'del anuncio'} ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
 }
-function vestiaireFichasBlock(r,item){
-  const picked=vestiaireMatchFichas(r?.fichas||[],item);
-  if(!picked.length)return vestiaireSoldBlock(r,item);
+function vestiaireFichasBlock(r,item,taskName=''){
+  const picked=vestiaireMatchFichas(r?.fichas||[],item,taskName);
+  if(!picked.length)return vestiaireSoldBlock(r,item,taskName);
   const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${Number.isFinite(x.likes)?` | ${x.likes} likes`:''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
   return `\n\nNIL'S VESTIAIRE DATABASE — LISTINGS FOR SALE (PRIMARY EVIDENCE: Nil's own database of real Vestiaire Collective listings, kept up to date daily (status, likes); more likes = more demand; CURRENT asking prices; size inferred from the listed measurements). These are the closest matches to THIS listing by size, colour and price:
 ${rows}
-These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels.`+vestiaireSoldBlock(r,item);
+These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels. All of them are the SAME MODEL as the target; never use listings of another model of the same brand as comparables.`+vestiaireSoldBlock(r,item,taskName);
 }
 // Ventas reales de la base de datos de Nil: el precio "Vendido a X €" de
 // Vestiaire. Es la mejor prueba de precio de reventa que tenemos.
-function vestiaireSoldBlock(r,item){
+function vestiaireSoldBlock(r,item,taskName=''){
   const sold=(r?.fichas||[]).filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>({...f,price_eur:f.sold_price_eur,excluded:false}));
   if(!sold.length)return '';
-  const picked=vestiaireMatchFichas(sold,item).slice(0,10);
+  const picked=vestiaireMatchFichas(sold,item,taskName).slice(0,10);
   const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | SOLD for ${x.sold_price_eur} EUR | ${x.country}${x.vintage?' | vintage':''}${Number.isFinite(x.likes)?` | ${x.likes} likes`:''} | ${x.url}`).join('\n');
   const st=r.sold_stats?.n?` (all recorded sales for this model: n=${r.sold_stats.n}, median ${r.sold_stats.median} €, range ${r.sold_stats.min}-${r.sold_stats.max} €)`:'';
   return `\n\nNIL'S VESTIAIRE DATABASE — CONFIRMED SALES (real Vestiaire Collective sales recorded by Nil: the listing page shows "Vendido a X €")${st}. Closest matches to THIS listing:
@@ -4949,14 +4933,23 @@ function vestiaireSnapshotBlock(task,item){
   if(!r)return '';
   const fmt=s=>`n=${s.n}, p25 ${s.p25} €, median ${s.median} €, p75 ${s.p75} €, range ${s.min}-${s.max} €`;
   let out='';
-  if(r.all?.n){
-    const groups=Object.values(r.groups||{}).filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
-    out+=`\n\nVESTIAIRE MARKET SNAPSHOT (${r.source==='sheet'?`computed live from Nil's own Vestiaire database on ${r.captured_on}, listings still for sale`:`captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}`}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
-- All listings: ${fmt(r.all)}
-${r.vintage?.n>=3?`- Tagged vintage: ${fmt(r.vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${r.discounted_share}% of listings already show a price reduction, so real sale prices are usually below asking.
+  // Solo el mismo modelo que el anuncio: la pestaña mezcla variantes y formatos.
+  const active=Array.isArray(r.fichas)?r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)):[];
+  const same=r.source==='sheet'?sameModelRows(task.task_name,active,vestiaireItemTexts(item,null)):null;
+  const list=same?.rows||(r.source==='sheet'?[]:null);
+  const all=list?priceStats(list.map(f=>f.price_eur)):r.all;
+  if(all?.n>=3){
+    const by={};if(list)for(const f of list)(by[(f.size||'Sin talla').trim()]||=[]).push(f.price_eur);
+    const groupList=list?Object.entries(by).map(([k,v])=>({label:k,...priceStats(v)})):Object.values(r.groups||{});
+    const groups=groupList.filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
+    const vintage=list?priceStats(list.filter(f=>f.vintage).map(f=>f.price_eur)):r.vintage;
+    const disc=list?(list.length?Math.round(list.filter(f=>Number.isFinite(f.original_eur)&&f.original_eur>f.price_eur).length/list.length*100):0):r.discounted_share;
+    out+=`\n\nVESTIAIRE MARKET SNAPSHOT${same?` — MODEL ${same.key} ONLY`:''} (${r.source==='sheet'?`computed live from Nil's own Vestiaire database on ${r.captured_on}, listings still for sale`:`captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}`}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
+- All listings${same?` of this model`:''}: ${fmt(all)}
+${vintage?.n>=3?`- Tagged vintage: ${fmt(vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${disc}% of listings already show a price reduction, so real sale prices are usually below asking.
 Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`;
   }
-  return out+vestiaireFichasBlock(r,item);
+  return out+vestiaireFichasBlock(r,item,task.task_name);
 }
 const VESTIAIRE_VALUATION_WEIGHT=Math.max(1,Number(process.env.VESTIAIRE_VALUATION_WEIGHT||2));
 function hostOf(url){
@@ -9278,8 +9271,8 @@ function xianyuTooCheapVeto(item,task){
   const price=Number(item?.price_eur);
   const r=vestiaireRefs().tasks?.[task.task_name];
   if(!Number.isFinite(price)||price<=0||!r)return null;
-  // En pestañas con varios modelos (Radar...) vale el modelo nombrado si lo hay.
-  const named=Array.isArray(r.fichas)?vestiaireModelFilter(r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)),`${item?.title||''} ${item?.description||''}`):null;
+  // Mínimo según el mismo modelo si se reconoce; si no, el de toda la pestaña.
+  const named=Array.isArray(r.fichas)?sameModelRows(task.task_name,r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)),vestiaireItemTexts(item,null))?.rows:null;
   const base=named&&named.length>=4?priceStats(named.map(f=>f.price_eur)).p25:r.all?.p25;
   if(!Number.isFinite(base)||base<=0)return null;
   const floor=Math.round(base*VESTIAIRE_DEFAULT_REALIZATION*XIANYU_MIN_PRICE_SHARE);
@@ -10247,12 +10240,13 @@ function vestiaireDbLines(taskName,item){
   const r=taskName?vestiaireRefs().tasks?.[taskName]:null;
   if(!r?.fichas?.length)return [];
   const c=vestiaireCompsFor(taskName,item);
-  if(!c)return ['🔮 <b>Pronóstico</b>: no hay anuncios parecidos en tu base de Vestiaire; la reventa es una estimación.'];
+  if(!c)return ['🔮 <b>Pronóstico</b>: no hay anuncios del mismo modelo en tu base de Vestiaire; la reventa es una estimación.'];
+  const mdl=c.model?` · modelo ${htmlEsc(c.model)}`:'';
   const head=c.tier==='iguales'
-    ? `📚 <b>Precio según ${c.n} iguales de tu base</b> (${htmlEsc(c.basis)}, ${htmlEsc(c.colour)}, ${htmlEsc(c.material)})`
+    ? `📚 <b>Precio según ${c.n} iguales de tu base</b> (${htmlEsc(c.basis)}, ${htmlEsc(c.colour)}, ${htmlEsc(c.material)})${mdl}`
     : c.tier==='misma_talla'
-      ? `📚 <b>Precio según ${c.n} de la misma talla en tu base</b> (${htmlEsc(c.basis)})`
-      : `📚 Tu base no tiene de esta talla: <b>mismo modelo en otras tallas</b> (${c.n}), solo orientativo`;
+      ? `📚 <b>Precio según ${c.n} de la misma talla en tu base</b> (${htmlEsc(c.basis)})${mdl}`
+      : `📚 Tu base no tiene de esta talla: <b>mismo modelo en otras tallas</b> (${c.n})${mdl}, solo orientativo`;
   const desc=f=>htmlEsc([f.size,f.dims?`${f.dims} cm`:'',f.material,f.color,f.condition].filter(Boolean).join(' · ')||'Anuncio');
   return [
     `${head}${c.cross?` · pestaña ${htmlEsc(c.tab)}`:''}`,
