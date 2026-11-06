@@ -45,18 +45,96 @@ async function waitForPage(tabId,search){
   return last||{status:502,finalUrl:'',title:'',body:'La página no se cargó',html:''};
 }
 
-async function handle(job,token){
-  const search=job.url.includes('/yahoo-auctions/search/');
-  let tab;
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+// Cada consulta va en una ventana nueva y minimizada, aparte de las ventanas
+// de Nil, y la ventana se cierra al terminar.
+async function openHidden(url){
+  const win=await chrome.windows.create({url,focused:false,state:'minimized'});
+  return {windowId:win.id,tabId:win.tabs[0].id};
+}
+
+async function waitLoaded(tabId,ms=30_000){
+  const until=Date.now()+ms;
+  let tab=null;
+  while(Date.now()<until){
+    tab=await chrome.tabs.get(tabId).catch(()=>null);
+    if(tab?.status==='complete')return tab;
+    await sleep(500);
+  }
+  return tab;
+}
+
+// Se ejecuta dentro de la página de Vestiaire: su propio buscador. Primero el
+// modelo exacto (el nombre de modelo de Vestiaire más largo contenido en la
+// búsqueda) y luego sus anuncios vendidos y en venta. Si Vestiaire responde
+// con una verificación, se para: no se reintenta ni se resuelve nada.
+async function vestiaireSearchInPage(q){
+  const call=async(query,filters,{facets=[],limit=48,sortBy='relevance'}={})=>{
+    const body={pagination:{offset:0,limit},fields:['name','description','model','brand','price','sold','likes','colors','condition','createdAt','link'],
+      facets:{fields:facets,stats:[]},sortBy,filters,q:query,locale:{country:'ES',currency:'EUR',language:'es',sizeType:'FR'},mySizes:null};
+    const r=await fetch('https://search.vestiairecollective.com/v1/product/search',{method:'POST',
+      headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    if(r.status===403||r.status===429)throw Object.assign(new Error(`Vestiaire HTTP ${r.status}`),{blocked:true});
+    if(!r.ok)throw new Error(`Vestiaire HTTP ${r.status}`);
+    return r.json();
+  };
+  const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  const norm=t=>String(t||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   try{
-    tab=await chrome.tabs.create({url:job.url,active:false});
-    const result=await waitForPage(tab.id,search);
+    const nq=` ${norm(q)} `;
+    const first=await call(q,{},{facets:['model'],limit:1});
+    const models=(first.facets?.fields?.model||[]).filter(m=>norm(m.name)&&nq.includes(` ${norm(m.name)} `))
+      .sort((a,b)=>norm(b.name).length-norm(a.name).length||b.count-a.count);
+    const pick=models[0];
+    if(!pick)return {status:200,body:JSON.stringify({query:q,model:null,items:[]})};
+    const filters={'model.id':[String(pick.id)]};
+    await wait(1200);
+    const sold=await call('',{...filters,sold:['1']},{sortBy:'recency'});
+    await wait(1200);
+    const active=await call('',{...filters,sold:['0']});
+    return {status:200,body:JSON.stringify({query:q,model:{id:pick.id,name:pick.name,count:pick.count},
+      sold_total:sold.paginationStats?.totalHits??null,active_total:active.paginationStats?.totalHits??null,
+      items:[...(sold.items||[]),...(active.items||[])]})};
+  }catch(error){
+    return {status:error.blocked?403:502,body:String(error.message||error)};
+  }
+}
+
+async function handleVestiaire(job,token){
+  let opened;
+  const reply=payload=>bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:job.url,title:'',html:'',...payload});
+  try{
+    opened=await openHidden(job.url);
+    const tab=await waitLoaded(opened.tabId);
+    await sleep(1500);
+    const title=tab?.title||'';
+    if(/just a moment|attention required|un momento|access denied|verify|verific/i.test(title)){
+      return await reply({status:403,title,body:'Vestiaire pide una verificación en el navegador'});
+    }
+    const [injection]=await chrome.scripting.executeScript({target:{tabId:opened.tabId},world:'MAIN',
+      func:vestiaireSearchInPage,args:[job.query]});
+    await reply({...injection.result,title});
+  }catch(error){
+    await reply({status:502,body:String(error)}).catch(()=>{});
+  }finally{
+    if(opened?.windowId)await chrome.windows.remove(opened.windowId).catch(()=>{});
+  }
+}
+
+async function handle(job,token){
+  if(job.kind==='vestiaire')return handleVestiaire(job,token);
+  const search=job.url.includes('/yahoo-auctions/search/');
+  let opened;
+  try{
+    opened=await openHidden(job.url);
+    const result=await waitForPage(opened.tabId,search);
     await bridge(`/result/${job.id}`,token,'POST',{...result,url:job.url});
   }catch(error){
     await bridge(`/result/${job.id}`,token,'POST',{url:job.url,status:502,
       finalUrl:job.url,title:'',body:String(error),html:''}).catch(()=>{});
   }finally{
-    if(tab?.id)await chrome.tabs.remove(tab.id).catch(()=>{});
+    if(opened?.windowId)await chrome.windows.remove(opened.windowId).catch(()=>{});
   }
 }
 

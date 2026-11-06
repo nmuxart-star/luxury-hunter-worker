@@ -18,7 +18,8 @@ import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION} from './scripts/vestiaire-bag-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {searchReefYahoo} from './scripts/reef-yahoo.mjs';
-import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
+import {macOneMapReady,macOneMapSnapshot,macVestiaireSearch} from './scripts/onemap-mac-client.mjs';
+import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables} from './scripts/vestiaire-live.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -4996,6 +4997,62 @@ function vestiaireComparablesNote(c){
   const what=c.tier==='iguales'?`iguales (${c.basis}, ${c.colour}, ${c.material})`:c.tier==='misma_talla'?`de la ${c.basis}`:'en otras tallas';
   return `Reventa según tu base de Vestiaire: ${c.n} anuncios del modelo ${c.model||'del anuncio'}${c.materialClass?` en ${c.materialClass}`:''} ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
 }
+// ── VESTIAIRE EN DIRECTO (sin referencia en la base) ────────────────────
+// Si la base de Nil no tiene nada del modelo, se busca ese modelo en
+// Vestiaire desde el Chrome del Mac (mismo puente que One Map). Cada búsqueda
+// (marca + modelo) se guarda VESTIAIRE_LIVE_CACHE_HOURS (12 h) y como mucho se
+// hacen VESTIAIRE_LIVE_DAILY_MAX (40) al día. Si Vestiaire pide verificación,
+// se deja de buscar 6 h: nunca se resuelve ni se esquiva.
+let vestiaireLiveMacReady={at:0,ok:false};
+function saveSetting(key,value){
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
+    .run(key,JSON.stringify(value),new Date().toISOString());
+}
+async function vestiaireLiveSearchRows(query){
+  if(['0','false','off','no'].includes(String(process.env.VESTIAIRE_LIVE||'').toLowerCase()))return {status:'disabled'};
+  const token=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
+  if(!token)return {status:'no_mac'};
+  const now=Date.now();
+  const ttl=Number(process.env.VESTIAIRE_LIVE_CACHE_HOURS||12)*3600e3;
+  const cache=getSetting('vestiaire_live_cache',{})||{};
+  const hit=cache[query];
+  if(hit&&now-Date.parse(hit.at)<ttl)return {status:'ok',cached:true,rows:hit.rows||[],model:hit.model||null};
+  const usage=getSetting('vestiaire_live_usage',{})||{};
+  if(Date.parse(usage.blocked_until||'')>now)return {status:'blocked'};
+  const day=new Date().toISOString().slice(0,10);
+  const used=usage.day===day?Number(usage.n)||0:0;
+  if(used>=Number(process.env.VESTIAIRE_LIVE_DAILY_MAX||40))return {status:'daily_limit'};
+  if(now-vestiaireLiveMacReady.at>120e3)vestiaireLiveMacReady={at:now,ok:await macOneMapReady(token)};
+  if(!vestiaireLiveMacReady.ok)return {status:'mac_offline'};
+  saveSetting('vestiaire_live_usage',{...usage,day,n:used+1});
+  const payload=await macVestiaireSearch(query,token);
+  if(payload?.blocked){
+    saveSetting('vestiaire_live_usage',{...usage,day,n:used+1,blocked_until:new Date(now+6*3600e3).toISOString()});
+    await reportHealthIssue('vestiaire-live','Vestiaire ha pedido una verificación en el Chrome del Mac; la búsqueda en directo queda en pausa 6 h (no se resuelve ni se esquiva). Los avisos siguen, con la reventa estimada sin Vestiaire.').catch(()=>{});
+    return {status:'blocked'};
+  }
+  const rows=vestiaireLiveRows(payload);
+  const model=payload?.model?.name||null;
+  const fresh=Object.fromEntries(Object.entries(cache).filter(([,v])=>now-Date.parse(v.at)<ttl).slice(-59));
+  fresh[query]={at:new Date(now).toISOString(),model,rows};
+  saveSetting('vestiaire_live_cache',fresh);
+  console.log(`Vestiaire en directo: "${query}" → ${model||'sin modelo'} · ${rows.length} anuncios (${rows.filter(r=>r.sold).length} vendidos).`);
+  return {status:'ok',rows,model};
+}
+async function vestiaireLiveFor(task,item,exact){
+  if(isWatchTask(task?.task_name))return null;
+  const query=vestiaireLiveQuery(item,exact||{});
+  if(!query)return {status:'no_query'};
+  const r=await vestiaireLiveSearchRows(query);
+  if(r.status!=='ok')return {status:r.status,query};
+  const c=vestiaireLiveComparables(r.rows,item,exact||{},{query,model:r.model});
+  return c?{...c,status:'ok'}:{status:'no_match',query,model:r.model,found:r.rows.length};
+}
+function vestiaireLiveNote(c){
+  if(c?.status!=='ok')return '';
+  return `Sin referencia en tu base: reventa según ${c.n} anuncios de Vestiaire en directo del modelo ${c.model}${c.material?` en ${c.material}`:''} (${c.basis}; ${c.price_basis==='sold'?`${c.sold_n} vendidos`:'precios pedidos × 92 %'}) → ${c.low}-${c.high} EUR.`;
+}
 function vestiaireFichasBlock(r,item,taskName=''){
   const picked=vestiaireMatchFichas(r?.fichas||[],item,taskName);
   if(!picked.length)return vestiaireSoldBlock(r,item,taskName);
@@ -8458,10 +8515,29 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
     }catch(e){console.error('Subasta, puja máxima:',e.message);}
   }
   if(!isWatchTask(task?.task_name)){
-    const comps=vestiaireComparables(task,{...item,model:a.model},verification?.exact||{brand:a.brand,family:a.model});
+    const ident=verification?.exact||{brand:a.brand,family:a.model};
+    const comps=vestiaireComparables(task,{...item,model:a.model},ident);
+    // Sin nada del modelo en la base de Nil: Vestiaire en directo.
+    let live=null;
+    if(!comps&&String(a.decision||'').toUpperCase()!=='REJECT'&&!listingAuction(item)){
+      try{live=await vestiaireLiveFor(task,{...item,model:a.model},ident);}
+      catch(e){live={status:'error',error:String(e.message||e).slice(0,160)};console.warn('Vestiaire en directo:',e.message);}
+      if(live?.status==='ok'){
+        const landed=Number(a.landed_cost_eur)||Number(economics?.importedTotalEur)||0;
+        a.resale_low_eur=live.low;a.resale_high_eur=live.high;
+        if(landed){a.net_profit_low_eur=roundMoney(live.low-landed);a.net_profit_high_eur=roundMoney(live.high-landed);}
+      }
+    }
     Object.assign(a,applyBagSheetPolicy(a,comps,{fresh:vestiaireSheetFresh()}));
+    if(live?.status==='ok'){
+      a.resale_estimate_source='VESTIAIRE_LIVE';
+      a.resale_estimate_confidence=live.tier==='misma_talla'?'MEDIUM':'LOW';
+      const note=vestiaireLiveNote(live);
+      a.decision_reasons_es=(a.decision_reasons_es||[]).map(r=>String(r).startsWith('CONSULTAR PRECIO:')?`CONSULTAR PRECIO: ${note} Posible oportunidad; la compra solo se recomienda con referencias de tu base.`:r);
+      if(!a.decision_reasons_es.some(r=>String(r).includes('Vestiaire en directo')))a.decision_reasons_es=[note,...a.decision_reasons_es].slice(0,5);
+    }
     verification={...(verification||{}),bag_sheet_rule_version:BAG_SHEET_RULE_VERSION,
-      market:{...(verification?.market||{}),sheet_comps:comps,sheet_fresh:vestiaireSheetFresh(),bag_sheet_required:true}};
+      market:{...(verification?.market||{}),sheet_comps:comps,vestiaire_live:live,sheet_fresh:vestiaireSheetFresh(),bag_sheet_required:true}};
     if(verification.final)verification.final={...verification.final,...a};
   }
   a.market_verification=verification;
@@ -9796,19 +9872,14 @@ async function telegramSendListing(text,x){
   if(!telegramConfigured())return {sent:false};
   const images=listingTelegramImages(x,4);
   let album={sent:false};
-  // Al pie de las fotos caben 1024 caracteres: si el aviso es más largo, las
-  // fotos van con el titular y el texto completo justo después.
-  const caption=text.length<=1024?text:text.split('\n').slice(0,2).join('\n');
+  // Telegram pliega los pies de foto largos: las fotos llevan solo el
+  // titular y el aviso completo va justo después, entero y con los botones.
+  const caption=text.split('\n').slice(0,4).join('\n').slice(0,1000);
   if(images.length){
     album=await telegramSendAlbum(images,caption).catch(()=>({sent:false}));
   }
-  if(album.sent&&caption!==text){
-    await telegramSend(text,null,{buttons:alertButtons(x.id),noPreview:true});
-  }else if(album.sent){
-    await telegramApi('sendMessage',{chat_id:process.env.TELEGRAM_CHAT_ID,text:'¿Te interesa este anuncio?',reply_markup:{inline_keyboard:alertButtons(x.id)}});
-  }else{
-    await telegramSend(text,null,{buttons:alertButtons(x.id),previewUrl:x.url||null});
-  }
+  if(album.sent)await telegramSend(text,null,{buttons:alertButtons(x.id),noPreview:true});
+  else await telegramSend(text,null,{buttons:alertButtons(x.id),previewUrl:x.url||null});
   return {sent:true};
 }
 
@@ -10364,9 +10435,23 @@ function vestiaireCompsFor(taskName,item){
   try{return vestiaireComparables({task_name:taskName},item,v?.exact&&v.exact.target_match!==false?v.exact:{brand:item?.brand,family:item?.model});}
   catch{return null;}
 }
+const VESTIAIRE_LIVE_WHY={mac_offline:'el Chrome del Mac no estaba encendido',no_mac:'el puente del Mac no está configurado',
+  blocked:'Vestiaire pidió una verificación y la búsqueda está en pausa',daily_limit:'ya se hicieron las búsquedas de hoy',
+  no_query:'no se identificó el modelo',no_match:'Vestiaire no tiene 3 anuncios del mismo modelo y material',
+  disabled:'está desactivada',error:'falló la búsqueda'};
 function vestiaireDbLines(taskName,item){
   const c=vestiaireCompsFor(taskName,item);
-  if(!c)return ['👀 <b>Consultar precio</b>: sin referencia válida de Sheets con el mismo modelo, medidas, material y color conocido. Reventa orientativa; no es BUY.'];
+  if(!c){
+    let live=null;try{live=JSON.parse(item?.verification_json||'{}')?.market?.vestiaire_live||null;}catch{}
+    const desc=f=>htmlEsc([f.size,f.dims?`${f.dims} cm`:'',f.color,f.condition].filter(Boolean).join(' · ')||f.title||'Anuncio');
+    if(live?.status==='ok')return [
+      `🔎 Tu base no tiene este modelo → <b>Vestiaire en directo</b>: ${live.n} anuncios de ${htmlEsc(live.model||'')}${live.material?` en ${htmlEsc(live.material)}`:''} (${htmlEsc(live.basis)})`,
+      `   Reventa estimada <b>${eur0(live.low)} – ${eur0(live.high)}</b> (${live.price_basis==='sold'?`${live.sold_n} vendidos`:'precios pedidos × 92 %; no son ventas'})`,
+      ...(live.picks||[]).slice(0,4).map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · ${f.sold?`vendido a ${eur0(f.price_eur)}`:`${eur0(f.price_eur)}${Number.isFinite(f.likes)?` · ${f.likes} ❤️`:''}`}`),
+      '   Sin referencia en tu base no se recomienda comprar: revísalo tú.'
+    ];
+    return [`⚠️ Tu base no tiene este modelo (mismo modelo, medidas, material y color).${live?` Vestiaire en directo: ${htmlEsc(VESTIAIRE_LIVE_WHY[live.status]||live.status)}.`:''} La reventa es una estimación sin verificar; no es compra recomendada.`];
+  }
   const mdl=c.model?` · modelo ${htmlEsc(c.model)}${c.materialClass?` en ${htmlEsc(c.materialClass)}`:''}`:'';
   const head=c.tier==='iguales'
     ? `📚 <b>Precio según ${c.n} iguales de tu base</b> (${htmlEsc(c.basis)}, ${htmlEsc(c.colour)}, ${htmlEsc(c.material)})${mdl}`
@@ -10381,29 +10466,99 @@ function vestiaireDbLines(taskName,item){
   ];
 }
 
-function instantAlertText(x){
-  const profit=x.net_profit_low_eur!=null||x.net_profit_high_eur!=null
-    ? `${eur0(x.net_profit_low_eur)} – ${eur0(x.net_profit_high_eur)}`
-    : '—';
-  const resale=`${eur0(x.resale_low_eur)} – ${eur0(x.resale_high_eur)}`;
+// ── TEXTO DEL AVISO (Telegram y correo) ─────────────────────────────────
+// Ordenado por bloques con título y sin nada plegado: qué es, los números,
+// el desglose del coste, con qué se ha comparado, vendedor/autenticidad y
+// por qué se avisa.
+const ALERT_DECISION_ES={'STRONG BUY':'COMPRA MUY RECOMENDADA','BUY':'COMPRA RECOMENDADA','WATCH':'VIGILAR','REVIEW':'REVISAR','REJECT':'DESCARTADO'};
+const RISK_ES={LOW:'bajo',MEDIUM:'medio',HIGH:'alto'};
+// Lo que identifica la revisión de fotos llega en inglés: palabras habituales en español.
+const ALERT_WORDS_ES=[[/lambskin/gi,'piel de cordero'],[/calfskin/gi,'piel de becerro'],[/caviar leather/gi,'piel caviar'],[/patent leather|patent/gi,'charol'],
+  [/leather/gi,'piel'],[/suede/gi,'ante'],[/canvas/gi,'lona'],[/nylon/gi,'nailon'],[/satin/gi,'satén'],[/velvet/gi,'terciopelo'],
+  [/black/gi,'negro'],[/white/gi,'blanco'],[/beige/gi,'beige'],[/brown/gi,'marrón'],[/grey|gray/gi,'gris'],[/red/gi,'rojo'],[/pink/gi,'rosa'],
+  [/blue/gi,'azul'],[/green/gi,'verde'],[/burgundy/gi,'burdeos'],[/gold/gi,'dorado'],[/silver/gi,'plateado']];
+const alertEs=t=>ALERT_WORDS_ES.reduce((a,[re,w])=>a.replace(re,w),String(t||''));
+function alertSection(title,lines){
+  const list=(lines||[]).filter(Boolean);
+  return list.length?['',`<b>${title}</b>`,...list]:[];
+}
+function alertAgo(ms){
+  if(!Number.isFinite(ms))return '';
+  const h=(Date.now()-ms)/3600e3;
+  if(h<0)return '';
+  return h<1?`hace ${Math.max(1,Math.round(h*60))} min`:h<48?`hace ${Math.round(h)} h`:`hace ${Math.round(h/24)} días`;
+}
+function alertResaleSource(x,v){
+  if(vestiaireCompsFor(x._task_name,x))return 'según tu base de Vestiaire';
+  if(v?.market?.vestiaire_live?.status==='ok')return 'según Vestiaire en directo (no está en tu base)';
+  const src=String(v?.final?.resale_estimate_source||'').toUpperCase();
+  if(src==='MARKET_ANALYSIS')return 'según anuncios de otras webs de reventa';
+  return '🔮 estimación sin verificar';
+}
+function instantAlertText(x,{soft=false}={}){
+  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
+  let raw={};try{raw=JSON.parse(x.raw_json||'{}')||{};}catch{}
+  const exact=v.exact||{};
+  const known=t=>t&&!/unknown|desconocid|sin determinar/i.test(String(t));
+  const source=String(x.source||'');
+  const platform=OPPORTUNITY_SOURCE_LABELS[source]||(source.startsWith('ebay-')?`eBay ${source.slice(5).toUpperCase()}`:source);
+  const orig=Number(x.original_price);
+  const price=Number.isFinite(orig)&&orig>0&&x.currency&&x.currency!=='EUR'?`${fmtMoney(orig,x.currency)} (≈ ${eur0(x.price_eur)})`:eur0(x.price_eur);
+  const ago=alertAgo(listingPublishedAtMs(x));
+  const decision=String(x.decision||'').toUpperCase();
+  const head=soft?'👀 <b>POSIBLE OPORTUNIDAD · revísala</b>':`🔥 <b>${ALERT_DECISION_ES[decision]||htmlEsc(decision)}</b>`;
+  const modelText=String(x.model||'').toLowerCase();
+  const identified=[known(exact.size)&&!modelText.includes(String(exact.size).toLowerCase())&&exact.size,known(exact.material)&&alertEs(exact.material),known(exact.main_color)&&alertEs(exact.main_color)].filter(Boolean).join(' · ');
+  const title=String(x.title||'').trim();
+  const landed=Number(x.landed_cost_eur);
+  const margin=landed>0&&Number.isFinite(Number(x.net_profit_low_eur))?Math.round(Number(x.net_profit_low_eur)/landed*100):null;
   const pct=Number.isFinite(x._priceVsTaskMedian)?Math.round((1-x._priceVsTaskMedian)*100):null;
-  const vsMedian=pct===null
-    ? ''
-    : pct>0
-      ? `\n📉 ${pct}% por debajo del precio mediano de esta tarea`
-      : `\nPrecio ${Math.abs(pct)}% por encima de la mediana de esta tarea`;
-  return [
-    `🔥 <b>${htmlEsc(x.decision)}</b> · ${htmlEsc(x._task_name||'')}`,
-    `<b>${htmlEsc(x.model||x.title||'')}</b>`,
-    `${htmlEsc(x.source)} · precio ${eur0(x.price_eur)} · coste importado ${eur0(x.landed_cost_eur)}`,
-    ...importCostLines(x),
-    `Reventa ${resale}`,
-    `Beneficio neto ${profit} · score ${x.opportunity_score??'—'}${vsMedian}`,
-    vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur,x._task_name),
-    ...vestiaireDbLines(x._task_name,x),
-    String(x.source||'').startsWith('ebay-')?(()=>{let r={};try{r=JSON.parse(x.raw_json||'{}')}catch{};return r.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`;})():'',
-    x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir en la app</a>`:''
-  ].filter(Boolean).join('\n');
+  const range=(a,b)=>a==null&&b==null?'—':`${eur0(a)}${b!=null&&Math.round(Number(b))!==Math.round(Number(a))?` – ${eur0(b)}`:''}`;
+  const reasons=(()=>{try{return JSON.parse(x.decision_reasons_es_json||'[]');}catch{return [];}})()
+    .map(r=>String(r||'').trim()).filter(Boolean)
+    // Lo que ya cuenta el bloque de comparación no se repite.
+    .filter(r=>!/^(CONSULTAR PRECIO:|Sin referencia en tu base|Reventa según tu base|Reventa ajustada con tu base|Sheets:)/.test(r)).slice(0,4);
+  const seller=[];
+  if(source.startsWith('ebay-'))seller.push(raw.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top de eBay: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`);
+  else{
+    if(source==='xianyu'&&xianyuListingHasVerificationTag(x))seller.push('✅ Con verificación de autenticidad de Xianyu (验货宝)');
+    const stats=[Number(x.seller_sales)>0?`${Number(x.seller_sales)} ventas`:'',Number(x.seller_reviews)>0?`${Number(x.seller_reviews)} reseñas`:'',Number(x.seller_items)>0?`${Number(x.seller_items)} anuncios`:''].filter(Boolean);
+    if(stats.length)seller.push(`Vendedor: ${stats.join(' · ')}`);
+  }
+  seller.push(`Riesgo de autenticidad: <b>${RISK_ES[String(x.authenticity_risk||'').toUpperCase()]||htmlEsc(x.authenticity_risk||'—')}</b>`);
+  if(known(exact.condition?.grade))seller.push(`Estado: ${htmlEsc(exact.condition.grade)}`);
+  const links=[x.url?`📱 <a href="${htmlEsc(listingAppLink(x))}">Abrir en la app</a>`:'',x.url&&listingAppLink(x)!==x.url?`🌐 <a href="${htmlEsc(x.url)}">Ver en la web</a>`:''].filter(Boolean).join('  ·  ');
+  const header=[
+    `${head} · ${htmlEsc(x._task_name||'')}`,
+    `<b>${htmlEsc(x.model||title)}</b>${identified?` · ${htmlEsc(identified)}`:''}`,
+    title&&title!==x.model?`<i>${htmlEsc(title.slice(0,140))}</i>`:'',
+    `${htmlEsc(platform)} · <b>${price}</b>${ago?` · publicado ${ago}`:''}`,
+    `Puntuación ${x.opportunity_score??'—'}/100`
+  ].filter(Boolean);
+  const lines=[
+    ...header,
+    ...alertSection('💰 NÚMEROS',[
+      `Coste puesto en España: <b>${eur0(x.landed_cost_eur)}</b>`,
+      `Reventa: <b>${range(x.resale_low_eur,x.resale_high_eur)}</b> · ${alertResaleSource(x,v)}`,
+      vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur,x._task_name).replace(/^Beneficio en/,'Beneficio limpio vendiendo en'),
+      `Margen bruto (reventa − coste): ${range(x.net_profit_low_eur,x.net_profit_high_eur)}${margin!=null?` · ${margin} %`:''}`,
+      pct===null?'':pct>0?`📉 ${pct} % por debajo del precio mediano de este modelo`:`📈 ${Math.abs(pct)} % por encima del precio mediano de este modelo`
+    ]),
+    ...alertSection('🧾 DESGLOSE DEL COSTE',importCostLines(x)),
+    ...alertSection('📚 CON QUÉ SE COMPARA',vestiaireDbLines(x._task_name,x)),
+    ...alertSection('🛡️ VENDEDOR Y AUTENTICIDAD',seller),
+    ...alertSection('📝 POR QUÉ',reasons.map(r=>`• ${htmlEsc(r.slice(0,300))}`)),
+    ...(links?['',links]:[])
+  ];
+  // Telegram admite 4.096 caracteres: si no cabe, fuera primero los enlaces
+  // de anuncios comparables (nunca se corta el texto a medias).
+  let text=lines.join('\n');
+  while(text.length>4000){
+    const i=lines.findLastIndex(l=>/^ {3}· <a /.test(l));
+    if(i<0)break;
+    lines.splice(i,1);text=lines.join('\n');
+  }
+  return text;
 }
 
 // ── LÍMITE DE AVISOS POR MODELO ─────────────────────────────────────────
@@ -10628,11 +10783,7 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'soft','telegram',?)`);
   let sent=0;
   for(const x of picks){
-    let why='';
-    try{why=String(JSON.parse(x.decision_reasons_es_json||'[]')[0]||'');}catch{}
-    const text=instantAlertText({...x,_task_name:task.task_name})
-      .replace(/^🔥 <b>[^<]*<\/b>/,`👀 <b>Posible oportunidad · revísala</b>`)
-      +(why?`\n<i>${htmlEsc(why.slice(0,220))}</i>`:'');
+    const text=instantAlertText({...x,_task_name:task.task_name},{soft:true});
     try{
       await telegramSendListing(text,x);
       mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());

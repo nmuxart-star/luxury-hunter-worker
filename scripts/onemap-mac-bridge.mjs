@@ -14,6 +14,14 @@ function allowedOneMapUrl(value){
   }catch{return false;}
 }
 
+// Búsqueda de Vestiaire desde el Chrome del Mac: solo un texto corto; la
+// extensión abre la portada de Vestiaire y consulta su buscador desde allí.
+export const VESTIAIRE_HOME='https://es.vestiairecollective.com/';
+export function allowedVestiaireQuery(value){
+  const q=String(value??'');
+  return q.length>=3&&q.length<=80&&!/[\r\n<>]/.test(q);
+}
+
 function send(res,status,body){
   res.writeHead(status,{'content-type':'application/json; charset=utf-8',
     'cache-control':'no-store'});
@@ -52,14 +60,15 @@ export function createOneMapMacBridge({token,timeoutMs=DEFAULT_TIMEOUT_MS}={}){
         const job=[...jobs.values()].find(x=>!x.dispatched);
         if(!job)return send(res,200,{job:null});
         job.dispatched=true;
-        return send(res,200,{job:{id:job.id,url:job.url}});
+        return send(res,200,{job:{id:job.id,url:job.url,...(job.kind?{kind:job.kind,query:job.query}:{})}});
       }
-      if(req.method==='POST'&&path==='/snapshot'){
+      if(req.method==='POST'&&(path==='/snapshot'||path==='/vestiaire')){
         const body=await readJson(req);
-        if(!allowedOneMapUrl(body?.url))return send(res,400,{error:'URL no permitida'});
+        const vestiaire=path==='/vestiaire';
+        if(vestiaire?!allowedVestiaireQuery(body?.query):!allowedOneMapUrl(body?.url))return send(res,400,{error:vestiaire?'Búsqueda no permitida':'URL no permitida'});
         if(jobs.size>=MAX_PENDING)return send(res,503,{error:'cola llena'});
         const id=randomUUID();
-        const job={id,url:body.url,dispatched:false};
+        const job=vestiaire?{id,url:VESTIAIRE_HOME,kind:'vestiaire',query:String(body.query),dispatched:false}:{id,url:body.url,dispatched:false};
         jobs.set(id,job);
         const timer=setTimeout(()=>{
           if(jobs.delete(id))send(res,504,{error:'El Chrome del Mac no respondió a tiempo'});
