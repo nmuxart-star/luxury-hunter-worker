@@ -66,6 +66,8 @@ export const brandOf=t=>(BRANDS.find(([,re])=>re.test(String(t||'')))||[])[0]||n
 // Talla y tipo de Vestiaire que no forman parte del nombre del modelo.
 const SIZE_WORDS=/\b(mini bolso|bolso|bandolera|boston|cabas|nano|mini|micro|small|medium|large|grande|pm|mm|gm|tpm|bb|vintage)\b/g;
 const modelName=t=>modelNorm(t).replace(/[-_\/]/g,' ').replace(SIZE_WORDS,' ').replace(/^de (cuero|lona)$/,'').replace(/[^a-z0-9 .\-]/g,' ').replace(/\s+/g,' ').trim();
+// Para comparar nombres: singular y plural iguales ("Accessoire" = "Accessoires").
+const sing=t=>String(t||'').replace(/\b([a-z]{4,})s\b/g,'$1');
 const isWatchTab=tab=>/omega|cartier|tudor|seiko|tag heuer|rolex|reloj|watch|speedmaster|seamaster/i.test(tab||'');
 
 function singleKey(spec,text,{vintage=false,requireBase=false,formatText=null}={}){
@@ -125,8 +127,8 @@ export function sameModelRows(tab,rows,texts={},{requireNamed=false}={}){
       const tf=flat(t);
       const byRef=list.find(x=>{const r=flat(x.f.size);return /\d{3}/.test(r)&&r.length>=5&&tf.includes(r);});
       if(byRef){key=byRef.key;break;}
-      const tn=` ${modelName(t)} `;
-      const byName=[...new Set(list.map(x=>x.key))].filter(k=>k.length>=3&&tn.includes(` ${k} `)).sort((a,b)=>b.length-a.length)[0];
+      const tn=` ${sing(modelName(t))} `;
+      const byName=[...new Set(list.map(x=>x.key))].filter(k=>k.length>=3&&tn.includes(` ${sing(k)} `)).sort((a,b)=>b.length-a.length)[0];
       if(byName){key=byName;break;}
     }
     explicit=!!key;
@@ -146,11 +148,11 @@ export function sameModelRows(tab,rows,texts={},{requireNamed=false}={}){
         // Radar, Murakami...: el nombre de modelo (de la hoja) más largo que cite
         // el anuncio y, en Radar, de la misma marca.
         for(const t of [title,all]){
-          const tn=` ${modelName(t)} `;
+          const tn=` ${sing(modelName(t))} `;
           const brand=brandOf(t)||brandOf(texts.label);
           const hit=[...new Set(list.map(x=>x.key))]
             .map(k=>{const [b,m]=k.includes(' · ')?k.split(' · '):[null,k];return {k,b,m};})
-            .filter(({b,m})=>m.length>=3&&tn.includes(` ${m} `)&&(!b||b===brand))
+            .filter(({b,m})=>m.length>=3&&tn.includes(` ${sing(m)} `)&&(!b||b===brand))
             .sort((a,b)=>b.m.length-a.m.length)[0];
           if(hit){key=hit.k;break;}
         }
@@ -159,7 +161,7 @@ export function sameModelRows(tab,rows,texts={},{requireNamed=false}={}){
     }
   }
   if(!key||(requireNamed&&!explicit))return null;
-  const same=list.filter(x=>x.key===key).map(x=>x.f);
+  const same=list.filter(x=>sing(x.key)===sing(key)).map(x=>x.f);
   return same.length?{key,explicit,rows:same}:null;
 }
 

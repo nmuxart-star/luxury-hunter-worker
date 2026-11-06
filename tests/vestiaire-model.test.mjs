@@ -84,3 +84,9 @@ test('lo negado y el relleno del título no cambian el modelo',()=>{
   // "caben el móvil y la cartera" en el título no lo convierte en cartera.
   assert.equal(sameModelRows('Celine Luggage',lux,{title:'CELINE Luggage nano 笑脸包 手机钱包都能装',label:'Luggage Nano'}).key,'Luggage');
 });
+
+test('singular y plural son el mismo modelo',()=>{
+  const rows=[{brand:'Louis Vuitton',size:'Pochette Accessoire'},{brand:'Louis Vuitton',size:'Pochette Accessoires'},{brand:'Louis Vuitton',size:'Pochette'}];
+  const m=sameModelRows('Radar oportunidades',rows,{title:'LOUIS VUITTON Monogram Pochette Accessoires'});
+  assert.equal(m.rows.length,2);
+});
