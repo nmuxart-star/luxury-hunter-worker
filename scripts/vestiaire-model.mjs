@@ -31,6 +31,7 @@ const SINGLE=[
   [/dior saddle/i,'Saddle',/saddle|马鞍|サドル|새들/i,[
     ['Double Saddle',/double/i],['Saddle Bowler',/bowler/i],['Saddle Soft',/\bsoft\b/i]]],
   [/chanel.*flap/i,'Classic Flap',/classic|timeless|classique|2\.55|\bcf\b|flap|口盖|マトラッセ|matelass|クラシック|클래식|플랩|마트라세/i,[
+    ['Reissue 2.55',/2\.55|reissue/i,true],
     ['Trendy CC',/trendy/i,true],['Chanel 19',/chanel ?19\b|^19$/i,true],['Boy',/\bboy\b/i,true],['Chanel 22',/chanel ?22\b/i,true],
     ['Coco Handle',/coco handle|top handle/i,true],['Gabrielle',/gabrielle/i,true],['Deauville',/deauville/i,true]]],
   [/evelyne/i,'Evelyne',/evelyne|エブリン|エヴリン|伊夫林|伊芙琳|에블린/i,[]],
@@ -61,7 +62,7 @@ const BRANDS=[
   ['chloe',/chlo[eé]|蔻依|クロエ|끌로에/i],['goyard',/goyard|戈雅|ゴヤール|고야드/i],['miu miu',/miu ?miu|缪缪|ミュウミュウ|미우미우/i],
   ['balenciaga',/balenciaga|巴黎世家|バレンシアガ|발렌시아가/i],['loro piana',/loro ?piana/i],['the row',/the row/i]
 ];
-const brandOf=t=>(BRANDS.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
+export const brandOf=t=>(BRANDS.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 // Talla y tipo de Vestiaire que no forman parte del nombre del modelo.
 const SIZE_WORDS=/\b(mini bolso|bolso|bandolera|boston|cabas|nano|mini|micro|small|medium|large|grande|pm|mm|gm|tpm|bb|vintage)\b/g;
 const modelName=t=>modelNorm(t).replace(/[-_\/]/g,' ').replace(SIZE_WORDS,' ').replace(/^de (cuero|lona)$/,'').replace(/[^a-z0-9 .\-]/g,' ').replace(/\s+/g,' ').trim();
@@ -92,10 +93,16 @@ export function rowModelKey(tab,f){
     return m||null;
   }
   const single=SINGLE.find(([re])=>re.test(tab));
-  if(single)return singleKey(single,`${f?.size||''} ${f?.notes||''}`,{vintage:!!f?.vintage}).key;
+  if(single){
+    // An explicit Modelo column wins over the name of the tab. Never silently
+    // turn a Bobby in a Lady Dior tab into a Lady Dior.
+    const explicit=String(f?.model||'').trim();
+    if(explicit&&!singleKey(single,explicit,{requireBase:true}))return modelName(explicit)||null;
+    return singleKey(single,`${explicit} ${f?.size||''} ${f?.notes||''}`,{vintage:!!f?.vintage}).key;
+  }
   const fixed=MULTI_FIXED.find(([re])=>re.test(tab));
-  if(fixed){const hit=fixed[1].find(([,re])=>re.test(`${f?.size||''} ${f?.notes||''}`));return hit?hit[0]:null;}
-  const m=modelName(f?.size);
+  if(fixed){const hit=fixed[1].find(([,re])=>re.test(`${f?.model||''} ${f?.size||''} ${f?.notes||''}`));return hit?hit[0]:null;}
+  const m=modelName(f?.model||f?.size);
   if(!m||m.length<3)return null;
   const brand=/radar/i.test(tab)?(brandOf(f?.brand)||brandOf(f?.notes)):null;
   return brand?`${brand} · ${m}`:m;
