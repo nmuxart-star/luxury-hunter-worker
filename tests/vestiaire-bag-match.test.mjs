@@ -69,7 +69,7 @@ test('a broader model cannot substitute for a named variant in another tab',()=>
 });
 test('confirmed sales win over asking prices; sold rows without a valid sale price never become asks',()=>{
   const c=match([{...row,id:'sold',sold:true,excluded:true,sold_price_eur:800},{...row,id:'active',price_eur:2000}]);
-  assert.equal(c.low,800);assert.equal(c.high,800);assert.equal(c.price_basis,'sold');
+  assert.equal(c.low,800);assert.equal(c.high,800);assert.equal(c.price_basis,'mixed');
   assert.equal(match([{...row,sold:true}]),null);
   assert.equal(match([{...row,sold:true,sold_price_eur:800,sold_price_suspect:true}]),null);
 });
@@ -159,4 +159,15 @@ test('cached BUY is revised without AI; both tables persist WATCH consistently a
     assert.ok(a.raw_json.length<10000);
   }
   db.close();
+});
+
+test('las vendidas y las que tienen más likes pesan más en el precio',()=>{
+  const rows=[{...row,id:'a',price_eur:1000,likes:0},{...row,id:'b',price_eur:1100,likes:0},{...row,id:'c',price_eur:2000,likes:300},{...row,id:'d',price_eur:2100,likes:250}];
+  const c=match(rows);
+  // Sin pesos la mediana caería entre 1.012 y 1.840; con likes manda la parte alta.
+  assert.equal(c.mid,1840);
+  assert.equal(c.picks[0].id,'c');
+  const s=match([{...row,id:'s',sold:true,sold_price_eur:900},{...row,id:'x',price_eur:2000},{...row,id:'y',price_eur:2100}]);
+  assert.equal(s.mid,900);
+  assert.equal(s.weighted.length,3);
 });

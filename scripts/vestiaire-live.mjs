@@ -4,7 +4,7 @@
 // One Map) y la reventa sale de los anuncios del mismo modelo y material:
 // primero los vendidos; si hay pocos, los pedidos × 92 %.
 import {materialClass, modelNorm} from './vestiaire-model.mjs';
-import {bagDimensions} from './vestiaire-bag-match.mjs';
+import {bagDimensions,compWeight,weightedQuantile} from './vestiaire-bag-match.mjs';
 
 export const VESTIAIRE_LIVE_REALIZATION=0.92;
 const ORIGIN='https://es.vestiairecollective.com';
@@ -50,6 +50,8 @@ export function vestiaireLiveRows(payload){
 
 // Franja de reventa con los anuncios del mismo modelo y material; misma talla
 // si el anuncio la dice (si no hay 3 de su talla, todas las tallas, orientativo).
+// Cuentan todos (vendidos a su precio; en venta, pedido × 92 %), pero los
+// vendidos y los que tienen más likes pesan más (compWeight).
 export function vestiaireLiveComparables(rows,item={},exact={},{query=null,model=null}={}){
   const itemMat=materialClass(known(exact.material)?exact.material:`${item.title||''} ${item.description||''}`);
   const brand=modelNorm(known(exact.brand)?exact.brand:item.brand||'').replace(/^yves /,'');
@@ -64,12 +66,29 @@ export function vestiaireLiveComparables(rows,item={},exact={},{query=null,model
   else return null;
   const sold=set.filter(r=>r.sold);
   const value=r=>r.sold?r.price_eur:r.price_eur*VESTIAIRE_LIVE_REALIZATION;
-  const values=(sold.length>=3?sold:set).map(value).sort((a,b)=>a-b);
-  const q=p=>Math.round(values[Math.round((values.length-1)*p)]);
+  const weighted=set.map(r=>({id:String(r.id),s:!!r.sold,v:value(r),w:compWeight(r)}));
+  const q=p=>Math.round(weightedQuantile(weighted,p));
   const mid=q(.5);
-  const picks=set.slice().sort((a,b)=>(Number(b.sold)-Number(a.sold))||Math.abs(value(a)-mid)-Math.abs(value(b)-mid)).slice(0,5);
+  const picks=set.slice().sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,5);
   return {source:'vestiaire_live',tier,query,model:model||set[0]?.model||null,material:itemMat,size,
     basis:tier==='misma_talla'?`talla ${size}`:size?`todas las tallas (solo ${sized.length} en ${size})`:'todas las tallas',
-    n:values.length,total:set.length,sold_n:sold.length,active_n:set.length-sold.length,
-    price_basis:sold.length>=3?'sold':'asking',low:q(.25),mid,high:q(.75),picks};
+    n:set.length,total:set.length,sold_n:sold.length,active_n:set.length-sold.length,
+    price_basis:sold.length===set.length?'sold':sold.length?'mixed':'asking',low:q(.25),mid,high:q(.75),
+    weighted:weighted.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),picks};
+}
+
+// Base de Nil + Vestiaire en directo. Las referencias de la base (mismas
+// medidas, material, color y estado) pesan el doble; de Vestiaire solo entran
+// las de la misma talla que no estén ya en la base. Dentro de cada grupo,
+// vendidas y con más likes pesan más.
+const refId=id=>String(id||'').match(/(\d{6,})(?:\.shtml)?$/)?.[1]||String(id||'');
+export function blendComparables(sheet,live){
+  if(!sheet?.weighted?.length||live?.status!=='ok'||live.tier!=='misma_talla')return null;
+  const seen=new Set(sheet.weighted.map(x=>refId(x.id)));
+  const extra=(live.weighted||[]).filter(x=>!seen.has(refId(x.id)));
+  if(!extra.length)return null;
+  const all=[...sheet.weighted.map(x=>({...x,w:x.w*2})),...extra];
+  const q=p=>Math.round(weightedQuantile(all,p));
+  return {n:all.length,n_sheet:sheet.weighted.length,n_live:extra.length,sold_n:all.filter(x=>x.s).length,
+    low:q(.25),mid:q(.5),high:q(.75)};
 }

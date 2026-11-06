@@ -59,6 +59,21 @@ export function bagCondition(text){
 const valueOf=(f,ratio)=>f.sold
   ? (!f.sold_price_suspect&&Number.isFinite(f.sold_price_eur)&&f.sold_price_eur>0?f.sold_price_eur:null)
   : (!f.excluded&&Number.isFinite(f.price_eur)&&f.price_eur>0?f.price_eur*ratio:null);
+// Peso de cada referencia en el precio (regla de Nil): las vendidas cuentan
+// el triple y los likes suben el peso poco a poco (0 → ×1, 7 → ×2, 63 → ×3).
+export function compWeight(f){
+  const likes=Math.max(0,Number(f?.likes)||0);
+  return (f?.sold?3:1)*(1+Math.log2(1+Math.min(likes,1000))/3);
+}
+// Cuantil ponderado: el primer valor cuyo peso acumulado llega a p del total.
+export function weightedQuantile(list,p){
+  const xs=(list||[]).filter(x=>Number.isFinite(x?.v)&&x.w>0).sort((a,b)=>a.v-b.v);
+  if(!xs.length)return null;
+  const total=xs.reduce((s,x)=>s+x.w,0);
+  let acc=0;
+  for(const x of xs){acc+=x.w;if(acc>=p*total-1e-9)return x.v;}
+  return xs[xs.length-1].v;
+}
 const detail=(t,groups)=>(groups.find(([,re])=>re.test(modelNorm(t)))||[])[0]||null;
 const LEATHERS=[['caviar',/caviar/],['lamb',/lamb|cordero|agneau|羊皮/],['calf',/calf|becerro|ternera|veau|牛皮/],['goat',/goat|cabra|chevre/]];
 const PATTERNS=[['oblique',/oblique/],['ff',/\bff\b|zucca|zucchino/],['cannage',/cannage/],['plain',/\bplain\b|\bliso\b/]];
@@ -112,14 +127,18 @@ export function strictBagComparables(entries,item={},exact={}){
   const ratios=selected.filter(f=>f.sold&&f.price_eur>0&&valueOf(f,1)>0).map(f=>f.sold_price_eur/f.price_eur).filter(x=>x>0.4&&x<1.6).sort((a,b)=>a-b);
   const ratio=ratios.length>=5?Math.max(.75,Math.min(1,ratios[Math.floor(ratios.length/2)])):.92;
   const sales=selected.filter(f=>f.sold);
-  const values=(sales.length?sales:selected).map(f=>valueOf(f,ratio)).sort((a,b)=>a-b);
-  const q=p=>Math.round(values[Math.round((values.length-1)*p)]);
+  // Todas cuentan (vendidas a su precio de venta; en venta, pedido × ratio),
+  // pero las vendidas y las que tienen más likes pesan más.
+  const weighted=selected.map(f=>({id:String(f.id||f.url||''),s:!!f.sold,v:valueOf(f,ratio),w:compWeight(f)})).filter(x=>x.v!==null);
+  const values=weighted.map(x=>x.v);
+  const q=p=>Math.round(weightedQuantile(weighted,p));
   const tabs=[...new Set(selected.map(f=>f.tab))];
   return {rule_version:BAG_SHEET_RULE_VERSION,tier,tab:tabs.join(', '),model:selected[0].matched_model,
     basis:`medidas declaradas ${dims.join(' × ')} cm`,colour:color,material:mat,
     condition, buy_eligible:dims.length===3&&!!condition&&Number(exact.confidence)>=.75&&Number(exact.condition?.confidence)>=.6&&selected.every(f=>f.details_confirmed),n:values.length,low:q(.25),mid:q(.5),high:q(.75),ratio,
-    price_basis:sales.length?'sold':'asking',ratio_source:ratios.length>=5?'recorded_sales':'assumption',sold_n:sales.length,
-    picks:selected.sort((a,b)=>Number(b.sold)-Number(a.sold)).slice(0,5)};
+    price_basis:sales.length?(sales.length===selected.length?'sold':'mixed'):'asking',ratio_source:ratios.length>=5?'recorded_sales':'assumption',sold_n:sales.length,
+    weighted:weighted.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),
+    picks:selected.sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,5)};
 }
 
 // Last deterministic gate: neither the LLM nor external market comparables can
