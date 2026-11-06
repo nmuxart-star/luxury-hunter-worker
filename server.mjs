@@ -17,7 +17,6 @@ import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/o
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,compWeight,compStats,refAgeDays,weightedQuantile} from './scripts/vestiaire-bag-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
-import {searchReefYahoo} from './scripts/reef-yahoo.mjs';
 import {macOneMapReady,macOneMapSnapshot,macVestiaireSearch} from './scripts/onemap-mac-client.mjs';
 import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables,vestiaireTaskQuery,vestiaireDeals} from './scripts/vestiaire-live.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1041,18 +1040,6 @@ function assertAiBudget(){
 // triaje y al análisis, que son los que encuentran oportunidades nuevas.
 function watchTaskIds(){return db.prepare('SELECT id,task_name FROM tasks').all().filter(t=>isWatchTask(t.task_name)).map(t=>Number(t.id));}
 // Análisis IA de hoy en tareas de relojes (sin contar los descartes del pre-filtro, que no gastan IA).
-function watchAnalysesToday(){
-  const ids=watchTaskIds();
-  if(!ids.length)return 0;
-  const since=new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z').toISOString();
-  return db.prepare(`SELECT COUNT(*) AS n FROM task_analyses WHERE task_id IN (${ids.map(()=>'?').join(',')}) AND updated_at>=? AND COALESCE(verification_json,'') NOT LIKE '%"prescreen"%'`).get(...ids,since).n;
-}
-function watchVerificationsToday(){
-  const ids=db.prepare('SELECT id,task_name FROM tasks').all().filter(t=>isWatchTask(t.task_name)).map(t=>Number(t.id));
-  if(!ids.length)return 0;
-  const since=new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z').toISOString();
-  return db.prepare(`SELECT COUNT(*) AS n FROM task_analyses WHERE task_id IN (${ids.map(()=>'?').join(',')}) AND updated_at>=? AND verification_json LIKE '%"status":"verified"%'`).get(...ids,since).n;
-}
 function verifyBudgetLeftUsd(){
   if(manualAiStore.getStore())return Infinity;
   let budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
@@ -3170,6 +3157,15 @@ const JAPAN_RADAR_SPECS=[
   }
 ];
 
+// Fuentes de Japón que se buscan (JAPAN_SOURCES, por defecto solo Mercari).
+// Rakuma, Yahoo Flea Market, 2nd STREET y KOMEHYO casi no daban
+// oportunidades y alargaban cada búsqueda; sus fichas se siguen pudiendo
+// importar a mano por enlace.
+function japanSearchSpecs(){
+  const ids=String(process.env.JAPAN_SOURCES||'mercari-jp').split(',').map(x=>x.trim()).filter(Boolean);
+  return JAPAN_RADAR_SPECS.filter(spec=>ids.includes(spec.id));
+}
+
 // One Map muestra las subastas de Yahoo Japón sin iniciar sesión. Una cuenta
 // personal sirve para pujar manualmente; el radar solo lee y recomienda.
 async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null,sessionId},browserContext){
@@ -3232,66 +3228,7 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
   return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',kept,detailErrors,perQuery,...(!ok?{error:perQuery[0]?.error||'No se pudo leer One Map'}:{})};
 }
 
-db.exec(`CREATE TABLE IF NOT EXISTS reef_search_usage (
-  month TEXT PRIMARY KEY,
-  attempts INTEGER NOT NULL DEFAULT 0
-)`);
 
-function reserveReefSearch(){
-  const limit=Math.min(500,Math.max(0,Math.floor(Number(process.env.REEF_MONTHLY_SEARCH_LIMIT||500))));
-  const month=xianyuBudgetMonth();
-  db.prepare('INSERT OR IGNORE INTO reef_search_usage(month,attempts) VALUES(?,0)').run(month);
-  return db.prepare('UPDATE reef_search_usage SET attempts=attempts+1 WHERE month=? AND attempts<?')
-    .run(month,limit).changes>0;
-}
-
-async function searchReefAuctions({queries,maxItems=30,minEur=null,maxEur=null,sessionId}){
-  const selected=normalizeLines(queries||[]).slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4));
-  const detailLimit=clampInt(process.env.ONEMAP_DETAIL_LIMIT||8,8,1,20);
-  const perQueryLimit=Math.max(1,Math.ceil(detailLimit/Math.max(1,selected.length)));
-  const perQuery=[];
-  const seen=new Set();
-  let kept=0;
-  for(const q of selected){
-    try{
-      if(!reserveReefSearch())throw new Error('Límite mensual de búsquedas ReefAPI alcanzado');
-      const {items}=await searchReefYahoo(q,{apiKey:process.env.REEF_API_KEY,limit:100});
-      const cards=items
-        .filter(c=>c.timeLeftMs>=5*60e3&&c.timeLeftMs<=AUCTION_MAX_HOURS*3600e3)
-        .filter(c=>{
-          const eur=toEur(c.currentBid,'JPY');
-          return eur!=null&&(minEur==null||eur>=Number(minEur))&&
-            (maxEur==null||eur<=Number(maxEur));
-        })
-        .sort((a,b)=>a.timeLeftMs-b.timeLeftMs);
-      let local=0;
-      for(const card of cards){
-        if(kept>=detailLimit||local>=perQueryLimit||kept>=Number(maxItems))break;
-        if(seen.has(card.id))continue;
-        seen.add(card.id);
-        const item={source:'yahoo-auctions-jp',source_id:card.id,url:card.url,
-          title:card.title,description:card.condition?`Item condition: ${card.condition}`:'',
-          original_price:card.currentBid,currency:'JPY',price_eur:toEur(card.currentBid,'JPY'),
-          seller_name:card.sellerId||'',seller_reviews:null,image_url:card.image||'',status:'',
-          purchase_via:'One Map / FROM JAPAN',
-          raw:{query:q,searchUrl:oneMapSearchUrl(q),searchMode:'api',sourceLabel:'Yahoo! Auctions Japan',
-            dataProvider:'ReefAPI',sellerPositivePercent:card.sellerPositivePercent,
-            shippingFeeJpy:card.shippingFee,purchaseVia:'One Map / FROM JAPAN',
-            auction:{endsAt:card.endsAt,bids:card.bids,currentBid:card.currentBid,
-              currency:'JPY',buyNow:card.buyNow,provider:'ReefAPI',requiresDatabase:true}}};
-        upsertListing(item,sessionId,q);
-        kept++;local++;
-      }
-      perQuery.push({query:q,count:local,candidates:cards.length,provider:'ReefAPI',creditsReserved:2});
-    }catch(e){perQuery.push({query:q,count:0,error:e.message,provider:'ReefAPI'});}
-  }
-  const ok=perQuery.length>0&&perQuery.some(x=>!x.error);
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)')
-    .run('reefapi','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
-  return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',
-    purchaseVia:'One Map / FROM JAPAN',mode:'api',kept,detailErrors:0,perQuery,
-    ...(!ok?{error:perQuery[0]?.error||'ReefAPI no devolvió resultados'}:{})};
-}
 
 function parseYen(text){
   const s=String(text||'').replace(/\s+/g,' ');
@@ -4136,75 +4073,42 @@ async function searchJapanRadarLive(opts){
   let browser=null;
   let browserContext=null;
   let browserError=null;
-  let usingOneMapAccount=false;
   const contextOptions={locale:'ja-JP',userAgent:JAPAN_HTTP_HEADERS['user-agent']};
-  const oneMapStateFile=String(process.env.ONEMAP_STORAGE_STATE_FILE||'').trim();
 
-  // One Map necesita un navegador para cargar las subastas con JavaScript.
-  try{
+  // Mercari necesita un navegador para cargar los anuncios con JavaScript.
+  const activeSpecs=japanSearchSpecs();
+  if(activeSpecs.some(spec=>spec.mode==='browser'))try{
     const {chromium}=await import('playwright');
 
     browser=await chromium.launch({
       headless:process.env.ONEMAP_HEADED!=='1'
     });
-
-    if(oneMapStateFile){
-      try{
-        browserContext=await browser.newContext({...contextOptions,storageState:oneMapStateFile});
-        usingOneMapAccount=true;
-      }catch(e){
-        console.warn(`One Map account session could not be loaded: ${e.message}`);
-        oneMapAccountStatus='unavailable';
-      }
-    }
-    if(!browserContext)browserContext=await browser.newContext(contextOptions);
+    browserContext=await browser.newContext(contextOptions);
   }catch(e){
     browserError=e.message;
   }
 
   try{
     try{
+      // Yahoo Subastas solo por One Map (FROM JAPAN) desde el Chrome del Mac.
+      // Sin el Mac no se busca: ni ReefAPI ni One Map desde la nube (vacía).
       const bridgeToken=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
-      const reefKey=String(process.env.REEF_API_KEY||'').trim();
       const macReady=bridgeToken&&await macOneMapReady(bridgeToken);
       let result;
       if(macReady){
         result=await searchOneMapAuctions(opts,{macBridgeToken:bridgeToken});
         result.mode='mac-chrome';
-        if(reefKey){
-          const failed=(result.perQuery||[]).filter(x=>x.error).map(x=>x.query);
-          if(failed.length){
-            const backup=await searchReefAuctions({...opts,queries:failed});
-            const byQuery=new Map(backup.perQuery.map(x=>[x.query,x]));
-            result={...result,mode:'mac-chrome+api',kept:result.kept+backup.kept,
-              perQuery:result.perQuery.map(x=>x.error&&byQuery.has(x.query)
-                ?{...byQuery.get(x.query),localError:x.error}:x)};
-            result.ok=result.perQuery.some(x=>!x.error);
-            result.error=result.ok?undefined:result.perQuery[0]?.error;
-          }
-        }
-      }else if(reefKey){
-        result=await searchReefAuctions(opts);
-      }else{
-        result=await searchOneMapAuctions(opts,browserContext);
-        if(!result.ok&&usingOneMapAccount&&browser&&browserContext){
-          console.warn(`One Map account search failed: ${result.error||'unknown error'}; trying public search.`);
-          oneMapAccountStatus='unavailable';
-          await browserContext.close().catch(()=>{});
-          browserContext=await browser.newContext(contextOptions);
-          result=await searchOneMapAuctions(opts,browserContext);
-        }
-      }
+      }else result={ok:false,kept:0,perQuery:[],error:bridgeToken?'el Chrome del Mac no está disponible':'puente del Mac sin configurar'};
       if(!result.ok)console.warn(`Yahoo Auctions search failed: ${result.error||'unknown error'}`);
       perSource['yahoo-auctions-jp']={
         ...result,
-        accountStatus:macReady?'mac-chrome':oneMapAccountStatus
+        accountStatus:macReady?'mac-chrome':'off'
       };
       kept+=Number(result.kept||0);
     }catch(e){
       perSource['yahoo-auctions-jp']={ok:false,kept:0,error:e.message};
     }
-    for(const spec of JAPAN_RADAR_SPECS){
+    for(const spec of activeSpecs){
       try{
         const result=await searchJapanSource(
           spec,
@@ -5065,7 +4969,7 @@ function vestiaireLiveNote(c){
 // Nil de ese modelo; vendidos, recientes y con más likes pesan más.
 // Gastos de comprador: VESTIAIRE_BUYER_FEE_PCT (10 %) + VESTIAIRE_BUYER_SHIPPING_EUR (20 €).
 // Mínimos: VESTIAIRE_DEAL_MIN_PROFIT_EUR (200 € limpios) y VESTIAIRE_DEAL_MIN_MARGIN_PCT (20 %).
-// Como mucho VESTIAIRE_DEAL_DAILY_MAX (6) avisos al día; cada anuncio una vez.
+// Sin máximo de avisos; cada anuncio una vez.
 function vestiaireDealText(task,d){
   const x=d.deal;
   const dealPart=(title,p,material)=>['',`<b>${title}</b>`,...(p?.n
@@ -5108,10 +5012,6 @@ async function scanVestiaireDeals(task){
     sheet=(m?.rows||[]).map(f=>({...f,title:f.model||r.model,_src:'base'}));
   }
   const sent=getSetting('vestiaire_deals_sent',{})||{};
-  const day=new Date().toISOString().slice(0,10);
-  const today=Object.values(sent).filter(v=>String(v).startsWith(day)).length;
-  const room=Math.max(0,Number(process.env.VESTIAIRE_DEAL_DAILY_MAX||6)-today);
-  if(!room)return {sent:0,reason:'daily_max'};
   // Talla: medidas o nombre de talla propio del modelo (PM/GM, 29/33...).
   const fam=(VESTIAIRE_FAMILY_SIZES.find(([re])=>re.test(task.task_name))||[])[1];
   const sizeOf=fam?(row=>{
@@ -5123,7 +5023,7 @@ async function scanVestiaireDeals(task){
   const deals=vestiaireDeals(live.filter(x=>!x.sold&&!sent[x.id]),[...live,...sheet],{sizeOf,
     buyerFeePct:Number(process.env.VESTIAIRE_BUYER_FEE_PCT??10),buyerShippingEur:Number(process.env.VESTIAIRE_BUYER_SHIPPING_EUR??20),
     sellFeePct:Number(process.env.VESTIAIRE_COMMISSION_PCT??20),minProfitEur:Number(process.env.VESTIAIRE_DEAL_MIN_PROFIT_EUR??200),
-    minMarginPct:Number(process.env.VESTIAIRE_DEAL_MIN_MARGIN_PCT??20)}).slice(0,Math.min(room,2));
+    minMarginPct:Number(process.env.VESTIAIRE_DEAL_MIN_MARGIN_PCT??20)});
   let n=0;
   for(const d of deals){
     try{
@@ -8318,10 +8218,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const worthVerifying=['BUY','STRONG BUY'].includes(preliminaryDecision)||
     (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin)||
     bigMarginWatch;
-  // Relojes: como mucho WATCH_VERIFY_MAX_PER_DAY verificaciones caras al día,
-  // para que nunca dejen sin presupuesto de verificación a los bolsos.
-  const watchQuotaOut=isWatchTask(task?.task_name)&&watchVerificationsToday()>=Number(process.env.WATCH_VERIFY_MAX_PER_DAY||3);
-  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&worthVerifying&&(verifyBudgetLeftUsd()<=0||watchQuotaOut)){
+  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&worthVerifying&&verifyBudgetLeftUsd()<=0){
     // Candidato serio pero sin presupuesto de verificación hoy: se verifica
     // en cuanto haya presupuesto (mañana), en vez de perderlo.
     verification={
@@ -8764,7 +8661,7 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
   const oneMapCalls=jQueries.slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4)).map(q=>({
     source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',
     mode:'mac-chrome-or-api',query:q,method:'MAC CHROME GET; REEFAPI POST if offline or failed',
-    url:oneMapSearchUrl(q),fallbackUrl:'https://api.reefapi.com/yahoo-auctions/v1/search',
+    url:oneMapSearchUrl(q),
     fallbackCreditsPerSearch:2
   }));
   const japanCalls=[...oneMapCalls,...JAPAN_RADAR_SPECS.flatMap(spec=>
@@ -8860,22 +8757,27 @@ async function globalSearch(body) {
     personalOnly:!!body.personal_only,freeShipping:!!body.free_shipping,newPublishOption:body.new_publish_option||null,region:body.region||null,
     accountStateFile:body.account_state_file||null,accountStrategy:body.account_strategy||'auto'
   };
+  // Todas las fuentes a la vez; cada una guarda cuánto ha tardado (ms).
   const jobs=[];
-  if(sources.includes('bunjang')) { status.bunjang={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.bunjang=await searchBunjangLive({...opts,queries:plan.bunjang});}catch(e){status.bunjang={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
-  if(sources.includes('buyee')) { status.buyee={ok:null,state:'running'}; persistStatus(); jobs.push((async()=>{try{status.buyee=await searchJapanRadarLive({...opts,queries:plan.japan});}catch(e){status.buyee={ok:false,state:'error',error:e.message};} finally{persistStatus();}})()); }
-  // Fuentes por API oficial: se activan solas cuando hay credenciales
-  // (o si la tarea las pide explícitamente). EXTRA_SOURCES=off las desactiva.
+  const run=(name,fn)=>{
+    status[name]={ok:null,state:'running'};persistStatus();
+    const t0=Date.now();
+    jobs.push((async()=>{
+      try{status[name]=await fn();}
+      catch(e){status[name]={ok:false,state:'error',error:e.message};}
+      finally{status[name]={...(status[name]||{}),ms:Date.now()-t0};persistStatus();}
+    })());
+  };
+  // Bunjang y Rakuten ya no se buscan salvo que se pidan expresamente
+  // (BUNJANG_ENABLED=1 / RAKUTEN_ENABLED=1): casi no daban oportunidades.
+  const on=k=>['1','on','true','yes'].includes(String(process.env[k]||'').toLowerCase());
+  if(sources.includes('bunjang')&&on('BUNJANG_ENABLED'))run('bunjang',()=>searchBunjangLive({...opts,queries:plan.bunjang}));
+  if(sources.includes('buyee'))run('buyee',()=>searchJapanRadarLive({...opts,queries:plan.japan}));
   const extraOff=['0','off','false','no'].includes(String(process.env.EXTRA_SOURCES||'').toLowerCase());
-  if(!extraOff&&(sources.includes('rakuten')||rakutenConfigured())){
-    status.rakuten={ok:null,state:'running'}; persistStatus();
-    jobs.push((async()=>{try{status.rakuten=await searchRakutenLive({...opts,queries:plan.japan});}catch(e){status.rakuten={ok:false,state:'error',error:e.message};}finally{persistStatus();}})());
-  }
-  if(!extraOff&&(sources.includes('ebay')||ebayConfigured())){
-    status.ebay={ok:null,state:'running'}; persistStatus();
-    jobs.push((async()=>{try{status.ebay=await searchEbayLive({...opts,product});}catch(e){status.ebay={ok:false,state:'error',error:e.message};}finally{persistStatus();}})());
-  }
+  if(!extraOff&&on('RAKUTEN_ENABLED')&&rakutenConfigured())run('rakuten',()=>searchRakutenLive({...opts,queries:plan.japan}));
+  if(!extraOff&&(sources.includes('ebay')||ebayConfigured()))run('ebay',()=>searchEbayLive({...opts,product}));
+  if(sources.includes('xianyu'))run('xianyu',()=>searchXianyuLive({...opts,queries:plan.xianyu}));
   await Promise.all(jobs);
-  if(sources.includes('xianyu')) { status.xianyu={ok:null,state:'running'}; persistStatus(); try{status.xianyu=await searchXianyuLive({...opts,queries:plan.xianyu});}catch(e){status.xianyu={ok:false,state:'error',error:e.message};} finally{persistStatus();} }
   const finishedAt=new Date().toISOString();
   db.prepare('UPDATE search_sessions SET source_status_json=?,status=?,finished_at=? WHERE id=?').run(JSON.stringify(status),'finished',finishedAt,sessionId);
   const items=sessionListings(sessionId);
@@ -9590,33 +9492,6 @@ function xianyuTooCheapVeto(item,task){
   };
 }
 
-// RELOJES EN XIANYU (regla de Nil): además de 验货宝, solo vendedores
-// profesionales con buenas valoraciones. Si no se puede comprobar, se descarta.
-function xianyuWatchSellerVeto(item,task){
-  if(String(item?.source||'').toLowerCase()!=='xianyu'||!isWatchTask(task?.task_name))return null;
-  let si=null;try{si=JSON.parse(item?.raw_json||'{}')?.['卖家信息']||null;}catch{}
-  const env=(k,d)=>{const n=Number(process.env[k]);return Number.isFinite(n)&&n>0?n:d;};
-  const rate=parseFloat(String(si?.['好评率']??'').replace('%',''));
-  const sold=Number(si?.['卖家已售']);
-  const days=Number(si?.['卖家注册天数']);
-  const onSale=Number(si?.['卖家在售']);
-  const credit=String(si?.['芝麻信用']||'');
-  const fails=[];
-  if(!si)fails.push('sin datos del vendedor');
-  else{
-    if(!Number.isFinite(rate)||rate<env('WATCH_XIANYU_MIN_RATE',98))fails.push(`valoraciones ${Number.isFinite(rate)?rate+' %':'no visibles'} (mín. ${env('WATCH_XIANYU_MIN_RATE',98)} %)`);
-    if(!Number.isFinite(sold)||sold<env('WATCH_XIANYU_MIN_SOLD',100))fails.push(`${Number.isFinite(sold)?sold:0} ventas (mín. ${env('WATCH_XIANYU_MIN_SOLD',100)})`);
-    if(!Number.isFinite(days)||days<env('WATCH_XIANYU_MIN_DAYS',365))fails.push(`cuenta de ${Number.isFinite(days)?days:0} días (mín. ${env('WATCH_XIANYU_MIN_DAYS',365)})`);
-    if(!/信用极好|信用优秀/.test(credit))fails.push(`crédito "${credit||'sin dato'}"`);
-    if(Number.isFinite(onSale)&&Number.isFinite(sold)&&sold>0&&onSale/sold>env('WATCH_XIANYU_MAX_LISTED_PER_SALE',50))fails.push(`${onSale} anuncios para ${sold} ventas`);
-  }
-  if(!fails.length)return null;
-  return {
-    code:'watch_seller_not_pro',
-    term:fails[0],
-    reasons:[`Reloj en Xianyu de un vendedor que no cumple tu filtro de profesional: ${fails.join('; ')}.`]
-  };
-}
 
 function deterministicPrescreen(item,task=null){
   const noPrice=noPriceVeto(item);
@@ -9627,8 +9502,8 @@ function deterministicPrescreen(item,task=null){
     const few=fewSellerReviewsVeto('Yahoo! Auctions',item?.seller_reviews);
     if(few)return few;
   }
-  const watchSeller=xianyuWatchSellerVeto(item,task);
-  if(watchSeller)return watchSeller;
+  // Relojes en Xianyu: las mismas condiciones que los bolsos (etiqueta
+  // 验货宝 obligatoria); el vendedor no cuenta (decisión de Nil, 06-11-2026).
   const replica=xianyuReplicaTerm(item);
   if(replica){
     return {
@@ -10734,16 +10609,14 @@ function isNearDuplicateAlert(x,sent){
     return false;
   });
 }
-function limitTaskAlerts(task,picks,{kinds,max,mustBeatWorst=false}){
+// Sin máximo de avisos por modelo ni por producto (decisión de Nil): solo se
+// quitan los casi-duplicados (mismo vendedor y precio parecido).
+function limitTaskAlerts(task,picks,{kinds}){
   const sent=recentTaskAlerts(task.id,kinds);
-  let room=Math.max(0,max-sent.length);
-  const worst=sent.length?Math.min(...sent.map(s=>Number(s.net_profit_low_eur)||0)):null;
   const out=[];
   for(const x of picks){
-    if(room<=0)break;
     if(isNearDuplicateAlert(x,[...sent,...out]))continue;
-    if(mustBeatWorst&&worst!=null&&!(Number(x.net_profit_low_eur)>worst))continue;
-    out.push(x);room--;
+    out.push(x);
   }
   return out;
 }
@@ -10789,7 +10662,7 @@ async function sendInstantAlerts(task,runId,items){
     Number(b.net_profit_low_eur??-1e9)-Number(a.net_profit_low_eur??-1e9)
   );
   const freshAll=fresh.slice();
-  fresh.splice(0,fresh.length,...limitTaskAlerts(task,freshAll,{kinds:['instant'],max:Number(process.env.INSTANT_ALERT_TASK_DAILY_MAX||4)}));
+  fresh.splice(0,fresh.length,...limitTaskAlerts(task,freshAll,{kinds:['instant']}));
   const soft=await sendSoftAlerts(task,runId,items,new Set(freshAll.map(x=>Number(x.id))));
   if(!fresh.length)return {sent:0,soft};
   // Bolsos iguales en la base de Vestiaire de Nil, para el texto del aviso.
@@ -10885,7 +10758,7 @@ async function sendAuctionAlerts(task,runId,items){
     x._auction=plan;x._task_name=task.task_name;
     return !already.get(Number(x.id));
   }).sort((a,b)=>(b._auction.max_bid_eur-Number(b.price_eur))-(a._auction.max_bid_eur-Number(a.price_eur)));
-  const limited=limitTaskAlerts(task,picks,{kinds:['auction'],max:Number(process.env.AUCTION_ALERT_TASK_DAILY_MAX||3)});
+  const limited=limitTaskAlerts(task,picks,{kinds:['auction']});
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'auction','telegram',?)`);
   let sent=0;
   for(const x of limited){
@@ -10924,7 +10797,7 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
     if(listingFeedback(x.id)==='not_interested')return false;
     return !already.get(Number(x.id));
   }).sort((a,b)=>Number(b.net_profit_low_eur)-Number(a.net_profit_low_eur));
-  const picksLimited=limitTaskAlerts(task,picks,{kinds:['instant','soft'],max:Number(process.env.SOFT_ALERT_TASK_DAILY_MAX||3)});
+  const picksLimited=limitTaskAlerts(task,picks,{kinds:['instant','soft']});
   picks.splice(0,picks.length,...picksLimited);
   if(!picks.length)return {sent:0};
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'soft','telegram',?)`);
@@ -11225,18 +11098,6 @@ async function executeTask(taskId, runId=null) {
         pendingItems.push(item);
       }
 
-      // Relojes: tope diario de análisis IA (WATCH_MAX_ANALYSES_PER_DAY, 60) entre
-      // todas las tareas de relojes, para no gastar el presupuesto de los bolsos.
-      // Lo que no cabe hoy queda sin analizar y se analiza en otra ejecución.
-      if(isWatchTask(task.task_name)){
-        const cap=Number(process.env.WATCH_MAX_ANALYSES_PER_DAY||60);
-        const room=Math.max(0,cap-watchAnalysesToday());
-        if(pendingItems.length>room){
-          console.log(`Relojes: tope diario de análisis (${cap}); se analizan ${room} de ${pendingItems.length} y el resto queda para otra ejecución.`);
-          pendingItems=pendingItems.slice(0,room);
-        }
-      }
-
       result.status.prescreen={ok:true,...prescreenStats};
       if(prescreenStats.rejected){
         console.log(`Task ${taskId}: pre-filtro descartó ${prescreenStats.rejected} anuncios sin usar Gemini.`);
@@ -11323,16 +11184,12 @@ async function executeTask(taskId, runId=null) {
         if(skipped)console.log(`Task ${taskId}: tope diario de ${dayCap} análisis alcanzado (${used} hoy); ${skipped} anuncios no se analizan.`);
         pendingItems=kept;
       }
-      const maxAiItems=Number(process.env.AI_MAX_ITEMS_PER_TASK_RUN||10);
+      // Sin tope de anuncios: se analizan todos los que dé tiempo. Para no
+      // quitar turno a otros modelos, cada tarea analiza como mucho
+      // AI_TASK_MAX_MINUTES (15) y lo que quede pasa a la siguiente pasada
+      // (primero lo más prometedor, que ya viene ordenado).
       let deferred=0;
-      if(Number.isFinite(maxAiItems)&&maxAiItems>0&&pendingItems.length>maxAiItems){
-        deferred=pendingItems.length-maxAiItems;
-        for(const item of pendingItems.slice(maxAiItems)){
-          db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);
-        }
-        pendingItems=pendingItems.slice(0,maxAiItems);
-        console.log(`Task ${taskId}: ${deferred} anuncios menos prioritarios aplazados a la siguiente ejecución.`);
-      }
+      const analysisMaxMs=Math.max(1,Number(process.env.AI_TASK_MAX_MINUTES||15))*60e3;
       // Xianyu funciona en modo búsqueda únicamente para evitar cargos de ficha.
       const xianyuPending=pendingItems.filter(x=>x.source==='xianyu');
       if(xianyuPending.length){
@@ -11379,8 +11236,10 @@ async function executeTask(taskId, runId=null) {
       let lastAiError=null;
       let lastReportedProgress=30;
 
+      const analysisStartedAt=Date.now();
       const worker=async()=>{
         while(!stopRequested){
+          if(Date.now()-analysisStartedAt>analysisMaxMs)return;
           const idx=nextIndex++;
 
           if(idx>=total)return;
@@ -11501,6 +11360,15 @@ async function executeTask(taskId, runId=null) {
             ()=>worker()
           )
         );
+        // Lo que no dio tiempo a analizar vuelve a salir en la siguiente pasada.
+        if(nextIndex<total&&!stopRequested){
+          for(const item of pendingItems.slice(nextIndex)){
+            db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);
+          }
+          deferred=total-nextIndex;
+          result.status.prescreen.deferred=deferred;
+          console.log(`Task ${taskId}: ${deferred} anuncios pasan a la siguiente pasada (límite de ${Math.round(analysisMaxMs/60e3)} min de análisis por modelo).`);
+        }
       }
 
       const allAiFailed=total>0&&succeeded===0&&failed>0;
@@ -12508,7 +12376,6 @@ async function sendTaskDigest(task,runId,sessionId,items,sourceStatus){
   // Mantener aparte las oportunidades que cumplen los criterios de alerta.
   // Solo estas se registran en notifications para no romper "solo nuevos".
   let alertSelected=allItems.filter(x=>qualifiesForEmail(task,x));
-  alertSelected=alertSelected.slice(0,task.notify_max_items||8);
 
   const decisionCounts={
     'STRONG BUY':0,

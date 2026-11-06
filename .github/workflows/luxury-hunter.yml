@@ -64,10 +64,11 @@ jobs:
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       JUSTONEAPI_TOKEN: ${{ secrets.JUSTONEAPI_TOKEN }}
-      # Yahoo Auctions: Chrome del Mac primero; ReefAPI solo cuando no responde.
+      # Yahoo Subastas: solo One Map (FROM JAPAN) desde el Chrome del Mac.
       ONEMAP_MAC_BRIDGE_TOKEN: ${{ secrets.ONEMAP_MAC_BRIDGE_TOKEN }}
-      REEF_API_KEY: ${{ secrets.REEF_API_KEY }}
-      REEF_MONTHLY_SEARCH_LIMIT: ${{ vars.REEF_MONTHLY_SEARCH_LIMIT || '500' }}
+      ONEMAP_HEADED: '1'
+      # Japón: Mercari (y Yahoo por el Mac). Bunjang y Rakuten apagados.
+      JAPAN_SOURCES: ${{ vars.JAPAN_SOURCES || 'mercari-jp' }}
       XIANYU_BASE_URL: http://127.0.0.1:8000
       # justoneapi, direct (cuenta de Nil) o alternate (una búsqueda con cada uno).
       XIANYU_PROVIDER: ${{ (vars.XIANYU_PROVIDER == 'direct' || vars.XIANYU_PROVIDER == 'alternate') && vars.XIANYU_PROVIDER || 'justoneapi' }}
@@ -82,7 +83,6 @@ jobs:
       XIANYU_MONTHLY_SEARCH_LIMIT: ${{ vars.XIANYU_MONTHLY_SEARCH_LIMIT || '650' }}
       XIANYU_DAILY_SEARCH_LIMIT: ${{ vars.XIANYU_DAILY_SEARCH_LIMIT || '20' }}
       XIANYU_QUERY_TIMEOUT_SEC: ${{ vars.XIANYU_QUERY_TIMEOUT_SEC || '180' }}
-      BUNJANG_MAX_QUERIES: ${{ vars.BUNJANG_MAX_QUERIES || '2' }}
       BUYEE_MAX_QUERIES: ${{ vars.BUYEE_MAX_QUERIES || '2' }}
       PORT: '8200'
       # Velocidad: tareas en paralelo y ciclos repetidos dentro de cada ejecución.
@@ -94,7 +94,8 @@ jobs:
       # Avisos inmediatos (email siempre; Telegram si hay secretos).
       INSTANT_ALERT_DECISIONS: ${{ vars.INSTANT_ALERT_DECISIONS || 'STRONG BUY,BUY' }}
       INSTANT_ALERT_MIN_PROFIT_EUR: ${{ vars.INSTANT_ALERT_MIN_PROFIT_EUR || '' }}
-      AI_MAX_ITEMS_PER_TASK_RUN: ${{ vars.AI_MAX_ITEMS_PER_TASK_RUN || '10' }}
+      # Sin tope de anuncios: cada modelo analiza como mucho estos minutos y el resto pasa a la siguiente pasada.
+      AI_TASK_MAX_MINUTES: ${{ vars.AI_TASK_MAX_MINUTES || '15' }}
       # Informe: uno al día a partir de esta hora (Europe/Madrid).
       DIGEST_SCHEDULE: ${{ vars.DIGEST_SCHEDULE || 'daily' }}
       DIGEST_DAILY_HOUR: ${{ vars.DIGEST_DAILY_HOUR || '9' }}
@@ -171,27 +172,11 @@ jobs:
             exit 0
           fi
           echo "LH_STATE_RESTORED=1" >> "$GITHUB_ENV"
-          # Por si alguna ejecución anterior arrancó sin memoria: se juntan los
-          # avisos enviados, análisis y valoraciones de las últimas ejecuciones.
-          mkdir -p .merge
-          N=0
-          for PREV_RUN in $(gh run list --workflow luxury-hunter.yml --limit 12 --json databaseId -q '.[].databaseId' 2>/dev/null || true); do
-            [ "$PREV_RUN" = "${GITHUB_RUN_ID:-}" ] && continue
-            [ "$PREV_RUN" = "$RESTORED_RUN" ] && continue
-            [ $N -ge 5 ] && break
-            if gh run download "$PREV_RUN" -n luxury-hunter-state -D ".merge/$PREV_RUN" >/dev/null 2>&1 && [ -f ".merge/$PREV_RUN/luxury-hunter.sqlite3" ]; then
-              N=$((N+1))
-            fi
-          done
-          if [ $N -gt 0 ]; then
-            node scripts/merge-state.mjs data/luxury-hunter.sqlite3 .merge/*/luxury-hunter.sqlite3 || echo "merge-state failed (continuing)"
-          fi
-          rm -rf .merge
 
       - name: Install Luxury Hunter dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Install Chromium for Bunjang
+      - name: Install Chromium for Mercari
         run: npx playwright install --with-deps chromium
 
       - name: Ensure virtual display for One Map
@@ -200,41 +185,6 @@ jobs:
           if ! command -v xvfb-run >/dev/null 2>&1; then
             sudo apt-get update -y >/dev/null
             sudo apt-get install -y xvfb >/dev/null
-          fi
-
-      - name: Load One Map account session
-        env:
-          ONEMAP_STORAGE_STATE_B64: ${{ secrets.ONEMAP_STORAGE_STATE_B64 }}
-        shell: bash
-        run: |
-          echo "ONEMAP_HEADED=1" >> "$GITHUB_ENV"
-          if [ -z "${ONEMAP_STORAGE_STATE_B64:-}" ]; then
-            echo "ONEMAP_SESSION_STATUS=public" >> "$GITHUB_ENV"
-            echo "One Map: public searches (no account session configured)."
-            exit 0
-          fi
-          mkdir -p -m 700 .onemap
-          if ! printf '%s' "$ONEMAP_STORAGE_STATE_B64" | base64 --decode > .onemap/storage-state.json; then
-            rm -f .onemap/storage-state.json
-            echo "ONEMAP_SESSION_STATUS=invalid" >> "$GITHUB_ENV"
-            echo "::warning::One Map account session could not be decoded; public searches will continue."
-            exit 0
-          fi
-          chmod 600 .onemap/storage-state.json
-          if ONEMAP_HEADED=1 xvfb-run -a node scripts/onemap-session-check.mjs .onemap/storage-state.json; then
-            echo "ONEMAP_SESSION_STATUS=ok" >> "$GITHUB_ENV"
-            echo "ONEMAP_STORAGE_STATE_FILE=$PWD/.onemap/storage-state.json" >> "$GITHUB_ENV"
-          else
-            STATUS=$?
-            if [ "$STATUS" -eq 2 ]; then
-              echo "ONEMAP_SESSION_STATUS=expired" >> "$GITHUB_ENV"
-              echo "::warning::One Map account session has expired; public searches will continue."
-              rm -f .onemap/storage-state.json
-            else
-              echo "ONEMAP_SESSION_STATUS=unverified" >> "$GITHUB_ENV"
-              rm -f .onemap/storage-state.json
-              echo "::warning::One Map account session could not be verified; public searches will continue."
-            fi
           fi
 
       - name: Start Xianyu connector when encrypted state is configured
@@ -372,30 +322,6 @@ jobs:
           echo "$NOW" > lh-upload/xianyu-qr-last
           TEXT="🔑 La sesión de tu cuenta de Xianyu ha caducado en la nube y sus turnos no pueden buscar. Para renovarla, en tu Mac pídele a Claude «inicia sesión en Xianyu» (o ejecuta: cd ~/luxury-hunter && npm run xianyu:login)."
           curl -s -o /dev/null -w "Telegram notice HTTP %{http_code}\n" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TEXT" || echo "Could not send the renewal notice"
-
-      - name: One Map session renewal notice
-        if: always()
-        shell: bash
-        run: |
-          if [ "${ONEMAP_SESSION_STATUS:-}" != "expired" ] && [ "${ONEMAP_SESSION_STATUS:-}" != "invalid" ] && [ "${ONEMAP_SESSION_STATUS:-}" != "unverified" ]; then exit 0; fi
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
-          LAST=0
-          [ -f .state/onemap-notice-last ] && LAST=$(cat .state/onemap-notice-last)
-          [[ "$LAST" =~ ^[0-9]+$ ]] || LAST=0
-          NOW=$(date +%s)
-          mkdir -p lh-upload
-          echo "$LAST" > lh-upload/onemap-notice-last
-          if [ $((NOW-LAST)) -lt 72000 ]; then exit 0; fi
-          if [ "${ONEMAP_SESSION_STATUS:-}" = "unverified" ]; then
-            TEXT="⚠️ Luxury Hunter no pudo verificar tu sesión de One Map desde GitHub. El bot intentará usarla y, si falla, buscará sin cuenta. Revisa la ejecución de GitHub Actions; si la sesión ha caducado, renueva el secreto ONEMAP_STORAGE_STATE_B64."
-          else
-            TEXT="🔑 La sesión de One Map de Luxury Hunter ha caducado. Las búsquedas públicas siguen funcionando, pero el bot ya no usa tu cuenta. Renueva la sesión en tu Mac con npm run onemap:login y actualiza el secreto ONEMAP_STORAGE_STATE_B64 de GitHub."
-          fi
-          if curl -fsS -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$TEXT"; then
-            echo "$NOW" > lh-upload/onemap-notice-last
-          else
-            echo "::warning::Could not send the One Map renewal notice."
-          fi
 
       - name: Collect persistent state
         if: always()

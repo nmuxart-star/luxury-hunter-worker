@@ -72,7 +72,8 @@ const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
 // una ejecución vacía no encadena la siguiente y el bot se quedaba parado
 // hasta el cron de GitHub, que llega con horas de retraso.
 const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
-const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',2,0,6);
+// 0 = sin máximo de relojes por ejecución (solo manda el tiempo).
+const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',0,0,30);
 const workerStartedAt=Date.now();
 // El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
 let budgetStartedAt=workerStartedAt;
@@ -92,13 +93,16 @@ function taskMinutesEstimate(){
   }catch(e){console.warn('Sin historial de duración de tareas:',e.message);}
   return id=>{const l=byTask.get(id);return l?.length?l.reduce((a,b)=>a+b,0)/l.length:25;};
 }
-// Como runPool, pero cada hueco solo empieza una tarea si canStart lo permite.
+// Cada hueco coge la siguiente tarea, en orden de prioridad, que aún dé
+// tiempo a terminar (canStart); si la primera no cabe, prueba las siguientes
+// en vez de quedarse parado.
 async function runPool(items,limit,fn,canStart=()=>true){
-  let next=0;
+  const queue=[...items];
   await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{
-    while(next<items.length){
-      if(!canStart(items[next]))return;
-      const item=items[next++];
+    while(queue.length){
+      const i=queue.findIndex(item=>canStart(item));
+      if(i<0)return;
+      const [item]=queue.splice(i,1);
       await fn(item);
     }
   }));
@@ -173,8 +177,8 @@ try{
     // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
     // cada grupo, los que llevan más tiempo sin revisarse.
     // Bolsos de 60 min siempre primero; luego se alternan reloj y bolso de menos
-    // prioridad. Como mucho WATCH_MAX_PER_RUN (2) relojes por ejecución, por nivel y antigüedad.
-    const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN});
+    // prioridad, por nivel y antigüedad. Sin máximo de relojes (WATCH_MAX_PER_RUN=0).
+    const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN||Infinity});
     runnable=plan.tasks;
     if(plan.deferred.length)console.log(`Relojes aplazados a la siguiente ejecución: ${plan.deferred.map(t=>t.task_name).join(', ')}.`);
     const estimate=taskMinutesEstimate();
