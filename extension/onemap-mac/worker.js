@@ -47,11 +47,34 @@ async function waitForPage(tabId,search){
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
-// Cada consulta va en una ventana nueva y minimizada, aparte de las ventanas
-// de Nil, y la ventana se cierra al terminar.
+// Las consultas van en una ventana propia que se crea YA minimizada (nunca
+// en las ventanas de Nil y sin ponerse al frente): una por tanda, y se cierra
+// al terminar la tanda. Cada consulta abre su pestaña dentro de esa ventana.
+let jobWindow=null;
 async function openHidden(url){
+  if(jobWindow){
+    try{
+      const tab=await chrome.tabs.create({windowId:jobWindow.id,url,active:false});
+      return {windowId:jobWindow.id,tabId:tab.id};
+    }catch{jobWindow=null;}
+  }
   const win=await chrome.windows.create({url,focused:false,state:'minimized'});
+  jobWindow={id:win.id,firstTab:win.tabs[0].id};
   return {windowId:win.id,tabId:win.tabs[0].id};
+}
+// Cierra la pestaña de la consulta (la primera de la ventana se queda hasta
+// el final de la tanda para que la ventana no se cierre y se vuelva a crear).
+async function closeHidden(opened){
+  if(!opened?.tabId)return;
+  if(jobWindow&&opened.tabId===jobWindow.firstTab){
+    await chrome.tabs.update(opened.tabId,{url:'about:blank'}).catch(()=>{});
+    return;
+  }
+  await chrome.tabs.remove(opened.tabId).catch(()=>{});
+}
+async function closeJobWindow(){
+  if(jobWindow)await chrome.windows.remove(jobWindow.id).catch(()=>{});
+  jobWindow=null;
 }
 
 async function waitLoaded(tabId,ms=30_000){
@@ -118,7 +141,7 @@ async function handleVestiaire(job,token){
   }catch(error){
     await reply({status:502,body:String(error)}).catch(()=>{});
   }finally{
-    if(opened?.windowId)await chrome.windows.remove(opened.windowId).catch(()=>{});
+    await closeHidden(opened);
   }
 }
 
@@ -134,7 +157,7 @@ async function handle(job,token){
     await bridge(`/result/${job.id}`,token,'POST',{url:job.url,status:502,
       finalUrl:job.url,title:'',body:String(error),html:''}).catch(()=>{});
   }finally{
-    if(opened?.windowId)await chrome.windows.remove(opened.windowId).catch(()=>{});
+    await closeHidden(opened);
   }
 }
 
@@ -152,7 +175,10 @@ async function poll(){
     }
   }catch(error){
     console.warn('Luxury Hunter One Map:',error.message);
-  }finally{polling=false;}
+  }finally{
+    await closeJobWindow();
+    polling=false;
+  }
 }
 
 async function start(){
