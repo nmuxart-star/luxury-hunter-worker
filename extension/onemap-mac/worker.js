@@ -119,9 +119,26 @@ async function vestiaireSearchInPage(q){
     await wait(1200);
     // En venta, los más recientes primero (para las ofertas nuevas).
     const active=await call('',{...filters,sold:['0']},{sortBy:'recency'});
+    const items=[...(sold.items||[]),...(active.items||[])];
+    // Miniatura de la primera foto de cada anuncio (las mismas que muestra la
+    // web), para que la IA compare cada referencia con el anuncio.
+    const thumbs={};
+    const toB64=async blob=>{const b=new Uint8Array(await blob.arrayBuffer());let s='';for(let i=0;i<b.length;i+=8192)s+=String.fromCharCode(...b.subarray(i,i+8192));return btoa(s);};
+    const queue=items.filter(x=>x?.id&&Array.isArray(x.pictures)&&x.pictures[0]).slice(0,96);
+    await Promise.all([0,1,2,3].map(async k=>{
+      for(let i=k;i<queue.length;i+=4){
+        try{
+          const x=queue[i];
+          const r=await fetch(`https://images.vestiairecollective.com/images/resized/w=256,q=60,f=jpg,${x.pictures[0]}`);
+          if(!r.ok)continue;
+          const blob=await r.blob();
+          if(blob.size>0&&blob.size<60000)thumbs[x.id]=await toB64(blob);
+        }catch{}
+      }
+    }));
     return {status:200,body:JSON.stringify({query:q,model:{id:pick.id,name:pick.name,count:pick.count},
       sold_total:sold.paginationStats?.totalHits??null,active_total:active.paginationStats?.totalHits??null,
-      items:[...(sold.items||[]),...(active.items||[])]})};
+      items,thumbs})};
   }catch(error){
     return {status:error.blocked?403:502,body:String(error.message||error)};
   }

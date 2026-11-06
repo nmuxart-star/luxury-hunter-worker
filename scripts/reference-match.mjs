@@ -1,4 +1,5 @@
-// REFERENCIAS ELEGIDAS POR LA IA (regla de Nil, 06-11-2026)
+// REFERENCIAS ELEGIDAS POR LA IA (regla de Nil, 06-11-2026; v2 07-11: solo las
+// comprobadas con foto, sin precio orientativo)
 // La IA no pone precio: mira el anuncio (modelo, talla, material, estado,
 // calidad) y, una a una, las referencias de la hoja de Nil y de Vestiaire en
 // directo, y dice cuáles son el MISMO producto con un estado parecido. Con
@@ -6,7 +7,7 @@
 // de más likes pesan más) y decide con los números.
 import {compWeight,compStats,weightedQuantile} from './vestiaire-bag-match.mjs';
 
-export const MATCH_VERSION='ai-refs-v1';
+export const MATCH_VERSION='ai-refs-v2';
 const refId=r=>String(r?.id||r?.url||'').match(/(\d{5,})(?:\.shtml)?$/)?.[1]||String(r?.id||r?.url||'');
 const clip=(t,n)=>String(t??'').replace(/\s+/g,' ').trim().slice(0,n);
 
