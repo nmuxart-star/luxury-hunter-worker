@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import {DatabaseSync} from 'node:sqlite';
-import {strictBagComparables,bagDimensions,sameBagDimensions,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION} from '../scripts/vestiaire-bag-match.mjs';
+import {strictBagComparables,bagDimensions,sameBagDimensions,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,compWeight,compStats,refAgeDays,recencyFactor,weightedQuantile} from '../scripts/vestiaire-bag-match.mjs';
 
 // Representative columns/values read from Nil's live Lady Dior sheet.
 const row={id:'71332269',brand:'Dior',size:'Medium',dims:'24x20x11',material:'Piel',color:'Gris',condition:'Buen estado',price_eur:998,sold:false};
@@ -88,7 +88,7 @@ test('deterministic gate forbids BUY and STRONG BUY without fresh eligible Sheet
 const source=fs.readFileSync(new URL('../server.mjs',import.meta.url),'utf8');
 const extract=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
 function harness(extra={}){
-  const ctx=vm.createContext({applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,strictBagComparables,
+  const ctx=vm.createContext({applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,strictBagComparables,compWeight,compStats,weightedQuantile,
     roundMoney:n=>Math.round(n*100)/100,clampNum:(n,l,h)=>Math.max(l,Math.min(h,Number(n)||0)),
     vestiaireComparablesNote:()=> 'Sheets comparables',clampResaleToAnchor:()=>{throw Error('unexpected loose anchor');},
     isWatchTask:s=>/Tudor/.test(s||''),vestiaireSheetCache:{tasks:{'Lady Dior':{source:'sheet',fichas:[row]}}},
@@ -170,4 +170,44 @@ test('las vendidas y las que tienen más likes pesan más en el precio',()=>{
   const s=match([{...row,id:'s',sold:true,sold_price_eur:900},{...row,id:'x',price_eur:2000},{...row,id:'y',price_eur:2100}]);
   assert.equal(s.mid,900);
   assert.equal(s.weighted.length,3);
+});
+
+test('peso: las recientes, las vendidas y las de más likes cuentan más',()=>{
+  const now=Date.UTC(2026,10,6);
+  assert.equal(Math.round(refAgeDays({published:'2026-10-07'},now)),30);
+  assert.equal(Math.round(refAgeDays({published:'07/10/2026'},now)),30);
+  assert.equal(Math.round(refAgeDays({created_at:'2026-11-01T10:00:00.000Z'},now)),5);
+  assert.equal(refAgeDays({published:'sin fecha'},now),null);
+  assert.equal(recencyFactor(10),2);assert.equal(recencyFactor(180),1);assert.equal(recencyFactor(400),0.7);assert.equal(recencyFactor(null),1);
+  const fresh={published:'2026-11-01',likes:10}, old={published:'2025-06-01',likes:10};
+  assert.ok(compWeight(fresh,now)>compWeight(old,now)*2.5);
+  assert.ok(compWeight({...old,sold:true},now)>compWeight(old,now));
+  assert.ok(compWeight({...fresh,likes:200},now)>compWeight(fresh,now));
+  assert.deepEqual(compStats([fresh,old,{sold:true,likes:300}],now),{sold_n:1,recent_n:1,dated_n:2,likes_max:300});
+});
+
+test('aviso: tu base y Vestiaire en bloques separados, con fecha, likes y vendidos',()=>{
+  const ago=d=>new Date(Date.now()-d*86400e3).toISOString().slice(0,10);
+  const comps={tier:'iguales',basis:'medidas declaradas 24 × 20 × 11 cm',colour:'gris',material:'leather',model:'Lady Dior',n:3,low:900,mid:1000,high:1100,
+    price_basis:'mixed',ratio:0.92,sold_n:1,recent_n:2,likes_max:80,
+    picks:[{url:'https://x/1',size:'Medium',color:'Gris',price_eur:1200,sold:true,sold_price_eur:1100,likes:80,published:ago(3)}]};
+  const live={status:'ok',tier:'misma_talla',n:5,model:'Lady Dior',material:'piel',basis:'talla medium',low:1500,mid:1700,high:1900,sold_n:2,active_n:3,recent_n:4,likes_max:50,
+    picks:[{url:'https://x/9',size:'medium',color:'Negro',price_eur:1800,sold:false,likes:50,created_at:new Date(Date.now()-86400e3).toISOString()}]};
+  const blend={n_live:4,low:1000,high:1600};
+  const ctx=vm.createContext({refAgeDays,isWatchTask:()=>false,vestiaireCompsFor:()=>comps,htmlEsc:s=>String(s),eur0:n=>`${Math.round(n)} €`,
+    VESTIAIRE_LIVE_WHY:{mac_offline:'el Chrome del Mac no estaba encendido'},JSON});
+  vm.runInContext(extract('function refAgeText(','function vestiaireDbLines('),ctx);
+  const item={verification_json:JSON.stringify({market:{vestiaire_live:live,vestiaire_blend:blend}})};
+  const c=ctx.vestiaireCompareSections('Lady Dior',item);
+  const base=c.base.join('\n'), lv=c.live.join('\n');
+  assert.match(base,/Precio: <b>900 € – 1100 €<\/b>/);
+  assert.match(base,/1 vendidas · 2 publicadas en los últimos 30 días · hasta 80 ❤️/);
+  assert.match(base,/✅ vendido a 1100 € · publicado hace 3 días · 80 ❤️/);
+  assert.doesNotMatch(base,/1500/);
+  assert.match(lv,/Precio: <b>1500 € – 1900 €<\/b>/);
+  assert.match(lv,/en venta a 1800 € · publicado ayer · 50 ❤️/);
+  assert.match(c.used,/se juntan las dos.*1000 € – 1600 €/);
+  const off=ctx.vestiaireCompareSections('Lady Dior',{verification_json:JSON.stringify({market:{vestiaire_live:{status:'mac_offline'}}})});
+  assert.match(off.live.join(' '),/Sin datos: el Chrome del Mac no estaba encendido/);
+  assert.match(off.used,/se usa tu base/);
 });

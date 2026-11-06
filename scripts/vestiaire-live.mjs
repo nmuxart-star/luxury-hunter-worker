@@ -4,7 +4,7 @@
 // One Map) y la reventa sale de los anuncios del mismo modelo y material:
 // primero los vendidos; si hay pocos, los pedidos × 92 %.
 import {materialClass, modelNorm} from './vestiaire-model.mjs';
-import {bagDimensions,compWeight,weightedQuantile} from './vestiaire-bag-match.mjs';
+import {bagDimensions,compWeight,compStats,weightedQuantile} from './vestiaire-bag-match.mjs';
 
 export const VESTIAIRE_LIVE_REALIZATION=0.92;
 const ORIGIN='https://es.vestiairecollective.com';
@@ -68,7 +68,7 @@ export function vestiaireLiveRows(payload){
 // Franja de reventa con los anuncios del mismo modelo y material; misma talla
 // si el anuncio la dice (si no hay 3 de su talla, todas las tallas, orientativo).
 // Cuentan todos (vendidos a su precio; en venta, pedido × 92 %), pero los
-// vendidos y los que tienen más likes pesan más (compWeight).
+// vendidos, los recientes y los que tienen más likes pesan más (compWeight).
 export function vestiaireLiveComparables(rows,item={},exact={},{query=null,model=null}={}){
   const itemMat=materialClass(known(exact.material)?exact.material:`${item.title||''} ${item.description||''}`);
   const brand=modelNorm(known(exact.brand)?exact.brand:item.brand||'').replace(/^yves /,'');
@@ -91,6 +91,7 @@ export function vestiaireLiveComparables(rows,item={},exact={},{query=null,model
     basis:tier==='misma_talla'?`talla ${size}`:size?`todas las tallas (solo ${sized.length} en ${size})`:'todas las tallas',
     n:set.length,total:set.length,sold_n:sold.length,active_n:set.length-sold.length,
     price_basis:sold.length===set.length?'sold':sold.length?'mixed':'asking',low:q(.25),mid,high:q(.75),
+    recent_n:compStats(set).recent_n,likes_max:compStats(set).likes_max,
     weighted:weighted.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),picks};
 }
 
@@ -115,13 +116,19 @@ export function blendComparables(sheet,live){
 // de comprador) y revendiéndolo en Vestiaire (−20 % de comisión) a la parte
 // baja de lo que valen los del mismo modelo, talla y material, deja al menos
 // minProfitEur limpios y minMarginPct de margen. Comparables: los demás
-// anuncios (los vendidos y los de más likes pesan más). Los de estado
+// anuncios (los vendidos, los recientes y los de más likes pesan más). Los de estado
 // "Correcto" no se proponen; los de "Buen estado" se valoran un 10 % más bajo.
 export function vestiaireDeals(candidates,pool,{buyerFeePct=10,buyerShippingEur=20,sellFeePct=20,minProfitEur=200,minMarginPct=20,minComps=4,sizeOf:sizeFn=null}={}){
   const sizeOf=r=>(sizeFn&&sizeFn(r))||liveSizeOf(`${r.size||''} ${r.title||''} ${r.notes||''}`);
   const norm=(pool||[]).map(r=>({...r,_id:refId(r.id||r.url),_size:sizeOf(r),_mat:materialClass(String(r.material||'').trim()||r.notes),
     _value:r.sold?(Number(r.sold_price_eur)>0?Number(r.sold_price_eur):Number(r.price_eur)):(r.excluded?null:Number(r.price_eur)*VESTIAIRE_LIVE_REALIZATION)}))
     .filter(r=>Number.isFinite(r._value)&&r._value>0);
+  // Un anuncio que está en la base y en Vestiaire en directo cuenta una vez,
+  // como de la base (r._src==='base').
+  const byId=new Map();
+  for(const r of norm){const prev=byId.get(r._id);if(!prev||(r._src==='base'&&prev._src!=='base'))byId.set(r._id,r);}
+  const pooled=[...byId.values()];
+  const pickOf=r=>({url:r.url,title:r.title||'',size:r.size,color:r.color,condition:r.condition,price_eur:r.sold?(r.sold_price_eur??r.price_eur):r.price_eur,sold:!!r.sold,likes:r.likes,published:r.published||null,created_at:r.created_at||null});
   const out=[];
   for(const c of candidates||[]){
     const price=Number(c.price_eur);
@@ -130,19 +137,28 @@ export function vestiaireDeals(candidates,pool,{buyerFeePct=10,buyerShippingEur=
     const size=sizeOf(c), mat=materialClass(String(c.material||'').trim()||c.notes);
     if(!size||!mat)continue;
     const id=refId(c.id||c.url);
-    const comps=norm.filter(r=>r._id!==id&&r._size===size&&r._mat===mat);
+    const comps=pooled.filter(r=>r._id!==id&&r._size===size&&r._mat===mat);
     if(comps.length<minComps)continue;
     const weighted=comps.map(r=>({v:r._value,w:compWeight(r),s:!!r.sold}));
     const haircut=/^buen estado|^good/i.test(String(c.condition||'').trim())?0.9:1;
     const q=p=>Math.round(weightedQuantile(weighted,p)*haircut);
     const low=q(.25),mid=q(.5),high=q(.75);
+    // Por separado, para el aviso: tu base y Vestiaire en directo.
+    const part=src=>{
+      const rows=comps.filter(r=>(r._src==='base')===(src==='base'));
+      if(!rows.length)return {n:0};
+      const w=rows.map(r=>({v:r._value,w:compWeight(r),s:!!r.sold}));
+      const qq=p=>Math.round(weightedQuantile(w,p)*haircut);
+      return {n:rows.length,...compStats(rows),low:qq(.25),mid:qq(.5),high:qq(.75),
+        picks:rows.slice().sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,3).map(pickOf)};
+    };
     const cost=Math.round(price*(1+buyerFeePct/100)+buyerShippingEur);
     const net=r=>Math.round(r*(1-sellFeePct/100)-cost);
     const netLow=net(low),netHigh=net(high);
     if(netLow<minProfitEur||netLow/cost*100<minMarginPct)continue;
     out.push({...c,deal:{size,material:mat,n:comps.length,sold_n:weighted.filter(x=>x.s).length,low,mid,high,cost,net_low:netLow,net_high:netHigh,
-      margin_pct:Math.round(netLow/cost*100),haircut:haircut<1,
-      picks:comps.sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,4).map(r=>({url:r.url,title:r.title||'',size:r.size,color:r.color,condition:r.condition,price_eur:r.sold?(r.sold_price_eur??r.price_eur):r.price_eur,sold:!!r.sold,likes:r.likes}))}});
+      margin_pct:Math.round(netLow/cost*100),haircut:haircut<1,base:part('base'),live:part('live'),
+      picks:comps.sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,4).map(pickOf)}});
   }
   return out.sort((a,b)=>b.deal.net_low-a.deal.net_low);
 }

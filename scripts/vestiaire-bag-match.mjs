@@ -59,11 +59,38 @@ export function bagCondition(text){
 const valueOf=(f,ratio)=>f.sold
   ? (!f.sold_price_suspect&&Number.isFinite(f.sold_price_eur)&&f.sold_price_eur>0?f.sold_price_eur:null)
   : (!f.excluded&&Number.isFinite(f.price_eur)&&f.price_eur>0?f.price_eur*ratio:null);
+// Días desde que se publicó la referencia (hoja: "Publicado"; Vestiaire en
+// directo: created_at). Acepta 2026-10-05, 05/10/2026 y fechas ISO.
+export function refAgeDays(f,now=Date.now()){
+  const raw=String(f?.published||f?.created_at||'').trim();
+  if(!raw)return null;
+  const dmy=raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
+  const ms=dmy?Date.UTC(Number(dmy[3])<100?2000+Number(dmy[3]):Number(dmy[3]),Number(dmy[2])-1,Number(dmy[1])):Date.parse(raw);
+  return Number.isFinite(ms)?Math.max(0,(now-ms)/86400e3):null;
+}
+// Lo reciente pesa más: hasta 30 días ×2, baja a ×1 a los 6 meses y a ×0,7
+// pasado un año. Sin fecha, ×1.
+export function recencyFactor(days){
+  if(days==null||!Number.isFinite(days))return 1;
+  if(days<=30)return 2;
+  if(days<=180)return 2-(days-30)/150;
+  if(days<=365)return 1-0.3*(days-180)/185;
+  return 0.7;
+}
 // Peso de cada referencia en el precio (regla de Nil): las vendidas cuentan
-// el triple y los likes suben el peso poco a poco (0 → ×1, 7 → ×2, 63 → ×3).
-export function compWeight(f){
+// el triple, los likes suben el peso poco a poco (0 → ×1, 7 → ×2, 63 → ×3) y
+// las recientes pesan más (recencyFactor).
+export function compWeight(f,now=Date.now()){
   const likes=Math.max(0,Number(f?.likes)||0);
-  return (f?.sold?3:1)*(1+Math.log2(1+Math.min(likes,1000))/3);
+  return (f?.sold?3:1)*(1+Math.log2(1+Math.min(likes,1000))/3)*recencyFactor(refAgeDays(f,now));
+}
+// Resumen para el aviso: cuántas vendidas, cuántas de los últimos 30 días y
+// el máximo de likes.
+export function compStats(rows,now=Date.now()){
+  const list=rows||[];
+  const ages=list.map(f=>refAgeDays(f,now));
+  return {sold_n:list.filter(f=>f?.sold).length,recent_n:ages.filter(a=>a!=null&&a<=30).length,
+    dated_n:ages.filter(a=>a!=null).length,likes_max:Math.max(0,...list.map(f=>Number(f?.likes)||0))};
 }
 // Cuantil ponderado: el primer valor cuyo peso acumulado llega a p del total.
 export function weightedQuantile(list,p){
@@ -137,7 +164,7 @@ export function strictBagComparables(entries,item={},exact={}){
     basis:`medidas declaradas ${dims.join(' × ')} cm`,colour:color,material:mat,
     condition, buy_eligible:dims.length===3&&!!condition&&Number(exact.confidence)>=.75&&Number(exact.condition?.confidence)>=.6&&selected.every(f=>f.details_confirmed),n:values.length,low:q(.25),mid:q(.5),high:q(.75),ratio,
     price_basis:sales.length?(sales.length===selected.length?'sold':'mixed'):'asking',ratio_source:ratios.length>=5?'recorded_sales':'assumption',sold_n:sales.length,
-    weighted:weighted.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),
+    weighted:weighted.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),...compStats(selected),
     picks:selected.sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,5)};
 }
 

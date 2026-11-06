@@ -77,3 +77,16 @@ test('ofertas en Vestiaire: solo si deja beneficio limpio frente a los iguales',
   assert.ok(d.net_low>=200);
   assert.equal(d.picks[0].sold,true);
 });
+
+test('ofertas: precio de tu base y de Vestiaire por separado, sin contar dos veces el mismo anuncio',()=>{
+  const r=(id,price,{sold=false,likes=0,src}={})=>({id,url:`https://es.vestiairecollective.com/x-${id}.shtml`,title:'Bolso',price_eur:price,sold,sold_price_eur:sold?price:null,likes,size:'medium',material:'cuero',condition:'Muy buen estado',...(src?{_src:src}:{})});
+  const base=[r(1,3000,{sold:true,src:'base'}),r(2,3100,{src:'base'}),r(7,2800,{sold:true,src:'base'})];
+  const live=[r(1,3000,{sold:true}),r(3,3300,{sold:true}),r(4,3400),r(5,3200,{likes:30})];
+  const cheap=r(10,1400);
+  const [d]=vestiaireDeals([cheap],[...live,cheap,...base]);
+  assert.equal(d.deal.n,6);                 // el 1 está en las dos: cuenta una vez
+  assert.equal(d.deal.base.n,3);assert.equal(d.deal.live.n,3);
+  assert.equal(d.deal.base.sold_n,2);
+  assert.ok(d.deal.base.high<=3100&&d.deal.live.low>=3200*0.92-1);
+  assert.equal(d.deal.base.picks[0].sold,true);
+});
