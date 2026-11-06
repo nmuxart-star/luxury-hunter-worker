@@ -4597,7 +4597,9 @@ function vestiaireSheetTab(values,today,formulas=null){
     const sold=/vendido/i.test(String(get(row,c.status)||''));
     // "Eliminado (sin precio)": desapareció sin precio de venta; no es una
     // venta confirmada, cuenta como lo que pedía.
-    const removed=sold&&/eliminad/i.test(String(get(row,c.sold)||''));
+    // Lo mismo si figura vendido sin precio de venta (Chrono24 retira el
+    // anuncio y no se sabe a cuánto se vendió).
+    const removed=sold&&(/eliminad/i.test(String(get(row,c.sold)||''))||!Number.isFinite(sheetNumber(get(row,c.sold))));
     const askPrice=sheetNumber(get(row,c.price));
     let soldPrice=sheetNumber(get(row,c.sold));
     // Un precio de venta muy lejos del precio pedido suele ser una referencia
@@ -8173,6 +8175,8 @@ Do three things:
 2. JUDGE THE LISTING: condition grade, visible wear or damage, completeness (box, dust bag, card, strap, papers for watches), photo quality and how much can be checked, and authenticity risk. quality_score 0-100 = how good the item and the listing are (100 = like new, complete, many clear photos; 50 = normal used item with average photos; below 30 = damaged, incomplete or impossible to check). authenticity_risk HIGH only with concrete evidence (replica wording, failed verification, clear defects of a fake); suspicion alone is MEDIUM.
 3. PRE-SELECT REFERENCES ONE BY ONE. Below are reference listings from Nil's database (codes B…) and from Vestiaire Collective right now (codes V…). For EVERY reference decide if it can be the SAME PRODUCT as the listing: same model AND same version/size/format (Mini ≠ Small ≠ regular ≠ Large; different measurements = different product), same material family (colour may differ), and a SIMILAR CONDITION (at most one grade apart). Put the ones the text confirms in *_same. Put in *_similar the ones of the same model whose size/version or condition the text does not make clear (they will be checked with photos). Leave out everything that is clearly another model, size, material or format. Use only what the reference text says; do not guess.
 
+WATCHES: the same product means the same reference family (2541.80 ≠ 2531.80), the same movement type (quartz ≠ automatic ≠ chronograph), the same case size and material. Check the reference number, "quartz/quarzo/クオーツ/石英" and "automatic/automatico/自動巻き/自动" words in titles and notes.
+
 EXOTIC SKIN POLICY: genuine crocodile, alligator, python/snake, ostrich, lizard or stingray → exotic_skin true.
 
 Return ONLY JSON:
@@ -8220,6 +8224,7 @@ The first images are the LISTING. After them come the REFERENCE photos, each one
 For EACH reference decide if it is the SAME PRODUCT as the listing:
 - same brand and model, and the same version/size/format: same silhouette and proportions, same closure, handle/strap type and hardware style; measurements within about 15 % when both are known. Mini, Small, regular and Large are different products.
 - same material family (smooth or grained leather, canvas, nylon, suede, exotic...). Colour may differ.
+- WATCHES: same reference family (2541.80 ≠ 2531.80), same movement (quartz ≠ automatic), same case size and material; dial colour must match.
 - condition at most one grade apart.
 If the reference photo shows another bag or another product, or you cannot tell the size/version apart from the listing (for example mini and regular look alike and nothing confirms it), it is NOT the same. A reference without photo can only be confirmed if its text gives the same size or measurements and version.
 Also re-judge the LISTING with all its photos (no prices): condition, completeness, quality and authenticity risk, as before.
@@ -10695,8 +10700,10 @@ function refAgeText(f){
 function refPickLine(f,{material=true}={}){
   const desc=htmlEsc([f.size,f.dims?`${f.dims} cm`:'',material?f.material:'',f.color,f.condition].filter(Boolean).join(' · ')||f.title||'Anuncio');
   const sold=Number.isFinite(Number(f.sold_price_eur))&&Number(f.sold_price_eur)>0?Number(f.sold_price_eur):Number(f.price_eur);
-  const bits=[f.sold?`✅ vendido a ${eur0(sold)}`:`en venta a ${eur0(f.price_eur)}`,refAgeText(f),Number(f.likes)>0?`${f.likes} ❤️`:''].filter(Boolean);
-  return `   · <a href="${htmlEsc(f.url)}">${desc}</a> · ${bits.join(' · ')}`;
+  const bits=[f.sold?`✅ vendido a ${eur0(sold)}`:f.removed?`retirado sin precio de venta (pedía ${eur0(f.price_eur)})`:`en venta a ${eur0(f.price_eur)}`,refAgeText(f),Number(f.likes)>0?`${f.likes} ❤️`:''].filter(Boolean);
+  // Chrono24 borra los anuncios vendidos: el enlace ya no abre el reloj.
+  const gone=(f.sold||f.removed)&&/chrono24\./i.test(String(f.url||''))?' · el enlace ya no abre el reloj (Chrono24 borra los vendidos)':'';
+  return `   · <a href="${htmlEsc(f.url)}">${desc}</a> · ${bits.join(' · ')}${gone}`;
 }
 function refSummaryLines(c,askPct){
   const recent=Number.isFinite(Number(c.recent_n))?`${c.recent_n} publicadas en los últimos 30 días`:'';

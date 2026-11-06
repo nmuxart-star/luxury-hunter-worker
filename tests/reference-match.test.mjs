@@ -125,9 +125,9 @@ test('hoja: foto y enlace de las fórmulas; "Eliminado (sin precio)" no es una v
   vm.runInContext(extract('function sheetNumber(','async function loadVestiaireSheet('),ctx);
   const head=['Foto','Marca','Likes','Referencia','Talla / tipo','Medidas (cm)','Material','Color','Estado','Precio €','Precio antes €','Rebaja %','País','Vintage','We Love','Publicado','Notas','Vendedor','Perfil vendedor','Enlace','Estado anuncio','Comprobado el','Precio venta €'];
   const row=(id,status,sold='')=>{const r=Array(23).fill('');r[1]='Saint Laurent';r[3]=id;r[4]='Le 5 à 7';r[9]=1200;r[19]='Ver anuncio';r[20]=status;r[22]=sold;return r;};
-  const values=[head,row('73042958','Vendido','Eliminado (sin precio)'),row('73066885','Operativo'),row('72301813','Referencia errónea'),row('73078626','Vendido',1100)];
+  const values=[head,row('73042958','Vendido','Eliminado (sin precio)'),row('73066885','Operativo'),row('72301813','Referencia errónea'),row('73078626','Vendido',1100),row('49547258','Vendido','')];
   const f=r=>{const x=Array(23).fill('');x[0]=`=IMAGE("https://drive.google.com/uc?export=view&id=F${r}";4;108;144)`;x[19]=`=HYPERLINK("https://es.vestiairecollective.com/${r}.shtml";"Ver anuncio")`;return x;};
-  const formulas=[head,f('73042958'),f('73066885'),f('72301813'),f('73078626')];
+  const formulas=[head,f('73042958'),f('73066885'),f('72301813'),f('73078626'),f('49547258')];
   const t=ctx.vestiaireSheetTab(values,'2026-11-07',formulas);
   const by=Object.fromEntries(t.fichas.map(x=>[x.id,x]));
   assert.equal(by['72301813'],undefined);
@@ -135,6 +135,8 @@ test('hoja: foto y enlace de las fórmulas; "Eliminado (sin precio)" no es una v
   assert.equal(by['73042958'].removed,true);
   assert.equal(by['73078626'].sold,true);
   assert.equal(by['73078626'].sold_price_eur,1100);
+  assert.equal(by['49547258'].sold,false);               // vendido sin precio: no es venta confirmada
+  assert.equal(by['49547258'].removed,true);
   assert.equal(by['73066885'].photo,'https://drive.google.com/uc?export=view&id=F73066885');
   assert.equal(by['73066885'].url,'https://es.vestiairecollective.com/73066885.shtml');
 });
