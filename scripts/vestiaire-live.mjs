@@ -15,12 +15,27 @@ const SIZES=[['nano',/\bnano\b/i],['micro',/\bmicro\b|マイクロ/i],['mini',/\
   ['tpm',/\btpm\b/i],['pm',/\bpm\b/i],['mm',/\bmm\b/i],['gm',/\bgm\b/i],['bb',/\bbb\b/i]];
 export const liveSizeOf=t=>(SIZES.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 
+// Nombres de modelo distintos en Vestiaire: el Classic Flap de Chanel es
+// "Timeless/Classique".
+const VESTIAIRE_ALIASES=[[/classic flap|timeless|classique|11[.\s]?12|经典翻盖|マトラッセ/i,'chanel timeless classique']];
+// Búsqueda por tarea (para las ofertas de Vestiaire): el nombre de la tarea,
+// sin palabras de relleno; null si Vestiaire no tiene ese modelo.
+export function vestiaireTaskQuery(taskName){
+  const t=String(taskName||'');
+  if(/radar|murakami/i.test(t))return null;
+  const alias=VESTIAIRE_ALIASES.find(([re])=>re.test(t));
+  if(alias)return alias[1];
+  const q=modelNorm(t).replace(/[^a-z0-9 ]+/g,' ').replace(/\b(bag|bolso|matelasse)\b/g,' ').replace(/\s+/g,' ').trim();
+  return q.length>=3?q.slice(0,70):null;
+}
 // Texto de búsqueda: marca + modelo identificados (sin repetir la marca).
 export function vestiaireLiveQuery(item={},exact={}){
   const brand=String((known(exact.brand)&&exact.brand)||item.brand||'').trim();
   const family=String((known(exact.family)&&exact.family)||item.model||'').trim();
   const clean=t=>t.replace(/[^\p{Script=Latin}\d\s'&.-]/gu,' ').replace(/\s+/g,' ').trim();
   const fam=clean(family);
+  const alias=VESTIAIRE_ALIASES.find(([re])=>re.test(`${family} ${brand}`)&&/chanel/i.test(`${brand} ${family} ${item.title||''}`));
+  if(alias)return alias[1];
   if(fam.length<3)return null;
   const b=clean(brand);
   const q=b&&!modelNorm(fam).includes(modelNorm(b))?`${b} ${fam}`:fam;
@@ -43,7 +58,9 @@ export function vestiaireLiveRows(payload){
     out.push({id,url:`${ORIGIN}${x.link}`,title:String(x.name||''),brand:x.brand?.name||'',model:x.model?.name||'',
       price_eur:Math.round(cents)/100,sold:x.sold===true,likes:Number.isFinite(Number(x.likes))?Number(x.likes):null,
       color:x.colors?.all?.[0]?.name||'',condition:x.condition?.label||'',material:slug,
-      size:liveSizeOf(`${x.name||''} ${x.description||''}`),dims:dims?dims.join('x'):'',notes:String(x.description||'').slice(0,300)});
+      size:liveSizeOf(`${x.name||''} ${x.description||''}`),dims:dims?dims.join('x'):'',notes:String(x.description||'').slice(0,300),
+      picture:Array.isArray(x.pictures)&&x.pictures[0]?`https://images.vestiairecollective.com/images/resized/w=1024,q=75,f=jpg,${x.pictures[0]}`:`https://images.vestiairecollective.com/images/resized/w=1024,q=75,f=jpg,/produit/${id}-1_1.jpg`,
+      created_at:Number(x.createdAt)>0?new Date(Number(x.createdAt)*1000).toISOString():null});
   }
   return out;
 }
@@ -91,4 +108,41 @@ export function blendComparables(sheet,live){
   const q=p=>Math.round(weightedQuantile(all,p));
   return {n:all.length,n_sheet:sheet.weighted.length,n_live:extra.length,sold_n:all.filter(x=>x.s).length,
     low:q(.25),mid:q(.5),high:q(.75)};
+}
+
+// OFERTAS DENTRO DE VESTIAIRE
+// Un anuncio en venta de Vestiaire es oferta si, comprándolo (precio + gastos
+// de comprador) y revendiéndolo en Vestiaire (−20 % de comisión) a la parte
+// baja de lo que valen los del mismo modelo, talla y material, deja al menos
+// minProfitEur limpios y minMarginPct de margen. Comparables: los demás
+// anuncios (los vendidos y los de más likes pesan más). Los de estado
+// "Correcto" no se proponen; los de "Buen estado" se valoran un 10 % más bajo.
+export function vestiaireDeals(candidates,pool,{buyerFeePct=10,buyerShippingEur=20,sellFeePct=20,minProfitEur=200,minMarginPct=20,minComps=4,sizeOf:sizeFn=null}={}){
+  const sizeOf=r=>(sizeFn&&sizeFn(r))||liveSizeOf(`${r.size||''} ${r.title||''} ${r.notes||''}`);
+  const norm=(pool||[]).map(r=>({...r,_id:refId(r.id||r.url),_size:sizeOf(r),_mat:materialClass(String(r.material||'').trim()||r.notes),
+    _value:r.sold?(Number(r.sold_price_eur)>0?Number(r.sold_price_eur):Number(r.price_eur)):(r.excluded?null:Number(r.price_eur)*VESTIAIRE_LIVE_REALIZATION)}))
+    .filter(r=>Number.isFinite(r._value)&&r._value>0);
+  const out=[];
+  for(const c of candidates||[]){
+    const price=Number(c.price_eur);
+    if(!(price>0)||c.sold)continue;
+    if(/correcto|fair|aceptable/i.test(String(c.condition||'')))continue;
+    const size=sizeOf(c), mat=materialClass(String(c.material||'').trim()||c.notes);
+    if(!size||!mat)continue;
+    const id=refId(c.id||c.url);
+    const comps=norm.filter(r=>r._id!==id&&r._size===size&&r._mat===mat);
+    if(comps.length<minComps)continue;
+    const weighted=comps.map(r=>({v:r._value,w:compWeight(r),s:!!r.sold}));
+    const haircut=/^buen estado|^good/i.test(String(c.condition||'').trim())?0.9:1;
+    const q=p=>Math.round(weightedQuantile(weighted,p)*haircut);
+    const low=q(.25),mid=q(.5),high=q(.75);
+    const cost=Math.round(price*(1+buyerFeePct/100)+buyerShippingEur);
+    const net=r=>Math.round(r*(1-sellFeePct/100)-cost);
+    const netLow=net(low),netHigh=net(high);
+    if(netLow<minProfitEur||netLow/cost*100<minMarginPct)continue;
+    out.push({...c,deal:{size,material:mat,n:comps.length,sold_n:weighted.filter(x=>x.s).length,low,mid,high,cost,net_low:netLow,net_high:netHigh,
+      margin_pct:Math.round(netLow/cost*100),haircut:haircut<1,
+      picks:comps.sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,4).map(r=>({url:r.url,title:r.title||'',size:r.size,color:r.color,condition:r.condition,price_eur:r.sold?(r.sold_price_eur??r.price_eur):r.price_eur,sold:!!r.sold,likes:r.likes}))}});
+  }
+  return out.sort((a,b)=>b.deal.net_low-a.deal.net_low);
 }

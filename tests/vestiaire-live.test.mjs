@@ -55,3 +55,25 @@ test('base + Vestiaire: la base pesa el doble y no se cuenta dos veces el mismo 
   assert.equal(blendComparables(sheet,{...live,tier:'mismo_modelo'}),null);
   assert.equal(blendComparables(sheet,{...live,weighted:[live.weighted[0]]}),null);
 });
+
+import {vestiaireTaskQuery,vestiaireDeals} from '../scripts/vestiaire-live.mjs';
+test('búsqueda por tarea: nombres de Vestiaire y tareas sin modelo',()=>{
+  assert.equal(vestiaireTaskQuery('Chanel Classic Flap'),'chanel timeless classique');
+  assert.equal(vestiaireTaskQuery('Loewe Puzzle bag'),'loewe puzzle');
+  assert.equal(vestiaireTaskQuery('Hermes Evelyne'),'hermes evelyne');
+  assert.equal(vestiaireTaskQuery('Radar oportunidades'),null);
+  assert.equal(vestiaireTaskQuery('Louis Vuitton Murakami Multicolore'),null);
+  assert.equal(vestiaireLiveQuery({title:'Chanel classic flap medium'},{brand:'Chanel',family:'Classic Flap'}),'chanel timeless classique');
+});
+test('ofertas en Vestiaire: solo si deja beneficio limpio frente a los iguales',()=>{
+  const r=(id,price,{sold=false,likes=0,size='medium',material='cuero',condition='Muy buen estado'}={})=>({id,url:`https://es.vestiairecollective.com/x-${id}.shtml`,title:'Bolso Lady Dior',price_eur:price,sold,sold_price_eur:sold?price:null,likes,size,material,condition});
+  const pool=[r(1,3000,{sold:true}),r(2,3100,{sold:true}),r(3,2900,{sold:true,likes:40}),r(4,3200),r(5,3000,{material:'sintetico'}),r(6,1500,{size:'mini'})];
+  const cheap=r(10,1400), fair=r(11,2300), worn=r(12,1200,{condition:'Correcto'}), noSize=r(13,1200,{size:''});
+  const deals=vestiaireDeals([cheap,fair,worn,noSize],[...pool,cheap,fair,worn,noSize]);
+  assert.deepEqual(deals.map(d=>d.id),[10]);
+  const d=deals[0].deal;
+  assert.equal(d.cost,1560);           // 1.400 + 10 % + 20 €
+  assert.equal(d.n,6);                 // misma talla y material, sin él mismo
+  assert.ok(d.net_low>=200);
+  assert.equal(d.picks[0].sold,true);
+});

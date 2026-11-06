@@ -19,7 +19,7 @@ import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION} from '.
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {searchReefYahoo} from './scripts/reef-yahoo.mjs';
 import {macOneMapReady,macOneMapSnapshot,macVestiaireSearch} from './scripts/onemap-mac-client.mjs';
-import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables} from './scripts/vestiaire-live.mjs';
+import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables,vestiaireTaskQuery,vestiaireDeals} from './scripts/vestiaire-live.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -5009,7 +5009,7 @@ function saveSetting(key,value){
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
     .run(key,JSON.stringify(value),new Date().toISOString());
 }
-async function vestiaireLiveSearchRows(query){
+async function vestiaireLiveSearchRows(query,{maxAgeHours=null}={}){
   if(['0','false','off','no'].includes(String(process.env.VESTIAIRE_LIVE||'').toLowerCase()))return {status:'disabled'};
   const token=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
   if(!token)return {status:'no_mac'};
@@ -5017,12 +5017,12 @@ async function vestiaireLiveSearchRows(query){
   const ttl=Number(process.env.VESTIAIRE_LIVE_CACHE_HOURS||12)*3600e3;
   const cache=getSetting('vestiaire_live_cache',{})||{};
   const hit=cache[query];
-  if(hit&&now-Date.parse(hit.at)<ttl)return {status:'ok',cached:true,rows:hit.rows||[],model:hit.model||null};
+  if(hit&&now-Date.parse(hit.at)<(maxAgeHours!=null?maxAgeHours*3600e3:ttl))return {status:'ok',cached:true,rows:hit.rows||[],model:hit.model||null};
   const usage=getSetting('vestiaire_live_usage',{})||{};
   if(Date.parse(usage.blocked_until||'')>now)return {status:'blocked'};
   const day=new Date().toISOString().slice(0,10);
   const used=usage.day===day?Number(usage.n)||0:0;
-  if(used>=Number(process.env.VESTIAIRE_LIVE_DAILY_MAX||40))return {status:'daily_limit'};
+  if(used>=Number(process.env.VESTIAIRE_LIVE_DAILY_MAX||80))return {status:'daily_limit'};
   if(now-vestiaireLiveMacReady.at>120e3)vestiaireLiveMacReady={at:now,ok:await macOneMapReady(token)};
   if(!vestiaireLiveMacReady.ok)return {status:'mac_offline'};
   saveSetting('vestiaire_live_usage',{...usage,day,n:used+1});
@@ -5052,6 +5052,84 @@ async function vestiaireLiveFor(task,item,exact){
 function vestiaireLiveNote(c){
   if(c?.status!=='ok')return '';
   return `Sin referencia en tu base: reventa según ${c.n} anuncios de Vestiaire en directo del modelo ${c.model}${c.material?` en ${c.material}`:''} (${c.basis}; ${c.sold_n} vendidos y ${c.active_n} en venta × 92 %; vendidos y con más likes pesan más) → ${c.low}-${c.high} EUR.`;
+}
+// ── OFERTAS DENTRO DE VESTIAIRE ─────────────────────────────────────────
+// Tras cada tarea de bolsos, se miran los anuncios más nuevos de ese modelo en
+// Vestiaire (desde el Chrome del Mac, como mucho cada
+// VESTIAIRE_DEALS_REFRESH_HOURS = 6 h por modelo) y se avisa de los que dejan
+// beneficio comprándolos en Vestiaire y revendiéndolos allí. Comparables: los
+// anuncios en directo del mismo modelo, talla y material más los de la base de
+// Nil de ese modelo; vendidos y con más likes pesan más.
+// Gastos de comprador: VESTIAIRE_BUYER_FEE_PCT (10 %) + VESTIAIRE_BUYER_SHIPPING_EUR (20 €).
+// Mínimos: VESTIAIRE_DEAL_MIN_PROFIT_EUR (200 € limpios) y VESTIAIRE_DEAL_MIN_MARGIN_PCT (20 %).
+// Como mucho VESTIAIRE_DEAL_DAILY_MAX (6) avisos al día; cada anuncio una vez.
+function vestiaireDealText(task,d){
+  const x=d.deal;
+  const desc=f=>htmlEsc([f.size,f.color,f.condition].filter(Boolean).join(' · ')||f.title||'Anuncio');
+  const fee=Number(process.env.VESTIAIRE_BUYER_FEE_PCT??10), ship=Number(process.env.VESTIAIRE_BUYER_SHIPPING_EUR??20);
+  const ago=alertAgo(Date.parse(d.created_at||''));
+  return [
+    `💎 <b>OFERTA EN VESTIAIRE</b> · ${htmlEsc(task.task_name)}`,
+    `<b>${htmlEsc(d.title||d.model||'')}</b> · ${htmlEsc([x.size,d.color,d.condition].filter(Boolean).join(' · '))}`,
+    `Vestiaire · <b>${eur0(d.price_eur)}</b>${ago?` · publicado ${ago}`:''}${Number(d.likes)>0?` · ${d.likes} ❤️`:''}`,
+    '',
+    '<b>💰 NÚMEROS</b>',
+    `Coste de compra: <b>${eur0(x.cost)}</b> (precio + ${fee} % de gastos de comprador + ${ship} € de envío, aproximado)`,
+    `Reventa: <b>${eur0(x.low)} – ${eur0(x.high)}</b> · según ${x.n} anuncios del mismo modelo, talla y material (${x.sold_n} vendidos)${x.haircut?' · −10 % por estar en "Buen estado"':''}`,
+    `Beneficio limpio revendiendo en Vestiaire (−20 % comisión): <b>${eur0(x.net_low)} – ${eur0(x.net_high)}</b> · margen ${x.margin_pct} %`,
+    '',
+    '<b>📚 CON QUÉ SE COMPARA</b>',
+    ...x.picks.map(f=>`   · <a href="${htmlEsc(f.url)}">${desc(f)}</a> · ${f.sold?`vendido a ${eur0(f.price_eur)}`:eur0(f.price_eur)}${Number(f.likes)>0?` · ${f.likes} ❤️`:''}`),
+    '',
+    '⚠️ Comprueba fotos, medidas y estado antes de comprar: la valoración es automática.',
+    `🌐 <a href="${htmlEsc(d.url)}">Ver en Vestiaire</a>`
+  ].join('\n');
+}
+async function scanVestiaireDeals(task){
+  if(['0','false','off','no'].includes(String(process.env.VESTIAIRE_DEALS||'').toLowerCase()))return {sent:0,reason:'disabled'};
+  if(isWatchTask(task?.task_name)||!telegramConfigured())return {sent:0};
+  const query=vestiaireTaskQuery(task.task_name);
+  if(!query)return {sent:0,reason:'no_query'};
+  const r=await vestiaireLiveSearchRows(query,{maxAgeHours:Number(process.env.VESTIAIRE_DEALS_REFRESH_HOURS||6)});
+  if(r.status!=='ok')return {sent:0,reason:r.status};
+  const live=(r.rows||[]).map(x=>({...x,sold_price_eur:x.sold?x.price_eur:null}));
+  // Base de Nil: filas de ese mismo modelo en la pestaña de la tarea.
+  const tab=vestiaireRefs().tasks?.[task.task_name];
+  let sheet=[];
+  if(tab?.source==='sheet'&&Array.isArray(tab.fichas)&&r.model){
+    const m=sameModelRows(task.task_name,tab.fichas,{title:r.model,label:r.model,description:''});
+    sheet=(m?.rows||[]).map(f=>({...f,title:f.model||r.model}));
+  }
+  const sent=getSetting('vestiaire_deals_sent',{})||{};
+  const day=new Date().toISOString().slice(0,10);
+  const today=Object.values(sent).filter(v=>String(v).startsWith(day)).length;
+  const room=Math.max(0,Number(process.env.VESTIAIRE_DEAL_DAILY_MAX||6)-today);
+  if(!room)return {sent:0,reason:'daily_max'};
+  // Talla: medidas o nombre de talla propio del modelo (PM/GM, 29/33...).
+  const fam=(VESTIAIRE_FAMILY_SIZES.find(([re])=>re.test(task.task_name))||[])[1];
+  const sizeOf=fam?(row=>{
+    const t=`${row.size||''} ${row.title||''} ${row.notes||''}`;
+    const w=vestiaireWidthCm(`${row.dims||''} ${row.notes||''}`);
+    const hit=fam.find(([,re,lo,hi])=>w?w>=lo&&w<=hi:re.test(t));
+    return hit?hit[0].toLowerCase():null;
+  }):null;
+  const deals=vestiaireDeals(live.filter(x=>!x.sold&&!sent[x.id]),[...live,...sheet],{sizeOf,
+    buyerFeePct:Number(process.env.VESTIAIRE_BUYER_FEE_PCT??10),buyerShippingEur:Number(process.env.VESTIAIRE_BUYER_SHIPPING_EUR??20),
+    sellFeePct:Number(process.env.VESTIAIRE_COMMISSION_PCT??20),minProfitEur:Number(process.env.VESTIAIRE_DEAL_MIN_PROFIT_EUR??200),
+    minMarginPct:Number(process.env.VESTIAIRE_DEAL_MIN_MARGIN_PCT??20)}).slice(0,Math.min(room,2));
+  let n=0;
+  for(const d of deals){
+    try{
+      const text=vestiaireDealText(task,d);
+      const album=await telegramSendAlbum([d.picture],text.split('\n').slice(0,3).join('\n')).catch(()=>({sent:false}));
+      await telegramSend(text,null,album.sent?{noPreview:true}:{previewUrl:d.url});
+      sent[d.id]=new Date().toISOString();n++;
+    }catch(e){console.error('Oferta de Vestiaire:',e.message);}
+  }
+  const keep=Object.fromEntries(Object.entries(sent).filter(([,v])=>Date.now()-Date.parse(v)<30*86400e3));
+  if(n)saveSetting('vestiaire_deals_sent',keep);
+  if(n)console.log(`Task ${task.id}: ${n} oferta(s) de Vestiaire enviada(s) por Telegram.`);
+  return {sent:n,checked:live.filter(x=>!x.sold).length};
 }
 function vestiaireFichasBlock(r,item,taskName=''){
   const picked=vestiaireMatchFichas(r?.fichas||[],item,taskName);
@@ -11474,6 +11552,12 @@ async function executeTask(taskId, runId=null) {
     }catch(e){
       result.status.instantAlerts={sent:0,error:e.message};
       console.error(`Instant alerts task ${taskId}:`,e.message);
+    }
+    try{
+      result.status.vestiaireDeals=await scanVestiaireDeals(task);
+    }catch(e){
+      result.status.vestiaireDeals={sent:0,error:e.message};
+      console.error(`Vestiaire deals task ${taskId}:`,e.message);
     }
     try{
       result.status.opportunitiesSheet=await syncOpportunitiesSheet();

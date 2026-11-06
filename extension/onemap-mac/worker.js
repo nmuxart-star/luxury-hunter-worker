@@ -94,7 +94,7 @@ async function waitLoaded(tabId,ms=30_000){
 // con una verificación, se para: no se reintenta ni se resuelve nada.
 async function vestiaireSearchInPage(q){
   const call=async(query,filters,{facets=[],limit=48,sortBy='relevance'}={})=>{
-    const body={pagination:{offset:0,limit},fields:['name','description','model','brand','price','sold','likes','colors','condition','createdAt','link'],
+    const body={pagination:{offset:0,limit},fields:['name','description','model','brand','price','sold','likes','colors','condition','createdAt','link','pictures'],
       facets:{fields:facets,stats:[]},sortBy,filters,q:query,locale:{country:'ES',currency:'EUR',language:'es',sizeType:'FR'},mySizes:null};
     const r=await fetch('https://search.vestiairecollective.com/v1/product/search',{method:'POST',
       headers:{'content-type':'application/json'},body:JSON.stringify(body)});
@@ -111,11 +111,14 @@ async function vestiaireSearchInPage(q){
       .sort((a,b)=>norm(b.name).length-norm(a.name).length||b.count-a.count);
     const pick=models[0];
     if(!pick)return {status:200,body:JSON.stringify({query:q,model:null,items:[]})};
-    const filters={'model.id':[String(pick.id)]};
+    // Vestiaire repite el mismo nombre de modelo con varios ids: todos cuentan.
+    const ids=models.filter(m=>norm(m.name)===norm(pick.name)).map(m=>String(m.id));
+    const filters={'model.id':ids};
     await wait(1200);
     const sold=await call('',{...filters,sold:['1']},{sortBy:'recency'});
     await wait(1200);
-    const active=await call('',{...filters,sold:['0']});
+    // En venta, los más recientes primero (para las ofertas nuevas).
+    const active=await call('',{...filters,sold:['0']},{sortBy:'recency'});
     return {status:200,body:JSON.stringify({query:q,model:{id:pick.id,name:pick.name,count:pick.count},
       sold_total:sold.paginationStats?.totalHits??null,active_total:active.paginationStats?.totalHits??null,
       items:[...(sold.items||[]),...(active.items||[])]})};
