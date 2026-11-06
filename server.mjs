@@ -16,9 +16,10 @@ import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationT
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,compWeight,compStats,refAgeDays,weightedQuantile} from './scripts/vestiaire-bag-match.mjs';
+import {MATCH_VERSION,refCandidates,refTable,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {macOneMapReady,macOneMapSnapshot,macVestiaireSearch} from './scripts/onemap-mac-client.mjs';
-import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables,vestiaireTaskQuery,vestiaireDeals} from './scripts/vestiaire-live.mjs';
+import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables,vestiaireTaskQuery,VESTIAIRE_LIVE_REALIZATION} from './scripts/vestiaire-live.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -343,6 +344,9 @@ const DEFAULT_ECONOMICS = {
     rakuten: { label:'Rakuten / Japón', domesticShippingEur:6, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
     // Dentro de la UE no hay aduana ni IVA de importación; sí conviene autenticar.
     ebay_eu: { label:'eBay / UE', euInternal:true, domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:15, customsDutyPercent:0, clearanceFeeEur:0, authenticationFeeEur:30, otherEur:0 },
+    // Vestiaire (dentro de la UE): gastos de servicio del comprador (%) y envío
+    // con autenticación. Estimación prudente: ajústala con un pago real.
+    vestiaire: { label:'Vestiaire Collective', euInternal:true, domesticShippingEur:0, agentFeePercent:15, agentFeeFixedEur:0, internationalShippingEur:25, customsDutyPercent:0, clearanceFeeEur:0, authenticationFeeEur:0, otherEur:0 },
     ebay_gb: { label:'eBay / Reino Unido', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:25, customsDutyPercent:3, clearanceFeeEur:15, authenticationFeeEur:30, otherEur:0 },
     ebay_us: { label:'eBay / EE. UU. y resto', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:45, customsDutyPercent:3, clearanceFeeEur:15, authenticationFeeEur:30, otherEur:0 }
   },
@@ -404,6 +408,7 @@ function importEconomics(item, settings=getEconomics()){
   else if(['yahoo-auctions-jp','jdirectitems-auction'].includes(rawSource))sourceKey='onemap';
   else if(japanEconomicSources.has(rawSource))sourceKey='buyee';
   else if(rawSource==='rakuten-jp')sourceKey='rakuten';
+  else if(rawSource==='vestiaire')sourceKey='vestiaire';
   else if(rawSource.startsWith('ebay-')){
     const cc=rawSource.slice(5).toUpperCase();
     sourceKey=EU_COUNTRIES.has(cc)?'ebay_eu':cc==='GB'?'ebay_gb':'ebay_us';
@@ -4348,9 +4353,11 @@ function vestiaireFileRefs(){
 // fija de esa tarea; las tareas sin pestaña siguen con la copia fija.
 function vestiaireRefs(){
   if(vestiaireRefsCache)return vestiaireRefsCache;
+  // La base es la hoja de Google Drive (decisión de Nil): con ella leída no se
+  // mezcla la copia fija del repositorio, que solo sirve si nunca se leyó.
   const file=vestiaireFileRefs();
   vestiaireRefsCache=vestiaireSheetCache?.tasks
-    ? {...file,tasks:{...(file.tasks||{}),...vestiaireSheetCache.tasks}}
+    ? {...file,tasks:{...vestiaireSheetCache.tasks}}
     : file;
   return vestiaireRefsCache;
 }
@@ -4382,6 +4389,8 @@ function revalidateStoredBagBuys(){
     for(const row of rows){
       if(isWatchTask(row.task_name))continue;
       let v={},raw={};try{v=JSON.parse(row.verification_json||'{}');raw=JSON.parse(row.raw_json||'{}');}catch{}
+      // Los análisis nuevos (referencias elegidas por la IA) ya llevan su precio: no se tocan.
+      if(v.match_version)continue;
       const comps=vestiaireComparables({task_name:row.task_name},row,v.exact||{brand:row.brand,family:row.model});
       let a={...raw,decision:row.decision,opportunity_score:row.opportunity_score,
         resale_low_eur:row.resale_low_eur,resale_high_eur:row.resale_high_eur,
@@ -4465,7 +4474,7 @@ async function googleSheetsAuth(write=false){
 // la comisión, el IVA y el beneficio se recalculan.
 const OPPORTUNITY_SHEET_MIN_SCORE=60;
 const OPPORTUNITY_SOURCE_LABELS={
-  'xianyu':'Xianyu','bunjang':'Bunjang','mercari-jp':'Mercari','rakuma-jp':'Rakuma',
+  'xianyu':'Xianyu','bunjang':'Bunjang','mercari-jp':'Mercari','rakuma-jp':'Rakuma','vestiaire':'Vestiaire Collective',
   'yahoo-auctions-jp':'Yahoo! Auctions','yahoo-fleamarket-jp':'Yahoo! Flea Market',
   '2ndstreet-jp':'2nd Street','komehyo-jp':'Komehyo','rakuten-jp':'Rakuten'
 };
@@ -4929,7 +4938,7 @@ async function vestiaireLiveSearchRows(query,{maxAgeHours=null}={}){
   if(Date.parse(usage.blocked_until||'')>now)return {status:'blocked'};
   const day=new Date().toISOString().slice(0,10);
   const used=usage.day===day?Number(usage.n)||0:0;
-  if(used>=Number(process.env.VESTIAIRE_LIVE_DAILY_MAX||80))return {status:'daily_limit'};
+  if(used>=Number(process.env.VESTIAIRE_LIVE_DAILY_MAX||200))return {status:'daily_limit'};
   if(now-vestiaireLiveMacReady.at>120e3)vestiaireLiveMacReady={at:now,ok:await macOneMapReady(token)};
   if(!vestiaireLiveMacReady.ok)return {status:'mac_offline'};
   saveSetting('vestiaire_live_usage',{...usage,day,n:used+1});
@@ -4960,84 +4969,30 @@ function vestiaireLiveNote(c){
   if(c?.status!=='ok')return '';
   return `Sin referencia en tu base: reventa según ${c.n} anuncios de Vestiaire en directo del modelo ${c.model}${c.material?` en ${c.material}`:''} (${c.basis}; ${c.sold_n} vendidos y ${c.active_n} en venta × 92 %; vendidos, recientes y con más likes pesan más) → ${c.low}-${c.high} EUR.`;
 }
-// ── OFERTAS DENTRO DE VESTIAIRE ─────────────────────────────────────────
-// Tras cada tarea de bolsos, se miran los anuncios más nuevos de ese modelo en
-// Vestiaire (desde el Chrome del Mac, como mucho cada
-// VESTIAIRE_DEALS_REFRESH_HOURS = 6 h por modelo) y se avisa de los que dejan
-// beneficio comprándolos en Vestiaire y revendiéndolos allí. Comparables: los
-// anuncios en directo del mismo modelo, talla y material más los de la base de
-// Nil de ese modelo; vendidos, recientes y con más likes pesan más.
-// Gastos de comprador: VESTIAIRE_BUYER_FEE_PCT (10 %) + VESTIAIRE_BUYER_SHIPPING_EUR (20 €).
-// Mínimos: VESTIAIRE_DEAL_MIN_PROFIT_EUR (200 € limpios) y VESTIAIRE_DEAL_MIN_MARGIN_PCT (20 %).
-// Sin máximo de avisos; cada anuncio una vez.
-function vestiaireDealText(task,d){
-  const x=d.deal;
-  const dealPart=(title,p,material)=>['',`<b>${title}</b>`,...(p?.n
-    ?[...refSummaryLines(p,92),...(p.picks||[]).map(f=>refPickLine(f,{material}))]
-    :['Sin referencias de esta talla y material.'])];
-  const fee=Number(process.env.VESTIAIRE_BUYER_FEE_PCT??10), ship=Number(process.env.VESTIAIRE_BUYER_SHIPPING_EUR??20);
-  const ago=alertAgo(Date.parse(d.created_at||''));
-  return [
-    `💎 <b>OFERTA EN VESTIAIRE</b> · ${htmlEsc(task.task_name)}`,
-    `<b>${htmlEsc(d.title||d.model||'')}</b> · ${htmlEsc([x.size,d.color,d.condition].filter(Boolean).join(' · '))}`,
-    `Vestiaire · <b>${eur0(d.price_eur)}</b>${ago?` · publicado ${ago}`:''}${Number(d.likes)>0?` · ${d.likes} ❤️`:''}`,
-    '',
-    '<b>💰 NÚMEROS</b>',
-    `Coste de compra: <b>${eur0(x.cost)}</b> (precio + ${fee} % de gastos de comprador + ${ship} € de envío, aproximado)`,
-    `Reventa: <b>${eur0(x.low)} – ${eur0(x.high)}</b> · según ${x.n} anuncios del mismo modelo, talla y material (${x.sold_n} vendidos)${x.haircut?' · −10 % por estar en "Buen estado"':''}`,
-    `Beneficio limpio revendiendo en Vestiaire (−20 % comisión): <b>${eur0(x.net_low)} – ${eur0(x.net_high)}</b> · margen ${x.margin_pct} %`,
-    '',
-    ...dealPart('📚 TU BASE DE DATOS',x.base,true),
-    ...dealPart('🌐 VESTIAIRE EN DIRECTO',x.live,false),
-    '',
-    `⚖️ La reventa sale de las dos juntas (un anuncio que está en las dos cuenta una vez)${x.haircut?'; −10 % por "Buen estado"':''}.`,
-    '',
-    '⚠️ Comprueba fotos, medidas y estado antes de comprar: la valoración es automática.',
-    `🌐 <a href="${htmlEsc(d.url)}">Ver en Vestiaire</a>`
-  ].join('\n');
-}
-async function scanVestiaireDeals(task){
-  if(['0','false','off','no'].includes(String(process.env.VESTIAIRE_DEALS||'').toLowerCase()))return {sent:0,reason:'disabled'};
-  if(isWatchTask(task?.task_name)||!telegramConfigured())return {sent:0};
-  const query=vestiaireTaskQuery(task.task_name);
-  if(!query)return {sent:0,reason:'no_query'};
-  const r=await vestiaireLiveSearchRows(query,{maxAgeHours:Number(process.env.VESTIAIRE_DEALS_REFRESH_HOURS||6)});
-  if(r.status!=='ok')return {sent:0,reason:r.status};
-  const live=(r.rows||[]).map(x=>({...x,sold_price_eur:x.sold?x.price_eur:null}));
-  // Base de Nil: filas de ese mismo modelo en la pestaña de la tarea.
-  const tab=vestiaireRefs().tasks?.[task.task_name];
-  let sheet=[];
-  if(tab?.source==='sheet'&&Array.isArray(tab.fichas)&&r.model){
-    const m=sameModelRows(task.task_name,tab.fichas,{title:r.model,label:r.model,description:''});
-    sheet=(m?.rows||[]).map(f=>({...f,title:f.model||r.model,_src:'base'}));
+// ── VESTIAIRE COMO FUENTE ───────────────────────────────────────────────
+// En cada tarea de bolsos, los anuncios más nuevos de ese modelo en
+// Vestiaire (desde el Chrome del Mac) entran como un anuncio más: la IA los
+// revisa y el bot los valora igual que los de Asia, con los gastos de
+// comprador de Vestiaire en el coste. La búsqueda se repite como mucho cada
+// VESTIAIRE_SOURCE_REFRESH_HOURS (1 h) por modelo.
+async function searchVestiaireSource({sessionId,minEur=null,maxEur=null},taskName){
+  const query=vestiaireTaskQuery(taskName);
+  if(!query)return {ok:false,kept:0,error:'tarea sin modelo de Vestiaire'};
+  const r=await vestiaireLiveSearchRows(query,{maxAgeHours:Number(process.env.VESTIAIRE_SOURCE_REFRESH_HOURS||1)});
+  if(r.status!=='ok')return {ok:false,kept:0,query,error:VESTIAIRE_LIVE_WHY[r.status]||r.status};
+  let kept=0;
+  for(const x of (r.rows||[]).filter(x=>!x.sold&&x.price_eur>0)){
+    if(minEur!=null&&Number(x.price_eur)<Number(minEur))continue;
+    if(maxEur!=null&&Number(x.price_eur)>Number(maxEur))continue;
+    upsertListing({source:'vestiaire',source_id:String(x.id),url:x.url,title:x.title||x.model,
+      description:[x.model,x.size,x.dims?`${x.dims} cm`:'',x.color,x.condition,x.material,x.notes].filter(Boolean).join(' · '),
+      original_price:x.price_eur,currency:'EUR',price_eur:x.price_eur,image_url:x.picture,status:'active',
+      raw:{...x,publishedAt:x.created_at},purchase_via:'Vestiaire Collective'},sessionId,query);
+    kept++;
   }
-  const sent=getSetting('vestiaire_deals_sent',{})||{};
-  // Talla: medidas o nombre de talla propio del modelo (PM/GM, 29/33...).
-  const fam=(VESTIAIRE_FAMILY_SIZES.find(([re])=>re.test(task.task_name))||[])[1];
-  const sizeOf=fam?(row=>{
-    const t=`${row.size||''} ${row.title||''} ${row.notes||''}`;
-    const w=vestiaireWidthCm(`${row.dims||''} ${row.notes||''}`);
-    const hit=fam.find(([,re,lo,hi])=>w?w>=lo&&w<=hi:re.test(t));
-    return hit?hit[0].toLowerCase():null;
-  }):null;
-  const deals=vestiaireDeals(live.filter(x=>!x.sold&&!sent[x.id]),[...live,...sheet],{sizeOf,
-    buyerFeePct:Number(process.env.VESTIAIRE_BUYER_FEE_PCT??10),buyerShippingEur:Number(process.env.VESTIAIRE_BUYER_SHIPPING_EUR??20),
-    sellFeePct:Number(process.env.VESTIAIRE_COMMISSION_PCT??20),minProfitEur:Number(process.env.VESTIAIRE_DEAL_MIN_PROFIT_EUR??200),
-    minMarginPct:Number(process.env.VESTIAIRE_DEAL_MIN_MARGIN_PCT??20)});
-  let n=0;
-  for(const d of deals){
-    try{
-      const text=vestiaireDealText(task,d);
-      const album=await telegramSendAlbum([d.picture],text.split('\n').slice(0,3).join('\n')).catch(()=>({sent:false}));
-      await telegramSend(text,null,album.sent?{noPreview:true}:{previewUrl:d.url});
-      sent[d.id]=new Date().toISOString();n++;
-    }catch(e){console.error('Oferta de Vestiaire:',e.message);}
-  }
-  const keep=Object.fromEntries(Object.entries(sent).filter(([,v])=>Date.now()-Date.parse(v)<30*86400e3));
-  if(n)saveSetting('vestiaire_deals_sent',keep);
-  if(n)console.log(`Task ${task.id}: ${n} oferta(s) de Vestiaire enviada(s) por Telegram.`);
-  return {sent:n,checked:live.filter(x=>!x.sold).length};
+  return {ok:true,kept,query,model:r.model,cached:!!r.cached};
 }
+
 function vestiaireFichasBlock(r,item,taskName=''){
   const picked=vestiaireMatchFichas(r?.fichas||[],item,taskName);
   if(!picked.length)return vestiaireSoldBlock(r,item,taskName);
@@ -8130,6 +8085,175 @@ function storeStandaloneAnalysis(item,a,now){
     ON CONFLICT(listing_id) DO UPDATE SET brand=excluded.brand,model=excluded.model,authenticity_risk=excluded.authenticity_risk,liquidity=excluded.liquidity,decision=excluded.decision,opportunity_score=excluded.opportunity_score,resale_low_eur=excluded.resale_low_eur,resale_high_eur=excluded.resale_high_eur,landed_cost_eur=excluded.landed_cost_eur,net_profit_low_eur=excluded.net_profit_low_eur,net_profit_high_eur=excluded.net_profit_high_eur,notes=excluded.notes,decision_reasons_es_json=excluded.decision_reasons_es_json,raw_json=excluded.raw_json,updated_at=excluded.updated_at,preliminary_decision=excluded.preliminary_decision,verification_json=excluded.verification_json`)
     .run(item.id,a.brand||'',a.model||'',a.authenticity_risk||'',a.liquidity||'',a.decision||'',numberOrNull(a.opportunity_score),numberOrNull(a.resale_low_eur),numberOrNull(a.resale_high_eur),numberOrNull(a.landed_cost_eur),numberOrNull(a.net_profit_low_eur),numberOrNull(a.net_profit_high_eur),a.notes||'',JSON.stringify(reasons),JSON.stringify(a),now,a.decision||'',JSON.stringify(a.market_verification||{status:'not_applicable',reason:'no_task_context'}));
 }
+// ── ANÁLISIS CON REFERENCIAS ELEGIDAS POR LA IA (regla de Nil, 06-11-2026) ─
+// 1) Referencias candidatas: las del mismo modelo en la hoja de Nil (Google
+//    Drive) y, en bolsos, los anuncios de Vestiaire en directo del modelo.
+// 2) La IA NO pone precio: identifica el producto, valora estado y calidad
+//    (fotos, accesorios, desgaste) y el riesgo de autenticidad, y dice una a
+//    una qué referencias son el MISMO producto con un estado parecido.
+// 3) El bot calcula la media de precio de esas (vendidas, recientes y con
+//    más likes pesan más), por separado la base y Vestiaire, y decide con el
+//    beneficio limpio y el margen; la calidad de la IA cuenta en la nota.
+// 4) Si sale rentable, se confirma con el modelo fuerte y más fotos.
+const REF_MAX_BASE=Number(process.env.REF_MAX_BASE||80);
+const REF_MAX_LIVE=Number(process.env.REF_MAX_LIVE||60);
+function baseReferenceRows(task,item){
+  const tabs=vestiaireRefs().tasks||{};
+  const watch=isWatchTask(task?.task_name);
+  const texts={title:item?.title||'',label:'',description:item?.description||''};
+  const usable=rows=>(rows||[]).filter(f=>Number(f.price_eur)>0||Number(f.sold_price_eur)>0);
+  const own=tabs[task?.task_name];
+  if(own&&Array.isArray(own.fichas)&&own.fichas.length){
+    const m=sameModelRows(task.task_name,usable(own.fichas),texts);
+    return {tab:task.task_name,model:m?.key||null,rows:m?.rows?.length?m.rows:usable(own.fichas)};
+  }
+  // Tareas sin pestaña propia (Radar): el modelo que nombre el anuncio, en cualquier pestaña del mismo tipo.
+  let best=null;
+  for(const [name,r] of Object.entries(tabs)){
+    if(isWatchTask(name)!==watch||!Array.isArray(r?.fichas))continue;
+    const m=sameModelRows(name,usable(r.fichas),texts,{requireNamed:true});
+    if(m&&(!best||m.rows.length>best.rows.length))best={tab:name,model:m.key,rows:m.rows};
+  }
+  return best||{tab:null,model:null,rows:[]};
+}
+async function liveReferenceRows(task,item){
+  if(isWatchTask(task?.task_name))return {status:'watch',rows:[]};
+  const query=vestiaireTaskQuery(task?.task_name)||vestiaireLiveQuery(item,{});
+  if(!query)return {status:'no_query',rows:[]};
+  try{
+    const r=await vestiaireLiveSearchRows(query);
+    return r.status==='ok'?{status:'ok',query,model:r.model,rows:(r.rows||[]).map(x=>({...x,sold_price_eur:x.sold?x.price_eur:null}))}:{status:r.status,query,rows:[]};
+  }catch(e){return {status:'error',query,rows:[],error:String(e.message||e).slice(0,160)};}
+}
+const LISTING_AI_INSTRUCTION=`You are the listing inspector of Luxury Hunter (second-hand luxury bags and watches bought in Asia/Japan/eBay and resold in Europe).
+YOUR JOB IS NOT TO PRICE THE ITEM. Luxury Hunter computes the price from the references you select. Never estimate resale prices, never judge whether the price is good.
+
+Do three things:
+1. IDENTIFY the item from title, description and photos: brand, model, exact variant, size (name and/or measurements), material, colour, hardware. Say whether it matches the TARGET of the task (target_match). Accessories only, wallets/pouches when the target is a bag, other models, replicas → target_match false.
+2. JUDGE THE LISTING: condition grade, visible wear or damage, completeness (box, dust bag, card, strap, papers for watches), photo quality and how much can be checked, and authenticity risk. quality_score 0-100 = how good the item and the listing are (100 = like new, complete, many clear photos; 50 = normal used item with average photos; below 30 = damaged, incomplete or impossible to check). authenticity_risk HIGH only with concrete evidence (replica wording, failed verification, clear defects of a fake); suspicion alone is MEDIUM.
+3. MATCH REFERENCES ONE BY ONE. Below are reference listings from Nil's database (codes B…) and from Vestiaire Collective right now (codes V…). For EVERY reference decide if it is the SAME PRODUCT as the listing: same model and variant, same size, same material (colour may differ only for standard colours), and a SIMILAR CONDITION (at most one grade apart). Put those codes in *_same. References of the same model but a different size, material or clearly different condition go in *_similar. Ignore the rest. Use only what the reference text says; do not guess.
+
+EXOTIC SKIN POLICY: genuine crocodile, alligator, python/snake, ostrich, lizard or stingray → exotic_skin true.
+
+Return ONLY JSON:
+{"brand":"","model":"","variant":"","size":"","material":"","colour":"","hardware":"","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"confidence":0.0,"base_same":["B1"],"base_similar":[],"vestiaire_same":["V3"],"vestiaire_similar":[],"decision_reasons_es":["1 a 4 motivos breves en español sobre identificación, estado, calidad y autenticidad; nada de precios"]}`;
+function referencePrompt(task,item,base,live,economics){
+  const ctx=`TASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nTASK CRITERIA:\n${String(task.description||'').slice(0,1500)}`;
+  return `${LISTING_AI_INSTRUCTION}\n\n${ctx}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nMARKETPLACE VERIFICATION: ${JSON.stringify(detectMarketplaceVerification(item))}\n\n`+
+    `REFERENCES FROM NIL'S DATABASE (code | model | size | measurements | material | colour | condition | sold? | published | notes):\n${refTable(base)||'(none)'}\n\n`+
+    `REFERENCES FROM VESTIAIRE NOW (same columns; material comes from the listing URL):\n${refTable(live)||'(none)'}`;
+}
+function referenceCompsForAlert(price,{tab,model,source}){
+  if(!price)return null;
+  return {rule_version:MATCH_VERSION,tier:'ia_iguales',source,tab,model,basis:'elegidas una a una por la IA',n:price.n,low:price.low,mid:price.mean,high:price.high,
+    sold_n:price.sold_n,recent_n:price.recent_n,likes_max:price.likes_max,price_basis:price.price_basis,ratio:price.ratio,picks:price.picks,weighted:price.weighted};
+}
+async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportProgress,negotiated}){
+  const economics=importEconomics(item);
+  const landed=Number(economics.importedTotalEur)||0;
+  const marketplaceVerification=detectMarketplaceVerification(item);
+  const platform=resalePlatform(task.task_name);
+  const realization=VESTIAIRE_DEFAULT_REALIZATION;
+  reportProgress(8,'Buscando referencias','Tu base y Vestiaire en directo');
+  const baseInfo=baseReferenceRows(task,item);
+  const liveInfo=String(item.source)==='vestiaire'||!listingAuction(item)?await liveReferenceRows(task,item):{status:'auction',rows:[]};
+  const excludeId=String(item.source)==='vestiaire'?item.source_id:null;
+  const base=refCandidates(baseInfo.rows,{prefix:'B',limit:REF_MAX_BASE,excludeId});
+  const live=refCandidates(liveInfo.rows,{prefix:'V',limit:REF_MAX_LIVE,excludeId});
+  const prompt=referencePrompt(task,item,base,live,economics);
+  const inspect=async(purpose,images)=>{
+    const parts=analyzeImages?await fetchGeminiImageParts(item,images):[];
+    const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:prompt},...parts],googleSearch:false,purpose});
+    return {data:r.data||{},images:parts.length};
+  };
+  const evaluate=data=>{
+    const basePrice=priceFromRefs(base,data.base_same,{ratio:realization});
+    const livePrice=priceFromRefs(live,data.vestiaire_same,{ratio:VESTIAIRE_LIVE_REALIZATION});
+    let combined=combinePrices(basePrice,livePrice);
+    let orientative=false;
+    if(!combined){
+      // Sin iguales: el mismo modelo en otra talla o estado, solo orientativo.
+      const b2=priceFromRefs(base,data.base_similar,{ratio:realization}), l2=priceFromRefs(live,data.vestiaire_similar,{ratio:VESTIAIRE_LIVE_REALIZATION});
+      combined=combinePrices(b2,l2);orientative=!!combined;
+    }
+    const failed=String(marketplaceVerification.status||'').toUpperCase()==='FAILED';
+    const dec=decideFromNumbers({price:combined,landed,feePct:platform.fee,minProfit:Number(task.notify_min_profit_eur)||200,
+      minMarginPct:Number(process.env.MIN_CLEAN_MARGIN_PCT||20),quality:data.quality_score,
+      risk:failed||data.exotic_skin===true?'HIGH':data.authenticity_risk,targetMatch:data.target_match!==false,orientative});
+    return {basePrice,livePrice,combined,orientative,dec,failed};
+  };
+  reportProgress(25,'Revisando el anuncio','La IA identifica el producto, su estado y las referencias iguales');
+  let shot=await inspect('screen',2);
+  let ev=evaluate(shot.data);
+  let confirmed=false;
+  // Confirmación con el modelo fuerte y más fotos para lo que sale rentable.
+  if(['STRONG BUY','BUY','WATCH'].includes(ev.dec.decision)&&verifyBudgetLeftUsd()>0){
+    reportProgress(60,'Confirmando','Modelo fuerte con más fotos');
+    verifyTierStore.enterWith('full');
+    try{const strong=await inspect('verify',4);shot=strong;ev=evaluate(strong.data);confirmed=true;}
+    catch(e){if(isAiPolicyFlag(e))throw e;console.warn('Confirmación con el modelo fuerte:',e.message);}
+  }
+  const d=shot.data;
+  const {basePrice,livePrice,combined,orientative,dec,failed}=ev;
+  const fee=platform.fee/100;
+  const a={
+    brand:d.brand||'',model:[d.model,d.variant].filter(Boolean).join(' ')||task.task_name,
+    authenticity_risk:failed?'HIGH':String(d.authenticity_risk||'MEDIUM').toUpperCase(),liquidity:'',
+    decision:dec.decision,opportunity_score:dec.score,
+    resale_low_eur:combined?.low??null,resale_high_eur:combined?.high??null,resale_mean_eur:combined?.mean??null,
+    landed_cost_eur:landed||null,import_costs:economics,marketplace_verification:marketplaceVerification,
+    net_profit_low_eur:combined&&landed?roundMoney(combined.low-landed):null,
+    net_profit_high_eur:combined&&landed?roundMoney(combined.high-landed):null,
+    net_profit_clean_eur:dec.clean,clean_margin_pct:dec.margin,quality_score:Number(d.quality_score)||null,
+    resale_estimate_source:combined?(orientative?'REFERENCIAS_PARECIDAS':combined.source==='base'?'VESTIAIRE_DB':combined.source==='vestiaire'?'VESTIAIRE_LIVE':'VESTIAIRE_DB+LIVE'):'UNAVAILABLE',
+    resale_estimate_market_verified:!!combined&&!orientative,
+    notes:[d.completeness_es,d.condition_grade].filter(Boolean).join(' · ')
+  };
+  const priceNote=combined
+    ?`${orientative?'Precio orientativo (mismo modelo, otra talla o estado)':'Precio con referencias iguales'}: media ${combined.mean} € (${combined.low}-${combined.high}); beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
+    :'Sin referencias iguales en tu base ni en Vestiaire: no se puede calcular el precio.';
+  a.decision_reasons_es=[priceNote,...(Array.isArray(d.decision_reasons_es)?d.decision_reasons_es:[]).map(String)].slice(0,5);
+  if(failed)a.decision_reasons_es.unshift(`La verificación de ${marketplaceVerification.service||'la plataforma'} figura como no superada.`);
+  if(d.exotic_skin===true)a.decision_reasons_es.unshift('Piel exótica (CITES): descartado por política.');
+  const exact={brand:d.brand,family:d.model,exact_variant_label:d.variant,size:d.size,material:d.material,main_color:d.colour,hardware:d.hardware,
+    condition:{grade:d.condition_grade||null},target_match:d.target_match!==false,confidence:Number(d.confidence)||null};
+  let verification={status:confirmed?'verified':'screen_only',match_version:MATCH_VERSION,preliminary_decision:dec.decision,exact,
+    marketplace_verification:marketplaceVerification,
+    market:{match_version:MATCH_VERSION,
+      sheet_comps:referenceCompsForAlert(basePrice,{tab:baseInfo.tab,model:baseInfo.model,source:'base'}),
+      vestiaire_live:livePrice?{status:'ok',tier:'misma_talla',...referenceCompsForAlert(livePrice,{model:liveInfo.model,source:'vestiaire'}),
+        active_n:livePrice.n-livePrice.sold_n,material:'',basis:'elegidos uno a uno por la IA'}:(liveInfo.status==='ok'?{status:'no_match',query:liveInfo.query}:{status:liveInfo.status,query:liveInfo.query}),
+      vestiaire_blend:basePrice&&livePrice?combined:null,orientative,
+      candidates:{base:base.length,vestiaire:live.length},sheet_fresh:vestiaireSheetFresh()}};
+  // Subastas: puja máxima con la parte baja de las referencias iguales.
+  const auc=listingAuction(item);
+  if(auc){
+    const resale=combined&&!orientative?Number(combined.low):null;
+    const rawMax=auc.live&&resale>0?auctionMaxBidEur(item,resale,task.task_name):null;
+    const maxLocal=rawMax!=null?auctionLocalBid(rawMax,auc.currency):null;
+    const maxEur=maxLocal!=null?toEur(maxLocal,auc.currency):null;
+    verification.auction={ends_at:auc.endsAt,bids:auc.bids,currency:auc.currency,current_bid:auc.currentBid,current_bid_eur:roundMoney(Number(item.price_eur)),
+      resale_eur:resale>0?roundMoney(resale):null,resale_from_db:resale>0,db_comparables:combined?.n||null,db_basis:'referencias iguales elegidas por la IA',
+      min_profit_eur:AUCTION_MIN_PROFIT_EUR,max_bid_eur:maxEur!=null?roundMoney(maxEur):null,max_bid_local:maxLocal};
+    if(a.decision!=='REJECT'){
+      if(!auc.live){a.decision='REVIEW';a.opportunity_score=null;a.decision_reasons_es.unshift('Subasta finalizada; la puja ya no está disponible.');}
+      else if(!(resale>0)){a.decision='REVIEW';a.opportunity_score=null;a.decision_reasons_es.unshift('Subasta: sin referencias iguales para calcular la puja máxima.');}
+      else if(maxEur==null||Number(item.price_eur)>=maxEur){a.decision='REJECT';a.decision_reasons_es.unshift(`Subasta: la puja actual ya supera la puja máxima rentable${maxEur!=null?` (${Math.round(maxEur)} €)`:''}.`);}
+      else{
+        const atMax=auctionNetProfit(item,maxEur,resale,task.task_name);
+        a.landed_cost_eur=roundMoney(atMax.landed);a.net_profit_low_eur=roundMoney(atMax.net);
+        a.decision_reasons_es.unshift(`Subasta: puja como máximo ${maxLocal} ${auc.currency} (≈ ${Math.round(maxEur)} €) para ganar al menos ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €.`);
+      }
+    }
+  }
+  a.decision_reasons_es=a.decision_reasons_es.slice(0,5);
+  verification.final={...a};
+  a.market_verification=verification;
+  reportProgress(97,'Guardando resultado','Actualizando Luxury Hunter');
+  storeTaskAnalysis(taskId,item,a,dec.decision,verification,new Date().toISOString());
+  return a;
+}
+
 async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProgress=null,opts={}){
   const reportProgress=(pct,stage,detail='')=>{
     try{
@@ -8159,6 +8283,10 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
     :row;
   const task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
   await refreshVestiaireSheet();
+  // Análisis de tarea: la IA valora el anuncio y elige las referencias; el
+  // precio y la decisión los pone el bot (REF_ANALYSIS=0 vuelve al antiguo).
+  if(task&&!['0','off','false','no'].includes(String(process.env.REF_ANALYSIS||'').toLowerCase()))
+    return analyzeByReferences({key,item,task,taskId,analyzeImages,reportProgress,negotiated});
   const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task,item)}`:'';
   const economics=importEconomics(item);
   const marketplaceVerification=detectMarketplaceVerification(item);
@@ -8777,6 +8905,10 @@ async function globalSearch(body) {
   if(!extraOff&&on('RAKUTEN_ENABLED')&&rakutenConfigured())run('rakuten',()=>searchRakutenLive({...opts,queries:plan.japan}));
   if(!extraOff&&(sources.includes('ebay')||ebayConfigured()))run('ebay',()=>searchEbayLive({...opts,product}));
   if(sources.includes('xianyu'))run('xianyu',()=>searchXianyuLive({...opts,queries:plan.xianyu}));
+  // Vestiaire: en las tareas de bolsos (VESTIAIRE_SOURCE=0 lo apaga).
+  const taskName=taskId?db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId)?.task_name:null;
+  if(taskName&&!isWatchTask(taskName)&&!['0','off','false','no'].includes(String(process.env.VESTIAIRE_SOURCE||'').toLowerCase()))
+    run('vestiaire',()=>searchVestiaireSource(opts,taskName));
   await Promise.all(jobs);
   const finishedAt=new Date().toISOString();
   db.prepare('UPDATE search_sessions SET source_status_json=?,status=?,finished_at=? WHERE id=?').run(JSON.stringify(status),'finished',finishedAt,sessionId);
@@ -8926,6 +9058,10 @@ function listingPublishedAtMs(item){
 
   if(source.startsWith('ebay-')){
     return parseMarketplacePublishedMs(raw?.publishedAt||raw?.itemCreationDate,'+00:00');
+  }
+  if(source==='vestiaire'){
+    const ms=Date.parse(raw?.publishedAt||raw?.created_at||'');
+    return Number.isFinite(ms)?ms:null;
   }
 
   return null;
@@ -9493,6 +9629,21 @@ function xianyuTooCheapVeto(item,task){
 }
 
 
+// Sin IA: si ni vendiéndolo al precio de las referencias más caras del
+// modelo en la base (p90) deja beneficio, no se analiza.
+function overpricedVeto(item,task){
+  if(!task?.task_name||listingAuction(item))return null;
+  const info=baseReferenceRows(task,item);
+  const values=(info.rows||[]).map(r=>refValueForGate(r)).filter(v=>v>0).sort((a,b)=>a-b);
+  if(values.length<5)return null;
+  const top=values[Math.floor((values.length-1)*0.9)];
+  const fee=resalePlatform(task.task_name).fee/100;
+  const landed=Number(importEconomics(item).importedTotalEur)||0;
+  if(!(landed>0)||landed<top*(1-fee))return null;
+  return {code:'overpriced',term:`${Math.round(landed)}≥${Math.round(top*(1-fee))}`,
+    reasons:[`Caro: el coste puesto (${Math.round(landed)} €) no deja beneficio ni vendiéndolo al precio de las referencias más caras de tu base (${Math.round(top)} € menos la comisión).`]};
+}
+const refValueForGate=r=>r?.sold?(Number(r.sold_price_eur)>0?Number(r.sold_price_eur):Number(r.price_eur)):Number(r?.price_eur)*VESTIAIRE_DEFAULT_REALIZATION;
 function deterministicPrescreen(item,task=null){
   const noPrice=noPriceVeto(item);
   if(noPrice)return noPrice;
@@ -9514,6 +9665,8 @@ function deterministicPrescreen(item,task=null){
   }
   const cheap=xianyuTooCheapVeto(item,task);
   if(cheap)return cheap;
+  const dear=overpricedVeto(item,task);
+  if(dear)return dear;
   const bj=bunjangTrustVeto(item);
   if(bj)return bj;
   const title=String(item?.title||'').toLowerCase();
@@ -9665,24 +9818,20 @@ async function triageWithAi(task,items){
       source:x.source,
       title:String(x.title||'').slice(0,180),
       description:String(x.description||'').replace(/\s+/g,' ').slice(0,260),
-      price_eur:x.price_eur!=null?Math.round(Number(x.price_eur)):null,
-      landed_cost_eur:Math.round(Number(importEconomics(x).importedTotalEur)||0)||null,
-      price_vs_task_median:Number.isFinite(x._priceVsTaskMedian)?Number(x._priceVsTaskMedian.toFixed(2)):null
     }));
-    const prompt=`You are the cheap first-pass triage for Luxury Hunter, a buyer of second-hand luxury handbags in Asia for resale in Western Europe. Only a few listings can receive the expensive full analysis, so select ONLY those with a realistic chance of being a profitable, authentic, exact-target purchase.
+    const prompt=`You are the cheap first-pass triage for Luxury Hunter, a buyer of second-hand luxury bags and watches in Asia for resale in Western Europe. Select the listings that are plausibly the authentic target product, so they get the full inspection.
 
 TASK: ${task.task_name}
 TARGET PRODUCT: ${task.product_query}
 TASK CRITERIA (abridged):
 ${String(task.description||'').slice(0,1800)}
 
-Prefer recall over precision: a full analysis costs about one cent, a missed bargain costs hundreds of euros. When a listing plausibly matches the target and the price looks attractive, score it at least 55 even if information is incomplete.
+Prefer recall over precision: a full analysis costs about one cent, a missed bargain costs hundreds of euros. DO NOT JUDGE THE PRICE: Luxury Hunter prices every listing itself from Nil's references. When a listing plausibly is the target product, score it at least 55 even if information is incomplete.
 
-Score each listing 0-100 for "worth a full analysis":
-- High: clearly the target product family/size, price well below typical European resale after the landed cost, no red flags.
-- Low: different model/size/product type (wallets, pouches, charms, straps, other bags), accessories only, replica wording, damaged beyond resale, price already near or above European resale, or too little information to identify the item.
+Score each listing 0-100 for "is this plausibly the target product":
+- High: clearly the target product family/size, no red flags.
+- Low: different model/size/product type (wallets, pouches, charms, straps, other bags), accessories only, replica wording, damaged beyond resale, or too little information to identify the item.
 - Score 0: genuine exotic leather (crocodile, alligator, python/snake, ostrich, lizard, stingray) — CITES import risk. Embossed calf is fine.
-- price_vs_task_median < 1 means cheaper than the median asking price seen for this task (a positive signal, not proof).
 Never invent facts. Use only the listing text below (titles may be Korean, Japanese or Chinese).
 
 LISTINGS (JSON):
@@ -10375,9 +10524,9 @@ function importCostLines(x){
   const rows=[
     ['Producto',c.productPriceEur],
     ['Envío en origen',c.domesticShippingEur],
-    [`Comisión agente${c.agentFeePercent?` ${c.agentFeePercent} %`:''}`,c.agentFeeEur],
+    [`${c.source==='vestiaire'?'Gastos de servicio de Vestiaire':'Comisión agente'}${c.agentFeePercent?` ${c.agentFeePercent} %`:''}`,c.agentFeeEur],
     [`Pago Alipay ${c.paymentFeePercent} %`,c.paymentFeeEur],
-    ['Envío internacional',c.internationalShippingEur],
+    [c.source==='vestiaire'?'Envío y autenticación de Vestiaire':'Envío internacional',c.internationalShippingEur],
     [`Arancel${c.customsDutyPercent?` ${c.customsDutyPercent} %`:''}${c.lowValueDutyApplied?' (valor bajo)':''}`,c.customsDutyEur],
     [`IVA importación ${c.vatPercent} %${c.importVatMode==='deductible'?' (deducible)':''}`,vatShown],
     ['Despacho aduanero',c.clearanceFeeEur],
@@ -10416,6 +10565,8 @@ function vestiaireProfitLine(resaleLow,resaleHigh,landed,taskName=''){
 // dice: la reventa es entonces un pronóstico.
 function vestiaireCompsFor(taskName,item){
   let v={};try{v=JSON.parse(item?.verification_json||'{}')||{};}catch{}
+  // Análisis nuevo: las referencias que eligió la IA, tal cual se guardaron.
+  if(v?.market?.match_version)return v.market.sheet_comps||null;
   if(isWatchTask(taskName)&&v?.market&&'sheet_comps' in v.market)return v.market.sheet_comps;
   try{return vestiaireComparables({task_name:taskName},item,v?.exact&&v.exact.target_match!==false?v.exact:{brand:item?.brand,family:item?.model});}
   catch{return null;}
@@ -10456,12 +10607,14 @@ function vestiaireCompareSections(taskName,item){
   const base=[];
   if(c){
     const mdl=c.model?` · modelo ${htmlEsc(c.model)}${c.materialClass?` en ${htmlEsc(c.materialClass)}`:''}`:'';
-    base.push(c.tier==='iguales'
+    base.push(c.tier==='ia_iguales'
+      ? `${v.market?.orientative?'Mismo modelo en otra talla o estado (orientativo)':'Iguales al anuncio'}, elegidas una a una por la IA${c.tab?` · pestaña ${htmlEsc(c.tab)}`:''}`
+      : c.tier==='iguales'
       ? `Iguales al anuncio (${htmlEsc(c.basis)}, ${htmlEsc(c.colour)}, ${htmlEsc(c.material)})${mdl}`
       : c.tier==='misma_talla'
         ? `De la misma talla (${htmlEsc(c.basis)})${mdl}`
         : `No hay de esta talla: mismo modelo en otras tallas${mdl}, solo orientativo`);
-    if(c.cross)base.push(`Pestaña ${htmlEsc(c.tab)}`);
+    if(c.cross&&c.tier!=='ia_iguales')base.push(`Pestaña ${htmlEsc(c.tab)}`);
     const askPct=c.price_basis==='sold'?null:Math.round((c.ratio||0.92)*100);
     base.push(...refSummaryLines(c,askPct),...(c.picks||[]).slice(0,4).map(f=>refPickLine(f)));
   }else base.push('Tu base no tiene este modelo (mismo modelo, medidas, material y color).');
@@ -10471,7 +10624,8 @@ function vestiaireCompareSections(taskName,item){
     liveLines.push(`${live.n} anuncios de ${htmlEsc(live.model||'este modelo')}${live.material?` en ${htmlEsc(live.material)}`:''} (${htmlEsc(live.basis)})`);
     liveLines.push(...refSummaryLines(live,live.active_n?92:null),...(live.picks||[]).slice(0,4).map(f=>refPickLine(f,{material:false})));
     if(live.tier!=='misma_talla')liveLines.push('De otras tallas: solo orientativo.');
-  }else if(live)liveLines.push(`Sin datos: ${htmlEsc(VESTIAIRE_LIVE_WHY[live.status]||live.status)}.`);
+  }else if(live?.status==='no_match'&&v.market?.match_version)liveLines.push('Ninguno de los anuncios de Vestiaire de este modelo es igual (según la IA).');
+  else if(live)liveLines.push(`Sin datos: ${htmlEsc(VESTIAIRE_LIVE_WHY[live.status]||live.status)}.`);
   else liveLines.push('No se consultó para este anuncio.');
   let used='';
   if(c&&blend)used=`⚖️ Para los números se juntan las dos: tu base (pesa el doble) + ${blend.n_live} de Vestiaire de la misma talla que no estaban en tu base → <b>${eur0(blend.low)} – ${eur0(blend.high)}</b>`;
@@ -11453,12 +11607,6 @@ async function executeTask(taskId, runId=null) {
     }catch(e){
       result.status.instantAlerts={sent:0,error:e.message};
       console.error(`Instant alerts task ${taskId}:`,e.message);
-    }
-    try{
-      result.status.vestiaireDeals=await scanVestiaireDeals(task);
-    }catch(e){
-      result.status.vestiaireDeals={sent:0,error:e.message};
-      console.error(`Vestiaire deals task ${taskId}:`,e.message);
     }
     try{
       result.status.opportunitiesSheet=await syncOpportunitiesSheet();

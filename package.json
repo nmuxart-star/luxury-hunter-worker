@@ -7,7 +7,7 @@
     "start": "node server.mjs",
     "check": "node scripts/check.mjs",
     "test:xianyu": "node --test tests/xianyu-account-pool.test.mjs tests/justone-xianyu.test.mjs tests/xianyu-search-budget.test.mjs tests/github-run-schedule.test.mjs",
-    "test:vestiaire": "node --test tests/vestiaire-model.test.mjs tests/vestiaire-bag-match.test.mjs tests/vestiaire-live.test.mjs",
+    "test:vestiaire": "node --test tests/vestiaire-model.test.mjs tests/vestiaire-bag-match.test.mjs tests/vestiaire-live.test.mjs tests/reference-match.test.mjs",
     "background:install": "bash scripts/install-background.sh",
     "background:status": "bash scripts/status-background.sh",
     "background:uninstall": "bash scripts/uninstall-background.sh",
