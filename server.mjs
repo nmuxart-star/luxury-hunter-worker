@@ -4866,7 +4866,9 @@ function vestiaireComparables(task,item,exact){
     for(const [name,r] of Object.entries(refs)){
       if(name===taskName||r?.source!=='sheet'||!Array.isArray(r.fichas)||isWatchTask(name)!==watch)continue;
       const m=vestiaireSameModel(name,r.fichas.filter(usable),item,exact,{requireNamed:true});
-      if(m&&(!best||m.rows.length>best.rows.length))best={name,...m};
+      // Gana el modelo más concreto ("pochette accessoires" antes que "pochette"); a igualdad, más filas.
+      const spec=k=>String(k||'').split(' · ').pop().length;
+      if(m&&(!best||spec(m.key)>spec(best.key)||(spec(m.key)===spec(best.key)&&m.rows.length>best.rows.length)))best={name,...m};
     }
     if(best){pool=best.rows;model=best.key;tab=best.name;matClass=best.material||null;}
   }

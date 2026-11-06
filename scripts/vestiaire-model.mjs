@@ -30,7 +30,7 @@ const SINGLE=[
     ['My Lady Dior',/\bmy (lady )?dior\b|\bmy abcdior\b/i,true],['Miss Dior',/miss ?dior/i,true]]],
   [/dior saddle/i,'Saddle',/saddle|马鞍|サドル|새들/i,[
     ['Double Saddle',/double/i],['Saddle Bowler',/bowler/i],['Saddle Soft',/\bsoft\b/i]]],
-  [/chanel.*flap/i,'Classic Flap',/classic|timeless|classique|2\.55|\bcf\b|flap|口盖|マトラッセ|matelass|クラシック/i,[
+  [/chanel.*flap/i,'Classic Flap',/classic|timeless|classique|2\.55|\bcf\b|flap|口盖|マトラッセ|matelass|クラシック|클래식|플랩|마트라세/i,[
     ['Trendy CC',/trendy/i,true],['Chanel 19',/chanel ?19\b|^19$/i,true],['Boy',/\bboy\b/i,true],['Chanel 22',/chanel ?22\b/i,true],
     ['Coco Handle',/coco handle|top handle/i,true],['Gabrielle',/gabrielle/i,true],['Deauville',/deauville/i,true]]],
   [/evelyne/i,'Evelyne',/evelyne|エブリン|エヴリン|伊夫林|伊芙琳|에블린/i,[]],
@@ -67,9 +67,10 @@ const SIZE_WORDS=/\b(mini bolso|bolso|bandolera|boston|cabas|nano|mini|micro|sma
 const modelName=t=>modelNorm(t).replace(/[-_\/]/g,' ').replace(SIZE_WORDS,' ').replace(/^de (cuero|lona)$/,'').replace(/[^a-z0-9 .\-]/g,' ').replace(/\s+/g,' ').trim();
 const isWatchTab=tab=>/omega|cartier|tudor|seiko|tag heuer|rolex|reloj|watch|speedmaster|seamaster/i.test(tab||'');
 
-function singleKey(spec,text,{vintage=false,requireBase=false}={}){
+function singleKey(spec,text,{vintage=false,requireBase=false,formatText=null}={}){
   const [,base,baseRe,variants]=spec;
-  const t=String(text||'');
+  // "(no Edge)", "not the Teen": lo negado no cuenta como variante.
+  const t=String(text||'').replace(/\b(?:no|not|non|sin)\s+(?:es\s+|is\s+|the\s+|el\s+|la\s+)?[\w.-]+/gi,' ');
   const named=baseRe.test(t);
   // En el anuncio, una variante con nombre genérico ("vintage", "chain"...)
   // solo cuenta si también nombra el modelo; las de nombre propio (D-Joy,
@@ -77,7 +78,10 @@ function singleKey(spec,text,{vintage=false,requireBase=false}={}){
   for(const [key,re,own] of variants)if(re.test(t)&&(own||named||!requireBase))return {key,explicit:true};
   if(requireBase&&!named)return null;
   if(vintage&&variants.some(([k])=>k==='Jackie vintage'))return {key:'Jackie vintage',explicit:true};
-  for(const [fmt,re] of FORMATS)if(re.test(t))return {key:`${base} · ${fmt}`,explicit:named};
+  // El formato (tote, cartera...) sale de lo identificado si lo hay: los títulos
+  // de Asia van llenos de palabras de relleno ("caben el móvil y la cartera").
+  const ft=String(formatText??t).replace(/\b(?:no|not|non|sin)\s+(?:es\s+|is\s+|the\s+|el\s+|la\s+)?[\w.-]+/gi,' ');
+  for(const [fmt,re] of FORMATS)if(re.test(ft))return {key:`${base} · ${fmt}`,explicit:named};
   return {key:base,explicit:named};
 }
 
@@ -124,7 +128,8 @@ export function sameModelRows(tab,rows,texts={},{requireNamed=false}={}){
     const vintage=/vintage|古着|ヴィンテージ|빈티지/i.test(title);
     if(single){
       // El anuncio tiene que nombrar el modelo (en cualquier idioma).
-      const k=singleKey(single,title,{vintage,requireBase:true});
+      const label=String(texts.label||'').trim();
+      const k=singleKey(single,title,{vintage,requireBase:true,formatText:label||String(texts.title||'')});
       if(k){key=k.key;explicit=k.explicit;}
     }else{
       const fixed=MULTI_FIXED.find(([re])=>re.test(tab));

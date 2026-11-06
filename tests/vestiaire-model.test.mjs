@@ -76,3 +76,11 @@ test('material: tela/sintético, piel y piel exótica no se mezclan',()=>{
   assert.equal(sameMaterialRows(rows,'lambskin').rows.length,3);
   assert.equal(sameMaterialRows(rows,'').rows.length,5);
 });
+
+test('lo negado y el relleno del título no cambian el modelo',()=>{
+  const rows=[{size:'Puzzle'},{size:'Puzzle Edge'},{size:'Mini bolso Puzzle'}];
+  assert.equal(sameModelRows('Loewe Puzzle',rows,{title:'Loewe 罗意威 Puzzle mini 几何包',label:'Loewe Puzzle Mini, clásico (no Edge)'}).key,'Puzzle');
+  const lux=[{size:'Luggage'},{size:'Cabas Luggage'}];
+  // "caben el móvil y la cartera" en el título no lo convierte en cartera.
+  assert.equal(sameModelRows('Celine Luggage',lux,{title:'CELINE Luggage nano 笑脸包 手机钱包都能装',label:'Luggage Nano'}).key,'Luggage');
+});
