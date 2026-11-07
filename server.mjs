@@ -10074,6 +10074,24 @@ function vetoUnverifiableXianyuAnalyses(){
   }
   if(n)console.log(`Sin verificación de autenticidad (Xianyu/eBay): ${n} análisis pasados a descartados.`);
 }
+// PRECIO SIN IA (07-11-2026): si ni vendiéndolo al precio alto de la base de
+// Nil para ese modelo (el 10 % más caro de sus fichas) queda beneficio, no se
+// gasta IA en él. Antes un tercio del gasto se iba en anuncios así.
+function priceCeilingVeto(item,task){
+  if(['0','off','false','no'].includes(String(process.env.PRICE_PRESCREEN||'').toLowerCase()))return null;
+  let info;try{info=baseReferenceRows(task,item);}catch{return null;}
+  const vals=(info?.rows||[]).map(r=>refValue(r,VESTIAIRE_DEFAULT_REALIZATION)).filter(v=>v>0).sort((a,b)=>a-b);
+  if(vals.length<8)return null;
+  const top=vals[Math.min(vals.length-1,Math.floor(vals.length*0.9))];
+  const landed=Number(importEconomics(item)?.importedTotalEur)||0;
+  if(!(landed>0))return null;
+  const fee=resalePlatform(task.task_name).fee/100;
+  const minProfit=Number(task.notify_min_profit_eur)||200;
+  const clean=top*(1-fee)-landed;
+  if(clean>=minProfit*0.6)return null;
+  return {code:'price_ceiling',term:'precio alto',
+    reasons:[`Precio: ni vendiéndolo al precio alto de tu base (${Math.round(top)} €, el 10 % más caro de ${vals.length} fichas del modelo) queda beneficio (${Math.round(clean)} € limpios con un coste puesto de ${Math.round(landed)} €). Descartado sin usar IA.`]};
+}
 function storePrescreenReject(taskId,item,pre){
   const now=new Date().toISOString();
   const economics=importEconomics(item);
@@ -11671,7 +11689,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
         ).get(taskId,item.id);
 
         if(!existingAnalysis){
-          const pre=deterministicPrescreen(item,task);
+          const pre=deterministicPrescreen(item,task)||priceCeilingVeto(item,task);
           if(pre){
             storePrescreenReject(taskId,item,pre);
             prescreenStats.rejected++;
@@ -11769,7 +11787,18 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
         if(live.length){
           const ids=new Set(live.map(x=>x.id));
           live.sort((a,b)=>(Number(listingAuction(b).bids)||0)-(Number(listingAuction(a).bids)||0)||listingAuction(a).endMs-listingAuction(b).endMs);
-          pendingItems=[...pendingItems.filter(x=>x._needsVerification),...live,...pendingItems.filter(x=>!x._needsVerification&&!ids.has(x.id))];
+          // Tope de subastas por modelo y pasada (07-11-2026: 284 subastas
+          // analizadas en un día se comieron el presupuesto). Solo las que
+          // acaban en AUCTION_ANALYZE_HOURS (36 h) y como mucho
+          // AUCTION_ANALYSIS_MAX_PER_RUN (6), las de más pujas primero; el
+          // resto vuelve en otra pasada.
+          const horizon=Date.now()+Math.max(1,Number(process.env.AUCTION_ANALYZE_HOURS||36))*3600e3;
+          const cap=Math.max(1,Number(process.env.AUCTION_ANALYSIS_MAX_PER_RUN||6));
+          const soon=live.filter(x=>listingAuction(x).endMs<=horizon);
+          const keep=soon.slice(0,cap);
+          for(const x of live)if(!keep.includes(x))db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,x.id);
+          if(live.length>keep.length)console.log(`Task ${taskId}: ${keep.length} subastas a analizar ahora (de ${live.length}; el resto en otra pasada).`);
+          pendingItems=[...pendingItems.filter(x=>x._needsVerification),...keep,...pendingItems.filter(x=>!x._needsVerification&&!ids.has(x.id))];
         }
       }
 
