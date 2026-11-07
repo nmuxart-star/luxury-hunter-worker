@@ -7090,26 +7090,14 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       );
     }
 
-    // Ya analizados: fuera, salvo que el precio haya cambiado desde el
-    // análisis (regla de Nil, 07-11-2026). Las pujas de una subasta no cuentan.
+    // Ya analizados: siempre fuera, nunca se vuelven a analizar (regla de Nil, 07-11-2026).
     const priceChangedIds=new Set();
-    {
-      const lastPrice=db.prepare(`SELECT json_extract(verification_json,'$.analyzed_price_eur') p FROM task_analyses WHERE listing_id=? AND json_extract(verification_json,'$.analyzed_price_eur') IS NOT NULL ORDER BY updated_at DESC LIMIT 1`);
-      const rows=db.prepare(`SELECT l.id,l.price_eur,l.raw_json FROM search_session_items s JOIN listings l ON l.id=s.listing_id
-        WHERE s.session_id=? AND (EXISTS(SELECT 1 FROM task_analyses ta WHERE ta.listing_id=l.id) OR EXISTS(SELECT 1 FROM analyses a WHERE a.listing_id=l.id))`).all(result.sessionId);
-      for(const r of rows){
-        if(listingAuction(r))continue;
-        const was=Number(lastPrice.get(r.id)?.p), now=Number(r.price_eur);
-        if(was>0&&now>0&&Math.abs(now-was)/was>=PRICE_CHANGE_REVALUE)priceChangedIds.add(Number(r.id));
-      }
-    }
     const previousAnalyzedAnywhere={changes:0};
     {
       const del=db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?');
       const ids=db.prepare(`SELECT s.listing_id id FROM search_session_items s WHERE s.session_id=? AND (EXISTS(SELECT 1 FROM task_analyses ta WHERE ta.listing_id=s.listing_id) OR EXISTS(SELECT 1 FROM analyses a WHERE a.listing_id=s.listing_id))`).all(result.sessionId);
       for(const {id} of ids)if(!priceChangedIds.has(Number(id))){del.run(result.sessionId,id);previousAnalyzedAnywhere.changes++;}
     }
-    if(priceChangedIds.size)console.log(`Task ${taskId}: ${priceChangedIds.size} anuncio(s) ya analizado(s) con el precio cambiado: se vuelven a valorar.`);
 
     if(previousAnalyzedAnywhere.changes){
       console.log(
