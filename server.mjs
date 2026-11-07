@@ -16,7 +16,7 @@ import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationT
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,compWeight,compStats,refAgeDays,weightedQuantile} from './scripts/vestiaire-bag-match.mjs';
-import {MATCH_VERSION,refCandidates,refTable,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
+import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {macOneMapReady,macOneMapSnapshot,macVestiaireSearch} from './scripts/onemap-mac-client.mjs';
 import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables,vestiaireTaskQuery,VESTIAIRE_LIVE_REALIZATION} from './scripts/vestiaire-live.mjs';
@@ -8189,7 +8189,7 @@ function storeStandaloneAnalysis(item,a,now){
 const REF_MAX_BASE=Number(process.env.REF_MAX_BASE||80);
 const REF_EXTRA_BASE=Number(process.env.REF_EXTRA_BASE||320);
 const REF_MAX_LIVE=Number(process.env.REF_MAX_LIVE||96);
-const REF_MAT_CLASS=[['exotica',/croco|alligat|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|stingray|exotic/i],['ante',/suede|ante\b|daim|nubuck|绒/i],['tela',/canvas|lona|toile|nylon|nail[oó]n|tela|fabric|denim|tweed|jacquard|cotton|algod[oó]n|raffia|paja|帆布|尼龙/i],['piel',/leather|cuero|piel|calf|lamb|caviar|cordero|becerro|charol|patent|皮/i]];
+const REF_MAT_CLASS=[['exotica',/croco|alligat|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|stingray|exotic/i],['ante',/suede|ante\b|daim|nubuck|绒/i],['tela',/canvas|lona|toile|nylon|nail[oó]n|tela|fabric|denim|tweed|jacquard|cotton|algod[oó]n|raffia|paja|帆布|尼龙/i],['sintetica',/vegana|vegan|sint[eé]tic|faux|imitaci|ecopiel|合成皮革|フェイクレザー/i],['charol',/charol|patent|vernis|エナメル|漆皮/i],['piel',/leather|cuero|piel|calf|lamb|caviar|cordero|becerro|charol|patent|皮/i]];
 const refMatClass=t=>(REF_MAT_CLASS.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 const refColour=t=>(typeof VESTIAIRE_COLOR_RE!=='undefined'?VESTIAIRE_COLOR_RE.find(([,re])=>re.test(String(t||''))):null)?.[0]||null;
 const refSize=t=>typeof vestiaireSizeLabel==='function'?vestiaireSizeLabel(String(t||'')):null;
@@ -8275,7 +8275,71 @@ function referenceCompsForAlert(price,{tab,model,source}){
 // referencias que la IA ha visto en foto y son el mismo bolso (mismo modelo,
 // misma talla/versión, mismo material). Si no hay ninguna, no hay precio ni
 // referencias en el aviso.
-const REF_PHOTO_MAX=Number(process.env.REF_PHOTO_MAX||30);
+const REF_PHOTO_MAX=Number(process.env.REF_PHOTO_MAX||12);
+// SELECCIÓN DE REFERENCIAS (regla de Nil, 07-11-2026): siempre del mismo
+// modelo; las elige el bot, no la IA. Mismo material obligatorio; si el
+// anuncio dice su talla o medidas, solo esa talla (±15 %); delante las de
+// mismas medidas y mismo color. Solo esas (REF_PHOTO_MAX, 12) se comprueban
+// con fotos.
+const REF_SIZE_JP=[['Mini',/ミニ|ﾐﾆ|迷你/],['Small',/スモール|小号/],['Medium',/ミディアム|ミディアム|中号/],['Large',/ラージ|大号|ラージュ/]];
+// Relojes: el diámetro de la caja en mm (el primer número de "41 x 47 mm").
+const caseMm=t=>{const m=String(t||'').match(/(\d{2}(?:[.,]\d)?)\s*(?:mm|ミリ|毫米)|(\d{2}(?:[.,]\d)?)\s*[x×]\s*\d{2}(?:[.,]\d)?\s*mm/i);const n=m?Number(String(m[1]||m[2]).replace(',','.')):NaN;return n>=18&&n<=60?n:null;};
+function listingWidthCm(text){
+  const t=String(text||'');
+  const mm=caseMm(t);
+  if(mm)return mm/10;
+  const w=vestiaireWidthCm(t);
+  if(w)return w;
+  const m=t.match(/(?:W|横幅?|幅|width|ancho|largo)\s*[:：]?\s*(?:約|约|approx\.?|aprox\.?)?\s*(\d{1,2}(?:[.,]\d)?)\s*(?:cm|センチ|㎝)/i)
+    ||t.match(/(?:マトラッセ|matelass[eé]|classic flap|timeless|クラシック|ラムスキン)\s*(\d{2})(?!\d)/i);
+  const n=m?Number(String(m[1]).replace(',','.')):NaN;
+  return n>=8&&n<80?n:null;
+}
+function listingSizeLabel(text){
+  const v=vestiaireSizeLabel(text);
+  return (v&&v!=='Bandolera'?v:null)||(REF_SIZE_JP.find(([,re])=>re.test(String(text||'')))||[])[0]||null;
+}
+function pickPhotoRefs(rows,{ident={},item={},boost={},max=REF_PHOTO_MAX}={}){
+  const text=`${item.title||''} ${item.description||''}`;
+  const unsure=/no (indicad|especificad|confirm)|parece|probabl|desconoc|unknown|not (stated|given)/i.test(String(ident.size||''));
+  // Talla dicha en el anuncio (texto): filtro duro. Talla deducida por la IA: solo puntúa.
+  const hardW=listingWidthCm(text), hardS=listingSizeLabel(item.title||'');
+  const guessW=hardW||(unsure?null:listingWidthCm(ident.size)), guessS=hardS||(unsure?null:listingSizeLabel(`${ident.size||''} ${ident.variant||''}`));
+  const lMat=refMatClass(ident.material)||refMatClass(text), lCol=refColour(ident.colour);
+  const flat=v=>String(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  const idRefs=[...String(`${ident.model||''} ${ident.variant||''} ${ident.size||''} ${item.title||''}`).toUpperCase().matchAll(/[A-Z0-9][A-Z0-9.\- ]{3,}[0-9][A-Z0-9]*/g)]
+    .map(m=>flat(m[0])).filter(x=>x.length>=5&&/\d{3}/.test(x));
+  const out=[];
+  for(const r of rows||[]){
+    const rMat=refMatClass(`${r.material||''} ${r.notes||''}`);
+    if(lMat&&rMat&&rMat!==lMat)continue;
+    const rW=caseMm(r.dims)?caseMm(r.dims)/10:(vestiaireWidthCm(r.dims)||listingWidthCm(`${r.size||''} ${r.notes||''}`));
+    const rS=listingSizeLabel(`${r.size||''} ${r.model||''} ${r.notes||''}`);
+    if(hardW&&rW&&Math.abs(rW-hardW)/hardW>0.15)continue;
+    if(!(hardW&&rW)&&hardS&&rS&&rS!==hardS)continue;
+    let s=0;
+    if(guessW&&rW){const d=Math.abs(rW-guessW)/guessW;s+=d<=0.07?6:d<=0.15?3:-3;}
+    else if(guessS&&rS)s+=rS===guessS?4:-3;
+    if(lCol&&refColour(r.color)===lCol)s+=3;
+    if(lMat&&rMat===lMat)s+=1;
+    const rr=flat(r.size);
+    // Relojes: la misma referencia pesa más que nada; después, la misma familia.
+    if(idRefs.length&&rr.length>=5)s+=idRefs.some(x=>x.includes(rr)||rr.includes(x))?10:idRefs.some(x=>x.slice(0,5)===rr.slice(0,5))?5:idRefs.some(x=>x.slice(0,4)===rr.slice(0,4))?2:0;
+    s+=boost[r._code]||0;
+    if(!(/^https:\/\//.test(String(r.photo||''))||String(r._code||'').startsWith('V')))s-=4;
+    if(r.sold)s+=0.5;
+    out.push({r,s,size:rS||(rW?`${Math.round(rW)}cm`:'?')});
+  }
+  out.sort((a,b)=>b.s-a.s||compWeight(b.r)-compWeight(a.r));
+  // Sin ninguna pista de talla: unas pocas de cada talla, para que la foto decida.
+  if(!guessW&&!guessS){
+    const by=new Map();for(const x of out){if(!by.has(x.size))by.set(x.size,[]);by.get(x.size).push(x);}
+    const lists=[...by.values()];const pick=[];
+    for(let i=0;pick.length<max&&lists.some(l=>l[i]);i++)for(const l of lists){if(l[i]&&pick.length<max)pick.push(l[i]);}
+    return pick.map(x=>x.r);
+  }
+  return out.slice(0,max).map(x=>x.r);
+}
 const refPhotoCache=new Map();
 async function refPhotoPart(r){
   const thumb=()=>{
@@ -8304,22 +8368,25 @@ const REF_PHOTO_INSTRUCTION=`You are the reference checker of Luxury Hunter. Lux
 The first images are the LISTING. After them come the REFERENCE photos, each one preceded by its code and its text.
 For EACH reference decide if it is the SAME PRODUCT as the listing:
 - same brand and model, and the same version/size/format: same silhouette and proportions, same closure, handle/strap type and hardware style; measurements within about 15 % when both are known. Mini, Small, regular and Large are different products.
-- same material family (smooth or grained leather, canvas, nylon, suede, exotic...). Colour may differ.
+- ONLY the same model line: never confirm another line of the brand even if it looks alike (Lady Dior ≠ Lady D-Lite/D-Joy, Classic Flap ≠ Boy/19/Coco Handle/WOC, Saddle ≠ Bobby, City ≠ First/Work/Neo Classic, Santos ≠ Santos Galbée/Demoiselle/Octagon).
+- same material family (smooth or grained leather, canvas, nylon, suede, exotic...). Colour may differ, but list in "same_colour" the confirmed codes that also have the same colour.
 - WATCHES: same reference family (2541.80 ≠ 2531.80), same movement (quartz ≠ automatic), same case size and material; dial colour must match.
 - condition at most one grade apart.
 SIZE WHEN THE LISTING GIVES NO MEASUREMENTS: do NOT reject a reference only because the listing text has no size. Judge the size from the photos as an expert would: proportions (width/height), number of quilting diamonds or stitched rows across the flap and the front, size of the turn-lock/logo and of the chain relative to the bag, strap length, hand or body for scale. Compare that with the reference photo and its measurements, and confirm it when they agree. Reject for size only when the photos point to a different size/version or are genuinely inconclusive between two sizes that look alike (for example mini vs regular with nothing to tell them apart).
 If the reference photo shows another bag or another product, it is NOT the same. A reference without photo can only be confirmed if its text gives the same size or measurements and version.
 Missing a reference that IS the same product is also an error: Nil checks your answers and an equal reference left out is as bad as a wrong one.
-Also re-judge the LISTING with all its photos (no prices): condition, completeness, quality and authenticity risk, as before.
+Also re-judge the LISTING with all its photos: condition, completeness, quality and authenticity risk, as before.
+PRICE (orientative): using ONLY the references you put in "same" and their prices (SOLD prices are real sales and weigh more than asking prices; same measurements and same colour weigh more), give price_eur = the realistic price at which THIS listing would sell second-hand in Europe in its condition and completeness. Go down for worse condition, wear, missing box/card/strap/papers; go up only if it is clearly better than those references. Never go above the highest or far below the lowest of the confirmed references. If "same" is empty, price_eur is null.
 Return ONLY JSON:
-{"same":["B3","V2"],"not_same":{"B4":"motivo breve en español"},"flaws_zh":"desgaste visible del ANUNCIO en chino, máx. 15 caracteres (p. ej. 四角轻微磨损); vacío si no se ve ninguno","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
+{"same":["B3","V2"],"same_colour":["B3"],"price_eur":0,"price_reason_es":"una frase: con qué referencias y por qué ese precio","not_same":{"B4":"motivo breve en español"},"flaws_zh":"desgaste visible del ANUNCIO en chino, máx. 15 caracteres (p. ej. 四角轻微磨损); vacío si no se ve ninguno","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
 async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,first}){
   const listing=analyzeImages?await fetchGeminiImageParts(item,Number(process.env.REF_LISTING_PHOTOS||6)):[];
   const photos=await Promise.all(refs.map(r=>refPhotoPart(r)));
   const head=`${REF_PHOTO_INSTRUCTION}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nFIRST IDENTIFICATION (text): ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour})}\n\nLISTING PHOTOS:`;
   const parts=[{text:head},...listing,{text:'REFERENCES (code | model | size | measurements | material | colour | condition | sold? | published | notes):'}];
   refs.forEach((r,i)=>{
-    parts.push({text:`${refTable([r])}${photos[i]?'':'\n(NO PHOTO)'}`});
+    const v=refValue(r,1);
+    parts.push({text:`${refTable([r])} | ${v?`${Math.round(v)} € ${r.sold?'(SOLD price)':'(asking price)'}`:'no price'}${photos[i]?'':'\n(NO PHOTO)'}`});
     if(photos[i])parts.push(photos[i]);
   });
   const r=await geminiJsonRequest({key,model:aiModel(),parts,googleSearch:false,purpose});
@@ -8341,9 +8408,11 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   // Todas las fichas del modelo con su código (B1… por peso); la primera
   // pasada ve las 80 primeras y el resto se revisa después por parecido.
   const base=refCandidates(baseInfo.rows,{prefix:'B',limit:REF_MAX_BASE+REF_EXTRA_BASE,excludeId});
-  const base0=base.slice(0,REF_MAX_BASE);
+  // La primera lectura ve solo las 40 más parecidas por el título (misma talla
+  // y color primero), no las 80 que más pesan.
+  const base0=pickPhotoRefs(base,{item,max:Number(process.env.REF_SCREEN_MAX||40)});
   const live=refCandidates(liveInfo.rows,{prefix:'V',limit:REF_MAX_LIVE,excludeId});
-  const prompt=referencePrompt(task,item,base0,live,economics);
+  const prompt=referencePrompt(task,item,base0,pickPhotoRefs(live,{item,max:24}),economics);
   const inspect=async(purpose,images)=>{
     const parts=analyzeImages?await fetchGeminiImageParts(item,images):[];
     const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:prompt},...parts],googleSearch:false,purpose});
@@ -8363,9 +8432,19 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     return {same:out.flatMap(d=>Array.isArray(d.base_same)?d.base_same:[]),similar:out.flatMap(d=>Array.isArray(d.base_similar)?d.base_similar:[]),chunks:chunks.length,rows:rest.length};
   };
   const evaluate=data=>{
-    const basePrice=priceFromRefs(base,data.base_same,{ratio:realization});
-    const livePrice=priceFromRefs(live,data.vestiaire_same,{ratio:VESTIAIRE_LIVE_REALIZATION});
-    const combined=combinePrices(basePrice,livePrice);
+    const basePrice=priceFromRefs(base,data.base_same,{ratio:realization,prefer:data.same_colour});
+    const livePrice=priceFromRefs(live,data.vestiaire_same,{ratio:VESTIAIRE_LIVE_REALIZATION,prefer:data.same_colour});
+    let combined=combinePrices(basePrice,livePrice);
+    // Precio orientativo de la IA (calidad del anuncio frente a las iguales),
+    // dentro de lo que dicen esas referencias.
+    const ai=Number(data.ai_price_eur);
+    if(combined&&ai>0){
+      const vals=[...(basePrice?.weighted||[]),...(livePrice?.weighted||[])].map(x=>Number(x.v)).filter(v=>v>0);
+      if(vals.length){
+        const clamped=Math.round(Math.max(Math.min(...vals)*0.9,Math.min(Math.max(...vals),ai)));
+        combined={...combined,formula:combined.realistic,ai_price:Math.round(ai),realistic:clamped};
+      }
+    }
     const orientative=false;
     const failed=String(marketplaceVerification.status||'').toUpperCase()==='FAILED';
     const dec=decideFromNumbers({price:combined,landed,feePct:platform.fee,minProfit:Number(task.notify_min_profit_eur)||200,
@@ -8377,34 +8456,20 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const shot=await inspect('screen',2);
   const codes=(list,cands)=>{const ok=new Set(cands.map(r=>r._code));return [...new Set((Array.isArray(list)?list:[]).map(c=>String(c).trim().toUpperCase()))].filter(c=>ok.has(c));};
   const s1={...shot.data};
-  // El resto de la base del modelo, para que no se escape ninguna igual.
-  let extra={chunks:0,rows:0};
-  if(base.length>REF_MAX_BASE&&s1.target_match!==false){
-    reportProgress(40,'Revisando el resto de tu base',`${base.length-REF_MAX_BASE} fichas más del modelo`);
-    extra=await inspectMoreBase(s1);
-    s1.base_same=[...(Array.isArray(s1.base_same)?s1.base_same:[]),...extra.same];
-    s1.base_similar=[...(Array.isArray(s1.base_similar)?s1.base_similar:[]),...extra.similar];
-  }
+  // Ya no se repasan 400 fichas en tandas de texto: el bot elige las
+  // referencias (mismo modelo y material, misma talla, mismas medidas y color
+  // delante) y la primera lectura solo les da un empujón.
+  const extra={chunks:0,rows:0};
   const sameB=codes(s1.base_same,base), simB=codes(s1.base_similar,base).filter(c=>!sameB.includes(c));
   const sameV=codes(s1.vestiaire_same,live), simV=codes(s1.vestiaire_similar,live).filter(c=>!sameV.includes(c));
   // Ninguna referencia cuenta sin pasar por las fotos. Solo se comprueban si,
-  // contando todas las posibles (o solo las seguras), podría salir rentable.
+  // contando todas las elegidas, podría salir rentable.
   const promising=d=>['STRONG BUY','BUY','WATCH'].includes(evaluate(d).dec.decision);
-  const byCode=new Map([...base,...live].map(r=>[r._code,r]));
-  const picked=[...sameB,...sameV,...simB,...simV].map(c=>byCode.get(c)).filter(Boolean);
-  // PRECISIÓN (regla de Nil, 07-11-2026): que no se escape ninguna igual. La
-  // primera lectura es solo de texto con el modelo barato y puede pasar por
-  // alto referencias iguales; detrás de las que eligió se añaden las más
-  // parecidas de la base y de Vestiaire (misma talla, material y color
-  // primero) hasta 2 rondas de fotos, y el modelo bueno las mira una a una.
-  const pickedSet=new Set(picked.map(r=>r._code));
-  const fill=s1.target_match===false?[]:[...rankByIdentity(base,s1),...rankByIdentity(live,s1)]
-    .filter(r=>!pickedSet.has(r._code)).slice(0,Math.max(0,REF_PHOTO_MAX*2-picked.length));
-  const poolAll=[...picked,...fill];
+  const boost={};for(const c of [...sameB,...sameV])boost[c]=3;for(const c of [...simB,...simV])boost[c]=boost[c]||1;
+  const poolAll=s1.target_match===false?[]:pickPhotoRefs([...base,...live],{ident:s1,item,boost,max:REF_PHOTO_MAX});
   let d={...s1,base_same:[],vestiaire_same:[]};
   let confirmed=false, photoCheck=null, unprofitableAnyway=null;
-  const fillB=fill.filter(r=>r._code.startsWith('B')).map(r=>r._code), fillV=fill.filter(r=>r._code.startsWith('V')).map(r=>r._code);
-  const optimistic={...s1,base_same:[...sameB,...simB,...(picked.length?[]:fillB)],vestiaire_same:[...sameV,...simV,...(picked.length?[]:fillV)]};
+  const optimistic={...s1,base_same:poolAll.filter(r=>r._code.startsWith('B')).map(r=>r._code),vestiaire_same:poolAll.filter(r=>r._code.startsWith('V')).map(r=>r._code)};
   if(poolAll.length&&(promising(optimistic)||promising({...s1,base_same:sameB,vestiaire_same:sameV}))){
     // Siempre con el modelo bueno: la precisión del precio depende de esto.
     const strong=true;
@@ -8423,7 +8488,9 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
         if(same.length)break;
       }
       d={...s1,...Object.fromEntries(['target_match','condition_grade','completeness_es','quality_score','authenticity_risk','exotic_skin','decision_reasons_es','flaws_zh'].filter(k=>pd[k]!=null&&pd[k]!=='').map(k=>[k,pd[k]])),
-        base_same:same.filter(c=>c.startsWith('B')),vestiaire_same:same.filter(c=>c.startsWith('V'))};
+        base_same:same.filter(c=>c.startsWith('B')),vestiaire_same:same.filter(c=>c.startsWith('V')),
+        ai_price_eur:same.length&&Number(pd.price_eur)>0?Number(pd.price_eur):null,price_reason_es:String(pd.price_reason_es||'').slice(0,240),
+        same_colour:(Array.isArray(pd.same_colour)?pd.same_colour:[]).map(c=>String(c).trim().toUpperCase()).filter(c=>same.includes(c))};
       confirmed=strong;
       photoCheck={checked,same,not_same:notSame,photos,model:strong?'verify':'screen'};
     }catch(e){
@@ -8458,7 +8525,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const priceNote=unprofitableAnyway
     ?`Ni contando como iguales todas las referencias posibles sale rentable: precio de venta realista ${combined?.realistic??combined?.mean} €, beneficio limpio en ${platform.name} ${dec.clean} € (margen ${dec.margin} %).`
     :combined
-    ?`Precio de venta realista ${combined.realistic??combined.mean} € con ${combined.n} referencias iguales comprobadas con foto (media ${combined.mean} €, franja ${combined.low}-${combined.high}); beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
+    ?`Precio orientativo ${combined.realistic??combined.mean} € con ${combined.n} referencias iguales comprobadas con foto${d.same_colour?.length?` (${d.same_colour.length} del mismo color)`:''} (media ${combined.mean} €, franja ${combined.low}-${combined.high})${d.price_reason_es?`: ${d.price_reason_es}`:''}; beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
     :photoCheck?.error?'No se pudieron comprobar las referencias con fotos: sin precio.'
     :`Sin referencias iguales en tu base (${base.length} fichas del modelo revisadas) ni en Vestiaire (${live.length}${liveInfo.status!=='ok'&&liveInfo.status!=='watch'?`; Vestiaire no respondió: ${liveInfo.status}`:''}): sin pronóstico de precio.`;
   a.decision_reasons_es=[priceNote,...(Array.isArray(d.decision_reasons_es)?d.decision_reasons_es:[]).map(String)].slice(0,5);
@@ -11053,7 +11120,7 @@ function instantAlertText(x,{soft=false}={}){
       :v.match_version&&Number(v.final?.resale_mean_eur)>0?[
         // Análisis nuevo: un precio de venta realista (media o mediana de las
         // iguales, la más baja) y el beneficio con ese precio, no con la franja alta.
-        `Precio de venta realista: <b>${eur0(v.final.resale_mean_eur)}</b> · ${alertResaleSource(x,v)}`,
+        `Precio de venta orientativo: <b>${eur0(v.final.resale_mean_eur)}</b> · ${alertResaleSource(x,v)}`,
         `Franja de las referencias iguales: ${range(x.resale_low_eur,x.resale_high_eur)}`,
         `Beneficio limpio vendiendo en ${htmlEsc(resalePlatform(x._task_name).name)} (−${resalePlatform(x._task_name).fee} % comisión): <b>${eur0(v.final.net_profit_clean_eur)}</b>${Number.isFinite(Number(v.final.clean_margin_pct))?` · margen ${v.final.clean_margin_pct} %`:''}`
       ]:[

@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {refCandidates,refTable,priceFromRefs,combinePrices,decideFromNumbers,MATCH_VERSION} from '../scripts/reference-match.mjs';
+import {refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers,MATCH_VERSION} from '../scripts/reference-match.mjs';
 import {compWeight,compStats,weightedQuantile} from '../scripts/vestiaire-bag-match.mjs';
 
 const ago=d=>new Date(Date.now()-d*86400e3).toISOString().slice(0,10);
-const ref=(id,price,{sold=false,likes=0,published=ago(10),size='Medium',material='Piel'}={})=>({id:String(id),url:`https://es.vestiairecollective.com/x-${id}.shtml`,model:'Lady Dior',size,material,color:'Negro',condition:'Muy buen estado',price_eur:price,sold,sold_price_eur:sold?price:null,likes,published});
+const ref=(id,price,{sold=false,likes=0,published=ago(10),size='Medium',material='Piel',color='Negro'}={})=>({id:String(id),url:`https://es.vestiairecollective.com/x-${id}.shtml`,photo:`https://img.example/${id}.jpg`,model:'Lady Dior',size,material,color,condition:'Muy buen estado',price_eur:price,sold,sold_price_eur:sold?price:null,likes,published});
 
 test('candidatas: las que más pesan primero, con código, sin repetir y sin el propio anuncio',()=>{
   const rows=[ref(1,1000),ref(2,1100,{sold:true,likes:50}),ref(2,1100),ref(3,900,{published:ago(400)}),ref(4,1200)];
@@ -58,12 +58,12 @@ test('decisión con los números; la calidad de la IA cuenta en la nota',()=>{
 // El análisis real del bot (analyzeByReferences), con la IA simulada.
 const source=fs.readFileSync(new URL('../server.mjs',import.meta.url),'utf8');
 const extract=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
-function harness({screen,photo,extraRows=[],extra={},landed=1000}){
+function harness({screen,photo,extraRows=[],extra={},landed=1000,colour=null}){
   const sheetRows=[ref(71,2000,{sold:true,likes:40}),ref(72,2100),ref(73,1900),ref(74,800,{size:'Mini'}),...extraRows];
   const liveRows=[{...ref(81,2200),sold:false},{...ref(82,2300),sold:true}];
   const stored=[],prompts=[];
   const ctx=vm.createContext({console,Number,String,JSON,Math,Date,Array,Object,Set,Map,Promise,Buffer,AbortSignal,process:{env:{}},
-    MATCH_VERSION,refCandidates,refTable,priceFromRefs,combinePrices,decideFromNumbers,compWeight,
+    MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers,compWeight,
     db:{prepare:()=>({get:()=>null})},fetch:async()=>{throw new Error('sin red');},
     vestiaireRefs:()=>({tasks:{'Lady Dior':{source:'sheet',fichas:sheetRows}}}),
     sameModelRows:(tab,rows)=>({key:'lady dior',rows}),isWatchTask:()=>false,
@@ -76,12 +76,13 @@ function harness({screen,photo,extraRows=[],extra={},landed=1000}){
     geminiJsonRequest:async({parts,purpose})=>{
       const text=parts.filter(p=>typeof p.text==='string').map(p=>p.text).join('\n');
       prompts.push({purpose,text});
-      const base={brand:'Dior',model:'Lady Dior',size:'Medium',target_match:true,condition_grade:'Muy buen estado',quality_score:80,authenticity_risk:'LOW',decision_reasons_es:['Medium negro con tarjeta.']};
+      const base={brand:'Dior',model:'Lady Dior',size:'Medium',...(colour?{colour}:{}),target_match:true,condition_grade:'Muy buen estado',quality_score:80,authenticity_risk:'LOW',decision_reasons_es:['Medium negro con tarjeta.']};
       if(/LISTING ALREADY IDENTIFIED/.test(text))return {data:{...base,base_same:[],base_similar:[],...extra}};
       if(/reference checker/.test(text))return {data:{...base,...photo}};
       return {data:{...base,...screen}};
     },
     storeTaskAnalysis:(...args)=>stored.push(args)});
+  vm.runInContext(extract('const VESTIAIRE_SIZE_RE=','const sheetNorm='),ctx);
   vm.runInContext(extract('const REF_MAX_BASE=','async function analyzeWithGemini('),ctx);
   const run=()=>ctx.analyzeByReferences({key:'k',item:{id:1,source:'xianyu',title:'Lady Dior medium',description:''},task:{task_name:'Lady Dior',product_query:'Lady Dior',notify_min_profit_eur:200},
     taskId:5,analyzeImages:true,reportProgress:()=>{},negotiated:false});
@@ -94,7 +95,7 @@ test('análisis: la IA preselecciona por texto y solo cuentan las comprobadas co
   assert.equal(h.prompts.length,2);
   assert.equal(h.prompts[1].purpose,'verify');
   assert.match(h.prompts[0].text,/NOT TO PRICE/);
-  assert.match(h.prompts[0].text,/B4 \| Lady Dior \| Mini/);   // le llegan todas, también las de otra talla
+  assert.doesNotMatch(h.prompts[0].text,/B4 \| Lady Dior \| Mini/);   // el título dice medium: la Mini no se compara
   assert.match(h.prompts[1].text,/reference checker/);
   assert.match(h.prompts[1].text,/\(NO PHOTO\)/);
   assert.ok(['BUY','STRONG BUY'].includes(a.decision),a.decision);
@@ -167,17 +168,38 @@ test('oferta al vendedor de Xianyu: abre por debajo y nunca pasa del máximo ren
   assert.equal(ctx.sellerOfferPlan({...x,source:'mercari-jp'},v),null);
 });
 
-test('análisis: revisa el resto de la base (más allá de las 80 primeras) y usa la igual que encuentre',async()=>{
+test('análisis: el bot elige las de la misma talla en toda la base (aunque estén más allá de las 80 que más pesan) y la foto confirma',async()=>{
   const many=Array.from({length:100},(_,i)=>ref(200+i,3000,{likes:0,size:i===95?'Medium':'Large'}));
-  const h=harness({extraRows:many,screen:{base_same:[],base_similar:[]},extra:{base_same:['B100']},photo:{same:['B100']}});
+  const h=harness({extraRows:many,screen:{base_same:[],base_similar:[]},photo:{same:['B100']}});
   const a=await h.run();
-  assert.ok(h.prompts.some(p=>/LISTING ALREADY IDENTIFIED/.test(p.text)),'hay tanda extra');
+  assert.ok(!h.prompts.some(p=>/LISTING ALREADY IDENTIFIED/.test(p.text)),'sin tandas extra de texto');
   const v=h.stored[0][4];
-  assert.equal(v.market.candidates.base,104);
-  assert.ok(v.market.candidates.extra_chunks>=1);
-  assert.equal(v.market.photo_check.same[0],'B100');
+  assert.ok(v.market.photo_check.checked.includes('B100'));
+  assert.ok(v.market.photo_check.checked.length<=12);
+  const check=h.prompts.find(p=>/reference checker/.test(p.text)).text;
+  assert.doesNotMatch(check,/\| Large \|/);            // ninguna de otra talla
   assert.ok(a.resale_mean_eur>0);
-  assert.equal(v.market.no_refs_interesting,false);
+});
+test('selección: las del mismo color van delante y entran en la comprobación aunque pesen menos',async()=>{
+  const blacks=Array.from({length:20},(_,i)=>ref(300+i,2000,{likes:50,sold:true}));
+  const h=harness({colour:'Rojo',extraRows:[...blacks,ref(399,2100,{likes:0,color:'Rojo'})],screen:{base_same:[],base_similar:[]},photo:{same:[]}});
+  await h.run();
+  const v=h.stored[0][4];
+  const checked=v.market.photo_check.checked;
+  const check=h.prompts.find(p=>/reference checker/.test(p.text)).text;
+  const firstRef=check.split('REFERENCES')[1].match(/\n?(B\d+) \|[^\n]*\| Rojo \|/);
+  assert.ok(firstRef,'la roja está en la comprobación');
+  assert.equal(checked[0],firstRef[1]);                   // y va la primera
+  assert.ok(checked.length<=12);
+});
+test('precio orientativo de la IA: se usa, pero nunca fuera de lo que dicen las referencias iguales',async()=>{
+  const h=harness({screen:{base_same:['B1','B2'],base_similar:[]},photo:{same:['B1','B2','B3'],price_eur:99999,price_reason_es:'Como las vendidas'}});
+  const a=await h.run();
+  assert.ok(a.resale_mean_eur<=2100,a.resale_mean_eur);   // tope: la referencia más cara
+  const low=harness({screen:{base_same:['B1'],base_similar:[]},photo:{same:['B1','B2','B3'],price_eur:1600,price_reason_es:'Peor estado'}});
+  const b=await low.run();
+  assert.equal(b.resale_mean_eur,1600);                    // dentro del rango: el de la IA
+  assert.match(b.decision_reasons_es.join(' '),/Peor estado/);
 });
 test('análisis: sin ninguna igual y buen anuncio → interesante sin pronóstico',async()=>{
   const h=harness({screen:{base_same:[],base_similar:[],vestiaire_same:[]},photo:{}});

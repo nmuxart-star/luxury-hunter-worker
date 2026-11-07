@@ -45,7 +45,8 @@ export function refValue(r,ratio=0.92){
   return v>0?v*ratio:null;
 }
 // Media ponderada y franja (p25–p75) de las referencias elegidas.
-export function priceFromRefs(cands,codes,{ratio=0.92}={}){
+export function priceFromRefs(cands,codes,{ratio=0.92,prefer=[]}={}){
+  const pref=new Set((prefer||[]).map(c=>String(c).trim().toUpperCase()));
   const want=new Set((codes||[]).map(c=>String(c).trim().toUpperCase()));
   const chosen=(cands||[]).filter(r=>want.has(String(r._code).toUpperCase()));
   const w=chosen.map(r=>({id:refId(r),s:!!r.sold,v:refValue(r,ratio),w:compWeight(r)})).filter(x=>x.v!=null&&x.w>0);
@@ -59,7 +60,8 @@ export function priceFromRefs(cands,codes,{ratio=0.92}={}){
   return {n:w.length,mean,low:q(.25),mid:q(.5),high:q(.75),realistic:Math.min(mean,q(.5)),sold_n:st.sold_n,recent_n:st.recent_n,likes_max:st.likes_max,
     price_basis:st.sold_n?(st.sold_n===w.length?'sold':'mixed'):'asking',ratio,
     weighted:w.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),
-    picks:chosen.slice().sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,5).map(({_code,...r})=>r)};
+    // En el aviso, primero las del mismo color.
+    picks:chosen.slice().sort((a,b)=>Number(pref.has(String(b._code).toUpperCase()))-Number(pref.has(String(a._code).toUpperCase()))||compWeight(b)-compWeight(a)).slice(0,5).map(({_code,...r})=>r)};
 }
 // Las dos juntas: la base de Nil pesa el doble; un anuncio que está en las
 // dos cuenta una vez (como de la base).
