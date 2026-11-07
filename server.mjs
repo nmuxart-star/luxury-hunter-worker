@@ -11088,7 +11088,8 @@ function sellerOfferPlan(x,v){
   const down50=c=>Math.max(50,Math.floor(c/50)*50);
   const maxCny=down50(Math.min(askCny,lo*rate));
   const openCny=down50(Math.min(askCny*0.85,maxCny*0.92));
-  const model=String(x.model||x._task_name||'').replace(/[<>]/g,'').slice(0,40);
+  // En el mensaje al vendedor, el modelo con su nombre de marca (no la descripción en español).
+  const model=String(v?.exact?.family&&!/^unknown/i.test(v.exact.family)?v.exact.family:x._task_name||x.model||'').split(/[,;(]/)[0].replace(/[<>]/g,'').trim().slice(0,30);
   const flaws=String(v?.final?.flaws_zh||'').trim();
   const msg=`您好，诚心想要这只${model}。${flaws?`看图片${flaws}，`:''}${openCny}元可以吗？走验货宝，同意的话我马上拍下付款，不来回砍价。谢谢！`;
   return {openCny,openEur:Math.round(openCny/rate),maxCny,maxEur:Math.round(maxCny/rate),profitOpen:Math.round(at(openCny/rate).clean),profitMax:Math.round(at(maxCny/rate).clean),msg,minProfit};
@@ -11103,87 +11104,84 @@ function sellerOfferLines(x,v){
     `<code>${htmlEsc(o.msg)}</code>`
   ];
 }
-function instantAlertText(x,{soft=false}={}){
-  const cmp=vestiaireCompareSections(x._task_name,x);
-  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
-  let raw={};try{raw=JSON.parse(x.raw_json||'{}')||{};}catch{}
+// AVISOS CORTOS (regla de Nil, 07-11-2026): solo lo que hace falta para
+// decidir, una idea por línea: qué es, cuánto cuesta, por cuánto se vende,
+// cuánto queda limpio, calidad, 3 referencias y el enlace.
+function alertMoney(x){
+  const orig=Number(x.original_price);
+  return Number.isFinite(orig)&&orig>0&&x.currency&&x.currency!=='EUR'?`${fmtMoney(orig,x.currency)} (≈ ${eur0(x.price_eur)})`:eur0(x.price_eur);
+}
+function alertEnds(auc){
+  if(!auc||!Number.isFinite(auc.endMs))return '';
+  const min=Math.max(0,Math.round((auc.endMs-Date.now())/60e3));
+  const at=new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',hour:'2-digit',minute:'2-digit'});
+  return `⏰ Termina a las <b>${at}</b> (en ${min<60?`${min} min`:`${Math.floor(min/60)} h ${min%60} min`}) · ${auc.bids||0} puja${auc.bids===1?'':'s'}`;
+}
+function alertIdentity(x,v){
   const exact=v.exact||{};
-  const known=t=>t&&!/unknown|desconocid|sin determinar/i.test(String(t));
+  const known=t=>t&&!/unknown|desconocid|sin determinar|no indicad|no especificad|no confirm/i.test(String(t));
+  // Cada dato corto: hasta la primera coma y sin coletillas ("probablemente…").
+  const short=(t,n=28)=>String(t||'').split(/[,;(]| - /)[0].replace(/\b(probablemente|aparentemente|posiblemente)\b.*$/i,'').trim().slice(0,n);
+  const model=short(exact.family&&!/^unknown/i.test(exact.family)?`${exact.brand&&!String(exact.family).toLowerCase().includes(String(exact.brand).toLowerCase())?exact.brand+' ':''}${exact.family}`:(x.model||x.title),48);
+  const bits=[known(exact.size)&&!model.toLowerCase().includes(short(exact.size).toLowerCase())?short(exact.size,20):'',
+    known(exact.material)?alertEs(short(exact.material)):'',known(exact.main_color)?alertEs(short(exact.main_color,20)):'',
+    known(exact.condition?.grade)?short(exact.condition.grade,20):''].filter(Boolean);
+  return `<b>${htmlEsc(model)}</b>${bits.length?` · ${htmlEsc(bits.join(' · '))}`:''}`;
+}
+function alertQuality(x,v){
+  const q=Number(v.final?.quality_score)||null;
+  const risk=RISK_ES[String(x.authenticity_risk||'').toUpperCase()]||'—';
+  const tag=String(x.source||'')==='xianyu'&&xianyuListingHasVerificationTag(x)?' · ✅ 验货宝':'';
+  return `⭐ Calidad ${q??'—'}/100 · riesgo ${risk}${tag}`;
+}
+function alertRefs(v){
+  const picks=[...(v.market?.sheet_comps?.picks||[]),...(v.market?.vestiaire_live?.picks||[])].slice(0,3);
+  if(!picks.length)return '';
+  const one=r=>{
+    const p=r.sold&&Number(r.sold_price_eur)>0?Number(r.sold_price_eur):Number(r.price_eur);
+    const txt=`${eur0(p)}${r.sold?' vendida':''}${r.color?` · ${alertEs(String(r.color).replace(/^Esfera\s+/i,''))}`:''}${r.size&&!/^\d{5,}$/.test(String(r.size))?` · ${String(r.size).slice(0,22)}`:''}`;
+    const href=r.url||r.link;
+    return href&&/^https?:\/\//.test(href)?`<a href="${htmlEsc(href)}">${htmlEsc(txt)}</a>`:htmlEsc(txt);
+  };
+  return `🔎 Iguales: ${picks.map(one).join('  ·  ')}`;
+}
+function alertLink(x){
+  if(!x.url)return '';
+  const app=listingAppLink(x);
+  return `📱 <a href="${htmlEsc(app)}">Abrir el anuncio</a>${app!==x.url?`  ·  <a href="${htmlEsc(x.url)}">web</a>`:''}`;
+}
+function instantAlertText(x,{soft=false}={}){
+  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
   const source=String(x.source||'');
   const platform=OPPORTUNITY_SOURCE_LABELS[source]||(source.startsWith('ebay-')?`eBay ${source.slice(5).toUpperCase()}`:source);
-  const orig=Number(x.original_price);
-  const price=Number.isFinite(orig)&&orig>0&&x.currency&&x.currency!=='EUR'?`${fmtMoney(orig,x.currency)} (≈ ${eur0(x.price_eur)})`:eur0(x.price_eur);
-  const ago=alertAgo(listingPublishedAtMs(x));
   const decision=String(x.decision||'').toUpperCase();
   const norefs=v.final?.no_refs_interesting===true&&!(Number(v.final?.resale_mean_eur)>0);
-  const head=norefs?'🔎 <b>INTERESANTE · SIN PRONÓSTICO</b>':soft?'👀 <b>POSIBLE OPORTUNIDAD · revísala</b>':`🔥 <b>${ALERT_DECISION_ES[decision]||htmlEsc(decision)}</b>`;
-  const modelText=String(x.model||'').toLowerCase();
-  const identified=[known(exact.size)&&!modelText.includes(String(exact.size).toLowerCase())&&exact.size,known(exact.material)&&alertEs(exact.material),known(exact.main_color)&&alertEs(exact.main_color)].filter(Boolean).join(' · ');
-  const title=String(x.title||'').trim();
-  const landed=Number(x.landed_cost_eur);
-  const margin=landed>0&&Number.isFinite(Number(x.net_profit_low_eur))?Math.round(Number(x.net_profit_low_eur)/landed*100):null;
-  const pct=Number.isFinite(x._priceVsTaskMedian)?Math.round((1-x._priceVsTaskMedian)*100):null;
-  const range=(a,b)=>a==null&&b==null?'—':`${eur0(a)}${b!=null&&Math.round(Number(b))!==Math.round(Number(a))?` – ${eur0(b)}`:''}`;
-  const reasons=(()=>{try{return JSON.parse(x.decision_reasons_es_json||'[]');}catch{return [];}})()
-    .map(r=>String(r||'').trim()).filter(Boolean)
-    // Lo que ya cuenta el bloque de comparación no se repite.
-    .filter(r=>!/^(CONSULTAR PRECIO:|Sin referencia en tu base|Reventa según tu base|Reventa ajustada con tu base|Sheets:|Precio combinado:)/.test(r)).slice(0,4);
-  const seller=[];
-  if(source.startsWith('ebay-'))seller.push(raw.authenticityGuarantee?'✅ Garantía de Autenticidad de eBay':`⭐ Vendedor top de eBay: ${Number(x.seller_sales)||0} valoraciones · ${x.seller_reviews??'—'} % positivas`);
-  else{
-    if(source==='xianyu'&&xianyuListingHasVerificationTag(x))seller.push('✅ Con verificación de autenticidad de Xianyu (验货宝)');
-    const stats=[Number(x.seller_sales)>0?`${Number(x.seller_sales)} ventas`:'',Number(x.seller_reviews)>0?`${Number(x.seller_reviews)} reseñas`:'',Number(x.seller_items)>0?`${Number(x.seller_items)} anuncios`:''].filter(Boolean);
-    if(stats.length)seller.push(`Vendedor: ${stats.join(' · ')}`);
-  }
-  seller.push(`Riesgo de autenticidad: <b>${RISK_ES[String(x.authenticity_risk||'').toUpperCase()]||htmlEsc(x.authenticity_risk||'—')}</b>`);
-  if(known(exact.condition?.grade))seller.push(`Estado: ${htmlEsc(exact.condition.grade)}`);
-  const links=[x.url?`📱 <a href="${htmlEsc(listingAppLink(x))}">Abrir en la app</a>`:'',x.url&&listingAppLink(x)!==x.url?`🌐 <a href="${htmlEsc(x.url)}">Ver en la web</a>`:''].filter(Boolean).join('  ·  ');
-  const header=[
-    listingAuction(x)?.live?auctionHotLine(listingAuction(x).bids):'',
-    `${head} · ${htmlEsc(x._task_name||'')}`,
-    `<b>${htmlEsc(x.model||title)}</b>${identified?` · ${htmlEsc(identified)}`:''}`,
-    title&&title!==x.model?`<i>${htmlEsc(title.slice(0,140))}</i>`:'',
-    `${htmlEsc(platform)} · <b>${price}</b>${ago?` · publicado ${ago}`:''}`,
-    norefs?`Calidad del anuncio ${Number(v.final?.quality_score)||'—'}/100`:`Puntuación ${x.opportunity_score??'—'}/100`
-  ].filter(Boolean);
-  const auc=listingAuction(x);
+  const head=norefs?'🔎 SIN PRONÓSTICO':soft?'👀 POSIBLE OPORTUNIDAD':decision==='STRONG BUY'?'🔥🔥 COMPRA MUY RECOMENDADA':decision==='BUY'?'🔥 COMPRA':decision==='WATCH'?'👁 VIGILAR':htmlEsc(ALERT_DECISION_ES[decision]||decision);
+  const auc=listingAuction(x)?.live?listingAuction(x):null;
+  const ago=alertAgo(listingPublishedAtMs(x));
+  const sale=Number(v.final?.resale_mean_eur)>0?Number(v.final.resale_mean_eur):Number(x.resale_low_eur)>0?Number(x.resale_low_eur):null;
+  const n=Number(v.market?.vestiaire_blend?.n)||((Number(v.market?.sheet_comps?.n)||0)+(Number(v.market?.vestiaire_live?.n)||0))||null;
+  const soldN=(Number(v.market?.sheet_comps?.sold_n)||0)+(Number(v.market?.vestiaire_live?.sold_n)||0);
+  const clean=Number.isFinite(Number(v.final?.net_profit_clean_eur))?Number(v.final.net_profit_clean_eur):Number(x.net_profit_low_eur);
+  const margin=Number.isFinite(Number(v.final?.clean_margin_pct))?Number(v.final.clean_margin_pct):null;
+  const o=sellerOfferPlan(x,v);
   const lines=[
-    ...header,
-    ...alertSection('💰 NÚMEROS',[
-      `Coste puesto en España: <b>${eur0(x.landed_cost_eur)}</b>${auc?.live?' (con la puja actual)':''}`,
-      ...(auc?.live?[`🔨 Subasta: ${auc.bids||0} puja${auc.bids===1?'':'s'} · termina ${Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—'}`]:[]),
-      ...(norefs?['<b>Sin pronóstico:</b> no hay ninguna referencia igual en tu base ni en Vestiaire, así que no te doy precio de venta. Te lo envío porque el anuncio es el modelo buscado y está en buen estado: valóralo tú.']
-      :v.match_version&&Number(v.final?.resale_mean_eur)>0?[
-        // Análisis nuevo: un precio de venta realista (media o mediana de las
-        // iguales, la más baja) y el beneficio con ese precio, no con la franja alta.
-        `Precio de venta orientativo: <b>${eur0(v.final.resale_mean_eur)}</b> · ${alertResaleSource(x,v)}`,
-        `Franja de las referencias iguales: ${range(x.resale_low_eur,x.resale_high_eur)}`,
-        `Beneficio limpio vendiendo en ${htmlEsc(resalePlatform(x._task_name).name)} (−${resalePlatform(x._task_name).fee} % comisión): <b>${eur0(v.final.net_profit_clean_eur)}</b>${Number.isFinite(Number(v.final.clean_margin_pct))?` · margen ${v.final.clean_margin_pct} %`:''}`
-      ]:[
-        `Reventa: <b>${range(x.resale_low_eur,x.resale_high_eur)}</b> · ${alertResaleSource(x,v)}`,
-        vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur,x._task_name).replace(/^Beneficio en/,'Beneficio limpio vendiendo en'),
-        `Margen bruto (reventa − coste): ${range(x.net_profit_low_eur,x.net_profit_high_eur)}${margin!=null?` · ${margin} %`:''}`
-      ]),
-      pct===null?'':pct>0?`📉 ${pct} % por debajo del precio mediano de este modelo`:`📈 ${Math.abs(pct)} % por encima del precio mediano de este modelo`
-    ]),
-    ...alertSection('💬 OFERTA AL VENDEDOR',sellerOfferLines(x,v)),
-    ...alertSection('🧾 DESGLOSE DEL COSTE',importCostLines(x)),
-    ...alertSection('📚 TU BASE DE DATOS',cmp.base),
-    ...alertSection('🌐 VESTIAIRE EN DIRECTO',cmp.live),
-    ...(cmp.used?['',cmp.used]:[]),
-    ...alertSection('🛡️ VENDEDOR Y AUTENTICIDAD',seller),
-    ...alertSection('📝 POR QUÉ',reasons.map(r=>`• ${htmlEsc(r.slice(0,300))}`)),
-    ...(links?['',links]:[])
+    auc?auctionHotLine(auc.bids):'',
+    `<b>${head}</b> · ${htmlEsc(x._task_name||'')}`,
+    alertIdentity(x,v),
+    `💶 <b>${alertMoney(x)}</b>${auc?' puja actual':''} · ${htmlEsc(platform)}${ago&&!auc?` · ${ago}`:''}`,
+    auc?alertEnds(auc):'',
+    norefs
+      ?`❔ No hay ninguna igual en tu base: sin precio de venta · coste puesto ${eur0(x.landed_cost_eur)}`
+      :sale?`📈 Venta orientativa <b>${eur0(sale)}</b>${n?` · ${n} igual${n===1?'':'es'}${soldN?` (${soldN} vendida${soldN===1?'':'s'})`:''}`:''}`:'',
+    !norefs&&sale?`✅ Beneficio limpio <b>${eur0(clean)}</b>${margin!=null?` (${margin} %)`:''} · coste puesto ${eur0(x.landed_cost_eur)}`:'',
+    alertQuality(x,v),
+    norefs?'':alertRefs(v),
+    o?`💬 Ofrece <b>¥${o.openCny}</b> · tu máximo ¥${o.maxCny} (${eur0(o.profitMax)} limpios)`:'',
+    o?`<code>${htmlEsc(o.msg)}</code>`:'',
+    alertLink(x)
   ];
-  // Telegram admite 4.096 caracteres: si no cabe, fuera primero los enlaces
-  // de anuncios comparables (nunca se corta el texto a medias).
-  let text=lines.join('\n');
-  while(text.length>4000){
-    const i=lines.findLastIndex(l=>/^ {3}· <a /.test(l));
-    if(i<0)break;
-    lines.splice(i,1);text=lines.join('\n');
-  }
-  return text;
+  return lines.filter(Boolean).join('\n').slice(0,4000);
 }
 
 // ── LÍMITE DE AVISOS POR MODELO ─────────────────────────────────────────
@@ -11334,21 +11332,20 @@ async function sendInstantAlerts(task,runId,items){
 // el riesgo son buenos y la puja actual va al menos un 10 % por debajo de ese
 // máximo. Como mucho AUCTION_ALERT_TASK_DAILY_MAX (3) por modelo cada 24 h.
 function auctionAlertText(x,plan){
+  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
   const auc=listingAuction(x)||{};
-  const left=Number.isFinite(auc.endMs)?Math.max(0,(auc.endMs-Date.now())/3600e3):null;
-  const ends=Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
   const maxLocal=plan.max_bid_local!=null?fmtMoney(plan.max_bid_local,plan.currency):eur0(plan.max_bid_eur);
   return [
     auctionHotLine(plan.bids),
-    `🔨 <b>Subasta · puja como máximo ${maxLocal}</b> · ${htmlEsc(x._task_name||'')}`,
-    `<b>${htmlEsc(x.model||x.title||'')}</b>`,
-    `${htmlEsc(x.purchase_via||x.source||'')} · puja actual ${fmtMoney(plan.current_bid,plan.currency)} (≈ ${eur0(x.price_eur)}) · ${plan.bids||0} puja${plan.bids===1?'':'s'}`,
-    `⏰ Termina el ${ends}${left!=null?` (en ${left<1?`${Math.round(left*60)} min`:`${Math.round(left)} h`})`:''}`,
-    `💰 <b>Puja máxima: ${maxLocal}</b> (≈ ${eur0(plan.max_bid_eur)})`,
-    `Con esa puja: coste puesto en España ${eur0(x.landed_cost_eur)} · vendiendo a ${eur0(plan.resale_eur)}${plan.resale_from_db?' (anuncios parecidos de tu base)':' (🔮 pronóstico)'} te quedan al menos <b>${eur0(plan.min_profit_eur)}</b> limpios (comisión de ${resalePlatform(x._task_name).name} e IVA del margen incluidos).`,
-    `Score ${x.opportunity_score??'—'} · riesgo de autenticidad ${htmlEsc(x.authenticity_risk||'—')}`,
-    ...vestiaireDbLines(x._task_name,x),
-    x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir la subasta</a>`:''
+    `<b>🔨 SUBASTA</b> · ${htmlEsc(x._task_name||'')}`,
+    alertIdentity(x,v),
+    alertEnds(auc),
+    `💶 Puja actual ${fmtMoney(plan.current_bid,plan.currency)} (≈ ${eur0(x.price_eur)})`,
+    `🎯 <b>Puja como máximo ${maxLocal}</b> (≈ ${eur0(plan.max_bid_eur)})`,
+    plan.resale_eur?`📈 Venta orientativa ${eur0(plan.resale_eur)}${plan.db_comparables?` · ${plan.db_comparables} iguales`:''} → al máximo te quedan ≥ ${eur0(plan.min_profit_eur)} limpios`:'',
+    alertQuality(x,v),
+    alertRefs(v),
+    alertLink(x)
   ].filter(Boolean).join('\n');
 }
 // Subasta con varios interesados (regla de Nil, 07-11-2026): se destaca
@@ -11439,14 +11436,12 @@ function triageOnlyText(x){
   const ends=auc?.live&&Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):null;
   return [
     auc?.live?auctionHotLine(auc.bids):'',
-    `🟡 <b>PASA EL TRIAJE · sin analizar</b> · ${htmlEsc(x._task_name||'')}`,
-    `<b>${htmlEsc(String(x.title||'').slice(0,160))}</b>`,
-    `${htmlEsc(x.purchase_via||x.source||'')} · <b>${fmtMoney(x.original_price,x.currency)}</b> (≈ ${eur0(x.price_eur)})`,
-    auc?.live?`🔨 Subasta: ${auc.bids||0} puja${auc.bids===1?'':'s'} · termina ${ends} (en ${Math.max(0,Math.round((auc.endMs-Date.now())/60e3))} min)`:'',
-    eco?.importedTotalEur?`Coste puesto en España${auc?.live?' con la puja actual':''}: ${eur0(eco.importedTotalEur)}`:'',
-    `Triaje: ${x._triageScore}/100${x._triageReason?` · ${htmlEsc(String(x._triageReason).slice(0,200))}`:''}`,
-    '⚠️ Presupuesto de IA de hoy agotado: no se ha comparado con tu base ni con fotos.',
-    x.url?`📱 <a href="${htmlEsc(listingAppLink(x))}">Abrir el anuncio</a>`:''
+    `<b>🟡 SIN ANALIZAR</b> (IA de hoy agotada) · ${htmlEsc(x._task_name||'')}`,
+    `<b>${htmlEsc(String(x.title||'').slice(0,120))}</b>`,
+    `💶 <b>${alertMoney(x)}</b>${auc?.live?' puja actual':''} · ${htmlEsc(x.purchase_via||x.source||'')}`,
+    auc?.live?alertEnds(auc):'',
+    eco?.importedTotalEur?`Coste puesto ${eur0(eco.importedTotalEur)} · triaje ${x._triageScore}/100`:`Triaje ${x._triageScore}/100`,
+    alertLink(x)
   ].filter(Boolean).join('\n');
 }
 async function sendTriageOnlyAlerts(task,runId,items){
