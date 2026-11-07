@@ -30,7 +30,7 @@ export function refCandidates(rows,{prefix='B',limit=80,excludeId=null}={}){
 // Una línea por referencia, corta, para que la IA las compare una a una.
 export function refTable(cands){
   return (cands||[]).map(r=>[r._code,clip(r.model||r.title,40),clip(r.size,20),clip(r.dims,18),clip(r.material,40),clip(r.color,20),clip(r.condition,24),
-    r.sold?'VENDIDO':'en venta',clip(r.published||String(r.created_at||'').slice(0,10),10),clip(r.notes,90)].join(' | ')).join('\n');
+    r.sold?'VENDIDO':'en venta',clip(r.published||String(r.created_at||'').slice(0,10),10),clip(r.notes,90),...(r.desc?[clip(r.desc,240)]:[])].join(' | ')).join('\n');
 }
 // Precio de una referencia: vendida, a su precio de venta; en venta, lo que
 // pide × ratio (lo que de verdad se acaba vendiendo).

@@ -4646,7 +4646,7 @@ const sheetFormulaUrl=v=>String(v||'').match(/^=\s*(?:IMAGE|HYPERLINK)\(\s*"(htt
 function vestiaireSheetTab(values,today,formulas=null){
   const head=(values[0]||[]).map(h=>String(h||'').trim().toLowerCase());
   const col=name=>head.indexOf(name);
-  const c={photo:col('foto'),link:col('enlace'),brand:col('marca'),model:col('modelo'),likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
+  const c={photo:col('foto'),link:col('enlace'),brand:col('marca'),model:col('modelo'),likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),desc:col('descripción')>=0?col('descripción'):col('descripcion'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
   if(c.ref<0||c.price<0)return null;
   const get=(row,i)=>i>=0?row[i]:'';
   const yes=v=>/^s[ií]|^yes|^true/i.test(String(v||'').trim());
@@ -4687,6 +4687,7 @@ function vestiaireSheetTab(values,today,formulas=null){
       published:String(get(row,c.published)||'').trim(),
       likes:sheetNumber(get(row,c.likes)),
       notes:String(get(row,c.notes)||'').trim().slice(0,200),
+      desc:c.desc>=0?String(get(row,c.desc)||'').replace(/\s+/g,' ').trim().slice(0,400):'',
       checked:String(get(row,c.checked)||'').trim(),
       url:/^https?:\/\//.test(String(get(row,c.url)||''))?String(get(row,c.url)).trim():link&&link.includes(id)?link:`https://es.vestiairecollective.com/${id}.shtml`,
       photo:sheetFormulaUrl(get(fRow,c.photo)),
@@ -8328,10 +8329,10 @@ function pickPhotoRefs(rows,{ident={},item={},boost={},max=REF_PHOTO_MAX}={}){
     .map(m=>flat(m[0])).filter(x=>x.length>=5&&/\d{3}/.test(x));
   const out=[];
   for(const r of rows||[]){
-    const rMat=refMatClass(`${r.material||''} ${r.notes||''}`);
+    const rMat=refMatClass(`${r.material||''} ${r.notes||''}`)||refMatClass(r.desc);
     if(lMat&&rMat&&rMat!==lMat)continue;
-    const rW=caseMm(r.dims)?caseMm(r.dims)/10:(vestiaireWidthCm(r.dims)||listingWidthCm(`${r.size||''} ${r.notes||''}`));
-    const rS=listingSizeLabel(`${r.size||''} ${r.model||''} ${r.notes||''}`);
+    const rW=caseMm(r.dims)?caseMm(r.dims)/10:(vestiaireWidthCm(r.dims)||listingWidthCm(`${r.size||''} ${r.notes||''}`)||listingWidthCm(r.desc));
+    const rS=listingSizeLabel(`${r.size||''} ${r.model||''} ${r.notes||''}`)||listingSizeLabel(r.desc);
     if(hardW&&rW&&Math.abs(rW-hardW)/hardW>0.15)continue;
     if(!(hardW&&rW)&&hardS&&rS&&rS!==hardS)continue;
     let s=0;
