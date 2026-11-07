@@ -1119,7 +1119,7 @@ function openaiInputFromParts(parts,detail='auto'){
       content.push({
         type:'input_image',
         image_url:`data:${type};base64,${p.inline_data.data}`,
-        detail
+        detail:p.detail||detail
       });
     }
   }
@@ -5391,7 +5391,7 @@ async function geminiJsonRequest({key,model,parts,googleSearch=false,purpose='ve
     return {data,groundingSources,webSearchQueries,jsonRepairUsed,usage:body?.usage||null};
   }
   const u=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
-  const payload={contents:[{role:'user',parts}]};
+  const payload={contents:[{role:'user',parts:parts.map(({detail,...p})=>p)}]};
 
   if(googleSearch){
     payload.tools=[{google_search:{}}];
@@ -8426,14 +8426,15 @@ PRICE (orientative): using ONLY the references you put in "same" and their price
 Return ONLY JSON:
 {"same":["B3","V2"],"same_colour":["B3"],"price_eur":0,"price_reason_es":"una frase: con qué referencias y por qué ese precio","not_same":{"B4":"motivo breve en español"},"flaws_zh":"desgaste visible del ANUNCIO en chino, máx. 15 caracteres (p. ej. 四角轻微磨损); vacío si no se ve ninguno","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
 async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,first}){
-  const listing=analyzeImages?await fetchGeminiImageParts(item,Number(process.env.REF_LISTING_PHOTOS||6)):[];
+  const listing=analyzeImages?await fetchGeminiImageParts(item,Number(process.env.REF_LISTING_PHOTOS||4)):[];
   const photos=await Promise.all(refs.map(r=>refPhotoPart(r)));
   const head=`${REF_PHOTO_INSTRUCTION}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nFIRST IDENTIFICATION (text): ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour})}\n\nLISTING PHOTOS:`;
   const parts=[{text:head},...listing,{text:'REFERENCES (code | model | size | measurements | material | colour | condition | sold? | published | notes):'}];
   refs.forEach((r,i)=>{
     const v=refValue(r,1);
     parts.push({text:`${refTable([r])} | ${v?`${Math.round(v)} € ${r.sold?'(SOLD price)':'(asking price)'}`:'no price'}${photos[i]?'':'\n(NO PHOTO)'}`});
-    if(photos[i])parts.push(photos[i]);
+    // Fotos de referencia en baja resolución (son miniaturas): cuesta mucho menos.
+    if(photos[i])parts.push({...photos[i],detail:'low'});
   });
   const r=await geminiJsonRequest({key,model:aiModel(),parts,googleSearch:false,purpose});
   const d=r.data||{};
@@ -8515,7 +8516,10 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const poolAll=s1.target_match===false?[]:pickPhotoRefs([...base,...live],{ident:s1,item,boost,max:REF_PHOTO_MAX});
   let d={...s1,base_same:[],vestiaire_same:[]};
   let confirmed=false, photoCheck=null, unprofitableAnyway=null;
-  const optimistic={...s1,base_same:poolAll.filter(r=>r._code.startsWith('B')).map(r=>r._code),vestiaire_same:poolAll.filter(r=>r._code.startsWith('V')).map(r=>r._code)};
+  // La comprobación con fotos (la parte cara) solo si con las 5 más parecidas
+  // podría salir rentable: con las 12, una Jumbo cara hacía rentable un Small.
+  const closest=poolAll.slice(0,5);
+  const optimistic={...s1,base_same:closest.filter(r=>r._code.startsWith('B')).map(r=>r._code),vestiaire_same:closest.filter(r=>r._code.startsWith('V')).map(r=>r._code)};
   if(poolAll.length&&(promising(optimistic)||promising({...s1,base_same:sameB,vestiaire_same:sameV}))){
     // Siempre con el modelo bueno: la precisión del precio depende de esto.
     const strong=true;
@@ -10128,8 +10132,12 @@ function vetoUnverifiableXianyuAnalyses(){
 function priceCeilingVeto(item,task){
   if(['0','off','false','no'].includes(String(process.env.PRICE_PRESCREEN||'').toLowerCase()))return null;
   let info;try{info=baseReferenceRows(task,item);}catch{return null;}
-  const vals=(info?.rows||[]).map(r=>refValue(r,VESTIAIRE_DEFAULT_REALIZATION)).filter(v=>v>0).sort((a,b)=>a-b);
-  if(vals.length<8)return null;
+  // Las 12 más parecidas por el título (misma talla, medidas, color y
+  // material, como las elegiría el bot), no todo el modelo: simulado con los
+  // 722 análisis del 07-11-2026, 153 descartes sin IA y ninguna compra perdida.
+  const near=pickPhotoRefs(info?.rows||[],{item,max:12});
+  const vals=near.map(r=>refValue(r,VESTIAIRE_DEFAULT_REALIZATION)).filter(v=>v>0).sort((a,b)=>a-b);
+  if(vals.length<5)return null;
   const top=vals[Math.min(vals.length-1,Math.floor(vals.length*0.9))];
   const landed=Number(importEconomics(item)?.importedTotalEur)||0;
   if(!(landed>0))return null;
@@ -10138,7 +10146,7 @@ function priceCeilingVeto(item,task){
   const clean=top*(1-fee)-landed;
   if(clean>=minProfit*0.6)return null;
   return {code:'price_ceiling',term:'precio alto',
-    reasons:[`Precio: ni vendiéndolo al precio alto de tu base (${Math.round(top)} €, el 10 % más caro de ${vals.length} fichas del modelo) queda beneficio (${Math.round(clean)} € limpios con un coste puesto de ${Math.round(landed)} €). Descartado sin usar IA.`]};
+    reasons:[`Precio: ni vendiéndolo al precio alto de las ${vals.length} fichas más parecidas de tu base (${Math.round(top)} €) queda beneficio (${Math.round(clean)} € limpios con un coste puesto de ${Math.round(landed)} €). Descartado sin usar IA.`]};
 }
 function storePrescreenReject(taskId,item,pre){
   const now=new Date().toISOString();
