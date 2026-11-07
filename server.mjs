@@ -3171,7 +3171,9 @@ const JAPAN_RADAR_SPECS=[
     cap:100,
     searchWaitMs:3500,
     detailWaitMs:4000,
-    searchUrl:q=>`https://jp.mercari.com/search?keyword=${encodeURIComponent(q)}&sort=created_time&order=desc`,
+    // Solo en venta (status=on_sale): sin filtro ~7 % de los resultados ya
+    // están vendidos o en trámite (prueba del 07-11-2026).
+    searchUrl:q=>`https://jp.mercari.com/search?keyword=${encodeURIComponent(q)}&sort=created_time&order=desc&status=on_sale`,
     // Fuera de Japón Mercari enseña los precios en euros: el precio en yenes
     // se lee de su API (buscador y ficha).
     searchApi:/api\.mercari\.jp\/v2\/entities:search/,
@@ -3819,6 +3821,20 @@ function mercariSearchApiPrices(apiResponses){
   return prices;
 }
 
+// Estado y fecha de publicación de cada anuncio según el buscador de Mercari.
+function mercariSearchApiInfo(apiResponses){
+  const out=new Map();
+  for(const json of apiResponses||[]){
+    for(const it of Array.isArray(json?.items)?json.items:[]){
+      const id=String(it?.id||'').trim();
+      if(!id)continue;
+      const c=Number(it?.created);
+      out.set(/^m\d+$/i.test(id)?id:`shops-${id}`,{status:String(it?.status||''),created:c>1e9?new Date(c*1000).toISOString():null});
+    }
+  }
+  return out;
+}
+
 async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
   const snap=spec.mode==='browser'
     ? await japanBrowserSnapshot(
@@ -3901,7 +3917,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
     candidate.href
   );
 
-  const status=/SOLD OUT|売り切れ|売切れ/i.test(snap.body)
+  const status=/SOLD OUT|売り切れ|売切れ/i.test(snap.body)||(candidate.apiStatus&&candidate.apiStatus!=='ITEM_STATUS_ON_SALE')
     ? 'sold'
     : '';
 
@@ -3920,7 +3936,7 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
     image_url:image,
     status,
     purchase_via:spec.purchaseVia,
-    publishedAt:publication?.publishedAt||null,
+    publishedAt:publication?.publishedAt||candidate.apiCreated||null,
     raw:{
       query:searchMeta.query,
       searchUrl:searchMeta.searchUrl,
@@ -3932,8 +3948,8 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
       detailHttpStatus:snap.status,
       finalUrl:snap.finalUrl,
       cardText:candidate.blob,
-      publishedAt:publication?.publishedAt||null,
-      publicationRaw:publication?.raw||null,
+      publishedAt:publication?.publishedAt||candidate.apiCreated||null,
+      publicationRaw:publication?.raw||(candidate.apiCreated?'mercari-api-created':null),
       publicationProvenance:publication?.provenance||null,
       inventoryArrival:arrival,
       inventoryArrivalIsPublication:false,
@@ -4029,10 +4045,21 @@ async function searchJapanSource(
 
       if(spec.searchApi){
         const apiPrices=mercariSearchApiPrices(snap.api);
+        const apiInfo=mercariSearchApiInfo(snap.api);
+        const markSold=db.prepare("UPDATE listings SET status='sold' WHERE source=? AND source_id=?");
         for(const candidate of candidates){
-          const apiPrice=apiPrices.get(japanSourceId(spec.id,candidate.href));
+          const sid=japanSourceId(spec.id,candidate.href);
+          const apiPrice=apiPrices.get(sid);
           if(apiPrice)candidate.apiPrice=apiPrice;
+          const info=apiInfo.get(sid);
+          if(info){candidate.apiStatus=info.status;candidate.apiCreated=info.created;}
         }
+        // Vendidos o en trámite: fuera antes de abrir ficha o gastar IA.
+        candidates=candidates.filter(c=>{
+          if(!c.apiStatus||c.apiStatus==='ITEM_STATUS_ON_SALE')return true;
+          markSold.run(spec.id,String(japanSourceId(spec.id,c.href)));
+          return false;
+        });
       }
 
       if(spec.id==='mercari-jp'&&personalOnly){
