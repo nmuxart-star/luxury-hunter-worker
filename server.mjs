@@ -5045,8 +5045,12 @@ function saveSetting(key,value){
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
     .run(key,JSON.stringify(value),new Date().toISOString());
 }
+// Vestiaire en directo APAGADO (Nil, 07-11-2026): en dos días no dio ningún
+// resultado útil (tope diario, Mac apagado, errores) y frenaba los análisis.
+// El precio sale solo de la base de Nil. VESTIAIRE_LIVE=on lo vuelve a activar.
+function vestiaireLiveOn(){return ['1','on','true','yes'].includes(String(process.env.VESTIAIRE_LIVE||'').toLowerCase());}
 async function vestiaireLiveSearchRows(query,{maxAgeHours=null}={}){
-  if(['0','false','off','no'].includes(String(process.env.VESTIAIRE_LIVE||'').toLowerCase()))return {status:'disabled'};
+  if(!vestiaireLiveOn())return {status:'disabled'};
   const token=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
   if(!token)return {status:'no_mac'};
   const now=Date.now();
@@ -8285,6 +8289,7 @@ async function liveReferenceRows(task,item,baseModel=null,baseBrand=''){
   if(fromBase&&b&&!fromBase.toLowerCase().includes(b.toLowerCase()))fromBase=`${b} ${fromBase}`;
   fromBase=fromBase.toLowerCase().slice(0,70);
   // Relojes: primero el modelo concreto (en la tarea caben varios: Santos y Tank).
+  if(!vestiaireLiveOn())return {status:'disabled',rows:[]};
   const query=(watch&&fromBase.length>=3?fromBase:'')||vestiaireTaskQuery(task?.task_name)||(fromBase.length>=3?fromBase:'')||vestiaireLiveQuery(item,{});
   if(!query)return {status:'no_query',rows:[]};
   try{
@@ -8577,6 +8582,8 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     :combined
     ?`Precio orientativo ${combined.realistic??combined.mean} € con ${combined.n} referencias iguales comprobadas con foto${d.same_colour?.length?` (${d.same_colour.length} del mismo color)`:''} (media ${combined.mean} €, franja ${combined.low}-${combined.high})${d.price_reason_es?`: ${d.price_reason_es}`:''}; beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
     :photoCheck?.error?'No se pudieron comprobar las referencias con fotos: sin precio.'
+    :liveInfo.status==='disabled'
+    ?`Sin referencias iguales en tu base (${base.length} fichas del modelo revisadas): sin pronóstico de precio.`
     :`Sin referencias iguales en tu base (${base.length} fichas del modelo revisadas) ni en Vestiaire (${live.length}${liveInfo.status!=='ok'&&liveInfo.status!=='watch'?`; Vestiaire no respondió: ${liveInfo.status}`:''}): sin pronóstico de precio.`;
   a.decision_reasons_es=[priceNote,...(Array.isArray(d.decision_reasons_es)?d.decision_reasons_es:[]).map(String)].slice(0,5);
   // SIN REFERENCIAS PERO INTERESANTE (regla de Nil, 07-11-2026): revisada la

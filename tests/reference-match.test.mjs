@@ -58,7 +58,7 @@ test('decisión con los números; la calidad de la IA cuenta en la nota',()=>{
 // El análisis real del bot (analyzeByReferences), con la IA simulada.
 const source=fs.readFileSync(new URL('../server.mjs',import.meta.url),'utf8');
 const extract=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
-function harness({screen,photo,extraRows=[],extra={},landed=1000,colour=null}){
+function harness({screen,photo,extraRows=[],extra={},landed=1000,colour=null,liveOn=true}){
   const sheetRows=[ref(71,2000,{sold:true,likes:40}),ref(72,2100),ref(73,1900),ref(74,800,{size:'Mini'}),...extraRows];
   const liveRows=[{...ref(81,2200),sold:false},{...ref(82,2300),sold:true}];
   const stored=[],prompts=[];
@@ -67,7 +67,7 @@ function harness({screen,photo,extraRows=[],extra={},landed=1000,colour=null}){
     db:{prepare:()=>({get:()=>null})},fetch:async()=>{throw new Error('sin red');},
     vestiaireRefs:()=>({tasks:{'Lady Dior':{source:'sheet',fichas:sheetRows}}}),
     sameModelRows:(tab,rows)=>({key:'lady dior',rows}),isWatchTask:()=>false,
-    vestiaireTaskQuery:()=>'lady dior',vestiaireLiveQuery:()=>null,
+    vestiaireLiveOn:()=>liveOn,vestiaireTaskQuery:()=>'lady dior',vestiaireLiveQuery:()=>null,
     vestiaireLiveSearchRows:async()=>({status:'ok',model:'Lady Dior',rows:liveRows}),
     importEconomics:()=>({importedTotalEur:landed}),detectMarketplaceVerification:()=>({status:'AVAILABLE'}),
     resalePlatform:()=>({name:'Vestiaire',fee:20}),VESTIAIRE_DEFAULT_REALIZATION:0.92,VESTIAIRE_LIVE_REALIZATION:0.92,
@@ -200,6 +200,14 @@ test('precio orientativo de la IA: se usa, pero nunca fuera de lo que dicen las 
   const b=await low.run();
   assert.equal(b.resale_mean_eur,1600);                    // dentro del rango: el de la IA
   assert.match(b.decision_reasons_es.join(' '),/Peor estado/);
+});
+test('Vestiaire en directo apagado: solo la base, sin buscar en Vestiaire ni nombrarlo',async()=>{
+  const h=harness({liveOn:false,screen:{base_same:[],base_similar:[],vestiaire_same:[]},photo:{same:[]}});
+  const a=await h.run();
+  const v=h.stored[0][4];
+  assert.equal(v.market.candidates.vestiaire,0);
+  assert.ok(!h.prompts.some(p=>/\nV1 \|/.test(p.text)));
+  assert.doesNotMatch(a.decision_reasons_es[0],/Vestiaire/);
 });
 test('análisis: sin ninguna igual y buen anuncio → interesante sin pronóstico',async()=>{
   const h=harness({screen:{base_same:[],base_similar:[],vestiaire_same:[]},photo:{}});
