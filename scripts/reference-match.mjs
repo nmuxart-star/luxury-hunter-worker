@@ -54,7 +54,9 @@ export function priceFromRefs(cands,codes,{ratio=0.92}={}){
   const mean=Math.round(w.reduce((s,x)=>s+x.v*x.w,0)/tw);
   const q=p=>Math.round(weightedQuantile(w,p));
   const st=compStats(chosen);
-  return {n:w.length,mean,low:q(.25),mid:q(.5),high:q(.75),sold_n:st.sold_n,recent_n:st.recent_n,likes_max:st.likes_max,
+  // Precio realista: la media o la mediana, la que sea más baja (una
+  // referencia cara no infla el precio).
+  return {n:w.length,mean,low:q(.25),mid:q(.5),high:q(.75),realistic:Math.min(mean,q(.5)),sold_n:st.sold_n,recent_n:st.recent_n,likes_max:st.likes_max,
     price_basis:st.sold_n?(st.sold_n===w.length?'sold':'mixed'):'asking',ratio,
     weighted:w.map(x=>({...x,v:Math.round(x.v),w:Math.round(x.w*100)/100})),
     picks:chosen.slice().sort((a,b)=>compWeight(b)-compWeight(a)).slice(0,5).map(({_code,...r})=>r)};
@@ -69,12 +71,13 @@ export function combinePrices(base,live){
   const all=[...base.weighted.map(x=>({...x,w:x.w*2})),...live.weighted.filter(x=>!seen.has(x.id))];
   const tw=all.reduce((s,x)=>s+x.w,0);
   const q=p=>Math.round(weightedQuantile(all,p));
+  const mean=Math.round(all.reduce((s,x)=>s+x.v*x.w,0)/tw);
   return {source:'base+vestiaire',n:all.length,n_sheet:base.weighted.length,n_live:all.length-base.weighted.length,
-    sold_n:all.filter(x=>x.s).length,mean:Math.round(all.reduce((s,x)=>s+x.v*x.w,0)/tw),low:q(.25),mid:q(.5),high:q(.75)};
+    sold_n:all.filter(x=>x.s).length,mean,low:q(.25),mid:q(.5),high:q(.75),realistic:Math.min(mean,q(.5))};
 }
 
 // DECISIÓN CON LOS NÚMEROS
-// Beneficio limpio = media × (1 − comisión) − coste puesto. La nota final
+// Beneficio limpio = precio realista × (1 − comisión) − coste puesto. La nota final
 // junta la calidad que ve la IA (la mitad) y el margen (la otra mitad).
 // - Riesgo alto de autenticidad o no es el producto → REJECT.
 // - Sin referencias iguales → como mucho WATCH (precio orientativo) o REVIEW.
@@ -85,8 +88,9 @@ export function decideFromNumbers({price,landed,feePct=20,minProfit=200,minMargi
   const q=Number.isFinite(Number(quality))?Math.max(0,Math.min(100,Number(quality))):50;
   if(targetMatch===false)return {decision:'REJECT',score:0,clean:null,margin:null,why:'no es el producto buscado'};
   if(String(risk).toUpperCase()==='HIGH')return {decision:'REJECT',score:Math.min(20,q),clean:null,margin:null,why:'riesgo alto de autenticidad'};
-  if(!price||!(Number(price.mean)>0)||!(Number(landed)>0))return {decision:'REVIEW',score:null,clean:null,margin:null,why:'sin referencias iguales para calcular el precio'};
-  const clean=Math.round(Number(price.mean)*(1-feePct/100)-Number(landed));
+  const sale=Number(price?.realistic??price?.mean);
+  if(!price||!(sale>0)||!(Number(landed)>0))return {decision:'REVIEW',score:null,clean:null,margin:null,why:'sin referencias iguales para calcular el precio'};
+  const clean=Math.round(sale*(1-feePct/100)-Number(landed));
   const margin=Math.round(clean/Number(landed)*100);
   const marginScore=Math.max(0,Math.min(100,margin*2));
   let score=Math.round(q*0.5+marginScore*0.5);

@@ -4765,7 +4765,7 @@ function vestiaireMatchFichas(fichas,item,taskName=''){
 // hoja de Vestiaire, y el % al que se venden de verdad frente al precio pedido
 // (ventas registradas en la hoja; 0,92 de media), sale una franja realista de
 // venta. Sirve de techo para que la reventa sugerida no se dispare.
-const VESTIAIRE_DEFAULT_REALIZATION=0.92;
+const VESTIAIRE_DEFAULT_REALIZATION=0.90; // vendido ≈ 90 % de lo pedido en la hoja de Nil (07-11-2026)
 // Anchura (cm) de cada talla en los modelos principales, para cuando el
 // anuncio dice la talla ("中号", "ミニ", "Medium"...) pero no las medidas.
 const VESTIAIRE_FAMILY_SIZES=[
@@ -4935,7 +4935,7 @@ function vestiaireComparables(task,item,exact){
 function vestiaireComparablesNote(c){
   if(!c)return '';
   if(c.rule_version===BAG_SHEET_RULE_VERSION){
-    return `Sheets: ${c.n} referencia(s) del modelo ${c.model}, ${c.basis}, material ${c.material}${c.tier==='iguales'?`, color ${c.colour}`:', otro color'}${c.condition?`, estado ${c.condition}`:''}. Reventa estimada ${c.low}-${c.high} EUR; ${c.sold_n} ventas registradas. ${c.price_basis==='sold'?'Valoración basada en los precios de venta registrados, sin descuento adicional.':c.price_basis==='mixed'?'Vendidos y en venta; los vendidos, los recientes y los de más likes pesan más.':c.ratio_source==='assumption'?'Precios pedidos ajustados al 92 % como hipótesis, no ventas confirmadas.':'Ajuste basado en ventas registradas de estas referencias.'}`;
+    return `Sheets: ${c.n} referencia(s) del modelo ${c.model}, ${c.basis}, material ${c.material}${c.tier==='iguales'?`, color ${c.colour}`:', otro color'}${c.condition?`, estado ${c.condition}`:''}. Reventa estimada ${c.low}-${c.high} EUR; ${c.sold_n} ventas registradas. ${c.price_basis==='sold'?'Valoración basada en los precios de venta registrados, sin descuento adicional.':c.price_basis==='mixed'?'Vendidos y en venta; los vendidos, los recientes y los de más likes pesan más.':c.ratio_source==='assumption'?'Precios pedidos ajustados al 90 % como hipótesis, no ventas confirmadas.':'Ajuste basado en ventas registradas de estas referencias.'}`;
   }
   const what=c.tier==='iguales'?`iguales (${c.basis}, ${c.colour}, ${c.material})`:c.tier==='misma_talla'?`de la ${c.basis}`:'en otras tallas';
   return `Reventa según tu base de Vestiaire: ${c.n} anuncios del modelo ${c.model||'del anuncio'}${c.materialClass?` en ${c.materialClass}`:''} ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
@@ -5007,7 +5007,7 @@ async function vestiaireLiveFor(task,item,exact){
 }
 function vestiaireLiveNote(c){
   if(c?.status!=='ok')return '';
-  return `Sin referencia en tu base: reventa según ${c.n} anuncios de Vestiaire en directo del modelo ${c.model}${c.material?` en ${c.material}`:''} (${c.basis}; ${c.sold_n} vendidos y ${c.active_n} en venta × 92 %; vendidos, recientes y con más likes pesan más) → ${c.low}-${c.high} EUR.`;
+  return `Sin referencia en tu base: reventa según ${c.n} anuncios de Vestiaire en directo del modelo ${c.model}${c.material?` en ${c.material}`:''} (${c.basis}; ${c.sold_n} vendidos y ${c.active_n} en venta × 90 %; vendidos, recientes y con más likes pesan más) → ${c.low}-${c.high} EUR.`;
 }
 // ── VESTIAIRE COMO FUENTE ───────────────────────────────────────────────
 // En cada tarea de bolsos, los anuncios más nuevos de ese modelo en
@@ -8156,11 +8156,18 @@ function baseReferenceRows(task,item){
   }
   return best||{tab:null,model:null,rows:[]};
 }
-async function liveReferenceRows(task,item,baseModel=null){
-  if(isWatchTask(task?.task_name))return {status:'watch',rows:[]};
-  // Radar: el modelo que la base reconoce en el anuncio ("saint laurent · le 5 a 7").
-  const fromBase=baseModel?String(baseModel).replace(/\s*·\s*/g,' ').trim():'';
-  const query=vestiaireTaskQuery(task?.task_name)||(fromBase.length>=3?fromBase:'')||vestiaireLiveQuery(item,{});
+async function liveReferenceRows(task,item,baseModel=null,baseBrand=''){
+  // Todos los anuncios se comparan también con Vestiaire en directo, relojes
+  // incluidos (regla de Nil, 07-11-2026).
+  const watch=isWatchTask(task?.task_name);
+  // El modelo que la base reconoce en el anuncio ("saint laurent · le 5 a 7",
+  // "black bay 58"), con la marca delante si no la lleva.
+  let fromBase=baseModel?String(baseModel).replace(/\s*·\s*/g,' ').trim():'';
+  const b=String(baseBrand||'').trim();
+  if(fromBase&&b&&!fromBase.toLowerCase().includes(b.toLowerCase()))fromBase=`${b} ${fromBase}`;
+  fromBase=fromBase.toLowerCase().slice(0,70);
+  // Relojes: primero el modelo concreto (en la tarea caben varios: Santos y Tank).
+  const query=(watch&&fromBase.length>=3?fromBase:'')||vestiaireTaskQuery(task?.task_name)||(fromBase.length>=3?fromBase:'')||vestiaireLiveQuery(item,{});
   if(!query)return {status:'no_query',rows:[]};
   try{
     const r=await vestiaireLiveSearchRows(query);
@@ -8253,7 +8260,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const realization=VESTIAIRE_DEFAULT_REALIZATION;
   reportProgress(8,'Buscando referencias','Tu base y Vestiaire en directo');
   const baseInfo=baseReferenceRows(task,item);
-  const liveInfo=String(item.source)==='vestiaire'||!listingAuction(item)?await liveReferenceRows(task,item,baseInfo.model):{status:'auction',rows:[]};
+  const liveInfo=await liveReferenceRows(task,item,baseInfo.model,baseInfo.rows?.[0]?.brand||'');
   const excludeId=String(item.source)==='vestiaire'?item.source_id:null;
   const base=refCandidates(baseInfo.rows,{prefix:'B',limit:REF_MAX_BASE,excludeId});
   const live=refCandidates(liveInfo.rows,{prefix:'V',limit:REF_MAX_LIVE,excludeId});
@@ -8313,7 +8320,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     brand:d.brand||'',model:[d.model,d.variant].filter(Boolean).join(' ')||task.task_name,
     authenticity_risk:failed?'HIGH':String(d.authenticity_risk||'MEDIUM').toUpperCase(),liquidity:'',
     decision:dec.decision,opportunity_score:dec.score,
-    resale_low_eur:combined?.low??null,resale_high_eur:combined?.high??null,resale_mean_eur:combined?.mean??null,
+    resale_low_eur:combined?.low??null,resale_high_eur:combined?.high??null,resale_mean_eur:combined?.realistic??combined?.mean??null,
     landed_cost_eur:landed||null,import_costs:economics,marketplace_verification:marketplaceVerification,
     net_profit_low_eur:combined&&landed?roundMoney(combined.low-landed):null,
     net_profit_high_eur:combined&&landed?roundMoney(combined.high-landed):null,
@@ -8323,7 +8330,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     notes:[d.completeness_es,d.condition_grade].filter(Boolean).join(' · ')
   };
   const priceNote=combined
-    ?`Precio con ${combined.n} referencias iguales comprobadas con foto: media ${combined.mean} € (${combined.low}-${combined.high}); beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
+    ?`Precio de venta realista ${combined.realistic??combined.mean} € con ${combined.n} referencias iguales comprobadas con foto (media ${combined.mean} €, franja ${combined.low}-${combined.high}); beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
     :photoCheck?.error?'No se pudieron comprobar las referencias con fotos: sin precio.'
     :'Sin referencias iguales (mismo modelo, talla y material) en tu base ni en Vestiaire: no se calcula el precio.';
   a.decision_reasons_es=[priceNote,...(Array.isArray(d.decision_reasons_es)?d.decision_reasons_es:[]).map(String)].slice(0,5);
@@ -10731,19 +10738,26 @@ function vestiaireCompareSections(taskName,item){
         ? `De la misma talla (${htmlEsc(c.basis)})${mdl}`
         : `No hay de esta talla: mismo modelo en otras tallas${mdl}, solo orientativo`);
     if(c.cross&&c.tier!=='ia_iguales')base.push(`Pestaña ${htmlEsc(c.tab)}`);
-    const askPct=c.price_basis==='sold'?null:Math.round((c.ratio||0.92)*100);
+    const askPct=c.price_basis==='sold'?null:Math.round((c.ratio||VESTIAIRE_DEFAULT_REALIZATION)*100);
     base.push(...refSummaryLines(c,askPct),...(c.picks||[]).slice(0,4).map(f=>refPickLine(f)));
   }else base.push(v.market?.match_version?'Ninguna referencia de tu base es el mismo bolso (mismo modelo, talla y material): no se usa.':'Tu base no tiene este modelo (mismo modelo, medidas, material y color).');
   const liveLines=[];
-  if(watch)liveLines.push('No se consulta en relojes: solo en bolsos.');
+  if(watch&&!v.market?.match_version)liveLines.push('No se consultó en relojes.');
   else if(live?.status==='ok'){
     liveLines.push(`${live.n} anuncios de ${htmlEsc(live.model||'este modelo')}${live.material?` en ${htmlEsc(live.material)}`:''} (${htmlEsc(live.basis)})`);
-    liveLines.push(...refSummaryLines(live,live.active_n?92:null),...(live.picks||[]).slice(0,4).map(f=>refPickLine(f,{material:false})));
+    liveLines.push(...refSummaryLines(live,live.active_n?Math.round(VESTIAIRE_LIVE_REALIZATION*100):null),...(live.picks||[]).slice(0,4).map(f=>refPickLine(f,{material:false})));
     if(live.tier!=='misma_talla')liveLines.push('De otras tallas: solo orientativo.');
   }else if(live?.status==='no_match'&&v.market?.match_version)liveLines.push('Ninguno de los anuncios de Vestiaire es el mismo bolso (comprobado con fotos): no se usa.');
   else if(live)liveLines.push(`Sin datos: ${htmlEsc(VESTIAIRE_LIVE_WHY[live.status]||live.status)}.`);
   else liveLines.push('No se consultó para este anuncio.');
   let used='';
+  if(v.market?.match_version){
+    used=c&&blend?`⚖️ El precio realista junta las dos: tu base (pesa el doble) + ${blend.n_live} de Vestiaire → <b>${eur0(blend.realistic??blend.mean)}</b>`
+      :c?'⚖️ El precio realista sale de tu base (Vestiaire no tiene iguales).'
+      :live?.status==='ok'?'⚖️ El precio realista sale de Vestiaire en directo (tu base no tiene iguales).'
+      :'⚠️ Sin referencias iguales: no hay precio.';
+    return {base,live:liveLines,used};
+  }
   if(c&&blend)used=`⚖️ Para los números se juntan las dos: tu base (pesa el doble) + ${blend.n_live} de Vestiaire de la misma talla que no estaban en tu base → <b>${eur0(blend.low)} – ${eur0(blend.high)}</b>`;
   else if(c)used=`⚖️ Para los números se usa tu base${live?.status==='ok'?(live.tier==='misma_talla'?' (los de Vestiaire ya estaban en ella)':' (Vestiaire es de otras tallas)'):''}.`;
   else if(live?.status==='ok')used='⚖️ Para los números se usa Vestiaire en directo. Sin referencia en tu base no se recomienda comprar: revísalo tú.';
@@ -10829,9 +10843,17 @@ function instantAlertText(x,{soft=false}={}){
     ...header,
     ...alertSection('💰 NÚMEROS',[
       `Coste puesto en España: <b>${eur0(x.landed_cost_eur)}</b>`,
-      `Reventa: <b>${range(x.resale_low_eur,x.resale_high_eur)}</b> · ${alertResaleSource(x,v)}`,
-      vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur,x._task_name).replace(/^Beneficio en/,'Beneficio limpio vendiendo en'),
-      `Margen bruto (reventa − coste): ${range(x.net_profit_low_eur,x.net_profit_high_eur)}${margin!=null?` · ${margin} %`:''}`,
+      ...(v.match_version&&Number(v.final?.resale_mean_eur)>0?[
+        // Análisis nuevo: un precio de venta realista (media o mediana de las
+        // iguales, la más baja) y el beneficio con ese precio, no con la franja alta.
+        `Precio de venta realista: <b>${eur0(v.final.resale_mean_eur)}</b> · ${alertResaleSource(x,v)}`,
+        `Franja de las referencias iguales: ${range(x.resale_low_eur,x.resale_high_eur)}`,
+        `Beneficio limpio vendiendo en ${htmlEsc(resalePlatform(x._task_name).name)} (−${resalePlatform(x._task_name).fee} % comisión): <b>${eur0(v.final.net_profit_clean_eur)}</b>${Number.isFinite(Number(v.final.clean_margin_pct))?` · margen ${v.final.clean_margin_pct} %`:''}`
+      ]:[
+        `Reventa: <b>${range(x.resale_low_eur,x.resale_high_eur)}</b> · ${alertResaleSource(x,v)}`,
+        vestiaireProfitLine(x.resale_low_eur,x.resale_high_eur,x.landed_cost_eur,x._task_name).replace(/^Beneficio en/,'Beneficio limpio vendiendo en'),
+        `Margen bruto (reventa − coste): ${range(x.net_profit_low_eur,x.net_profit_high_eur)}${margin!=null?` · ${margin} %`:''}`
+      ]),
       pct===null?'':pct>0?`📉 ${pct} % por debajo del precio mediano de este modelo`:`📈 ${Math.abs(pct)} % por encima del precio mediano de este modelo`
     ]),
     ...alertSection('🧾 DESGLOSE DEL COSTE',importCostLines(x)),

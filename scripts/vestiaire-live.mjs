@@ -6,7 +6,9 @@
 import {materialClass, modelNorm} from './vestiaire-model.mjs';
 import {bagDimensions,compWeight,compStats,weightedQuantile} from './vestiaire-bag-match.mjs';
 
-export const VESTIAIRE_LIVE_REALIZATION=0.92;
+// En la hoja de Nil, lo vendido sale de media al 90 % de lo que se pedía
+// (187 ventas con precio, 07-11-2026).
+export const VESTIAIRE_LIVE_REALIZATION=0.90;
 const ORIGIN='https://es.vestiairecollective.com';
 const known=v=>v&&!/unknown|desconocid|sin determinar/i.test(String(v));
 const SIZES=[['nano',/\bnano\b/i],['micro',/\bmicro\b|マイクロ/i],['mini',/\bmini\b|ミニ|迷你/i],
@@ -50,8 +52,8 @@ export function vestiaireLiveRows(payload){
   for(const x of items){
     const id=Number(x?.id);
     const cents=Number(x?.price?.cents);
-    // Solo bolsos: "Claude" de Celine también es una bota.
-    if(!id||seen.has(id)||!(cents>0)||!/-bolsos\//.test(String(x?.link||'')))continue;
+    // Solo bolsos y relojes: "Claude" de Celine también es una bota.
+    if(!id||seen.has(id)||!(cents>0)||!/-bolsos\/|\/relojes\//.test(String(x?.link||'')))continue;
     seen.add(id);
     const slug=String(x.link).split('/').pop().replace(/-\d+\.shtml$/,'').replace(/-/g,' ');
     const dims=bagDimensions(x.description||'');

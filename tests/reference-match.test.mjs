@@ -140,3 +140,11 @@ test('hoja: foto y enlace de las fórmulas; "Eliminado (sin precio)" no es una v
   assert.equal(by['73066885'].photo,'https://drive.google.com/uc?export=view&id=F73066885');
   assert.equal(by['73066885'].url,'https://es.vestiairecollective.com/73066885.shtml');
 });
+test('precio realista: la media o la mediana, la más baja; el beneficio sale de ahí',()=>{
+  const cands=refCandidates([ref(1,1000),ref(2,1050),ref(3,1100),ref(4,3000)]);
+  const p=priceFromRefs(cands,cands.map(r=>r._code),{ratio:1});
+  assert.ok(p.mean>p.mid,`${p.mean} ${p.mid}`);           // la de 3000 sube la media
+  assert.equal(p.realistic,p.mid);
+  const d=decideFromNumbers({price:p,landed:500,feePct:20,quality:80});
+  assert.equal(d.clean,Math.round(p.mid*0.8-500));
+});

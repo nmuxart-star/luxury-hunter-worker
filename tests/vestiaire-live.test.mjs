@@ -42,7 +42,7 @@ test('sin 3 de su talla: todas las tallas (orientativo); sin 3 del material: nad
   const c=vestiaireLiveComparables(rows,{title:'Lady Dior medium'},{brand:'Dior',family:'Lady Dior',material:'leather',size:'Medium'});
   assert.equal(c.tier,'mismo_modelo');
   assert.equal(c.price_basis,'asking');
-  assert.equal(c.low,1840);
+  assert.equal(c.low,1800);
   assert.equal(vestiaireLiveComparables(rows,{title:'Lady Dior canvas'},{brand:'Dior',family:'Lady Dior',material:'canvas'}),null);
 });
 
@@ -87,6 +87,6 @@ test('ofertas: precio de tu base y de Vestiaire por separado, sin contar dos vec
   assert.equal(d.deal.n,6);                 // el 1 está en las dos: cuenta una vez
   assert.equal(d.deal.base.n,3);assert.equal(d.deal.live.n,3);
   assert.equal(d.deal.base.sold_n,2);
-  assert.ok(d.deal.base.high<=3100&&d.deal.live.low>=3200*0.92-1);
+  assert.ok(d.deal.base.high<=3100&&d.deal.live.low>=3200*0.90-1);
   assert.equal(d.deal.base.picks[0].sold,true);
 });

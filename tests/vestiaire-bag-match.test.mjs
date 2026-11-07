@@ -195,7 +195,7 @@ test('aviso: tu base y Vestiaire en bloques separados, con fecha, likes y vendid
     picks:[{url:'https://x/9',size:'medium',color:'Negro',price_eur:1800,sold:false,likes:50,created_at:new Date(Date.now()-86400e3).toISOString()}]};
   const blend={n_live:4,low:1000,high:1600};
   const ctx=vm.createContext({refAgeDays,isWatchTask:()=>false,vestiaireCompsFor:()=>comps,htmlEsc:s=>String(s),eur0:n=>`${Math.round(n)} €`,
-    VESTIAIRE_LIVE_WHY:{mac_offline:'el Chrome del Mac no estaba encendido'},JSON});
+    VESTIAIRE_LIVE_WHY:{mac_offline:'el Chrome del Mac no estaba encendido'},VESTIAIRE_LIVE_REALIZATION:0.9,VESTIAIRE_DEFAULT_REALIZATION:0.9,JSON});
   vm.runInContext(extract('function refAgeText(','function vestiaireDbLines('),ctx);
   const item={verification_json:JSON.stringify({market:{vestiaire_live:live,vestiaire_blend:blend}})};
   const c=ctx.vestiaireCompareSections('Lady Dior',item);
