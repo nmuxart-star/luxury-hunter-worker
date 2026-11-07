@@ -3824,13 +3824,10 @@ async function japanEnrichCandidate(spec,candidate,searchMeta,browserContext){
   const ogTitle=$('meta[property="og:title"]').attr('content')||'';
   const h1=$('h1').first().text().replace(/\s+/g,' ').trim();
 
+  // El aviso antibots de la página ("Confirme que es humano") no es el título.
+  const botText=BOT_CHECK_TEXT;
   let title=String(
-    product?.name||
-    ogTitle||
-    h1||
-    candidate.title||
-    snap.title||
-    ''
+    [product?.name,ogTitle,h1,candidate.title,snap.title].map(x=>String(x||'').trim()).find(x=>x&&!botText.test(x))||''
   ).replace(/\s+/g,' ').trim();
 
   title=title
@@ -8198,7 +8195,18 @@ const refColour=t=>(typeof VESTIAIRE_COLOR_RE!=='undefined'?VESTIAIRE_COLOR_RE.f
 const refSize=t=>typeof vestiaireSizeLabel==='function'?vestiaireSizeLabel(String(t||'')):null;
 function rankByIdentity(rows,ident){
   const size=refSize(`${ident?.size||''} ${ident?.variant||''}`), mat=refMatClass(ident?.material), col=refColour(ident?.colour);
-  const score=r=>(size&&refSize(`${r.size||''} ${r.model||''} ${r.notes||''}`)===size?3:0)+(mat&&refMatClass(`${r.material||''} ${r.notes||''}`)===mat?2:0)+(col&&refColour(r.color)===col?1:0);
+  // Relojes (y bolsos con código): la misma referencia o la misma familia de
+  // referencia (mismas 4-5 primeras letras/cifras) van delante.
+  const flat=v=>String(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  const idRefs=[...String(`${ident?.model||''} ${ident?.variant||''} ${ident?.size||''}`).toUpperCase().matchAll(/[A-Z0-9][A-Z0-9.\- ]{3,}[0-9][A-Z0-9]*/g)]
+    .map(m=>flat(m[0])).filter(x=>x.length>=5&&/\d{3}/.test(x));
+  const refScore=r=>{
+    if(!idRefs.length)return 0;
+    const rr=flat(`${r.size||''}`);if(rr.length<5)return 0;
+    if(idRefs.some(x=>x.includes(rr)||rr.includes(x)))return 6;
+    return idRefs.some(x=>x.slice(0,5)===rr.slice(0,5))?4:idRefs.some(x=>x.slice(0,4)===rr.slice(0,4))?2:0;
+  };
+  const score=r=>refScore(r)+(size&&refSize(`${r.size||''} ${r.model||''} ${r.notes||''}`)===size?3:0)+(mat&&refMatClass(`${r.material||''} ${r.notes||''}`)===mat?2:0)+(col&&refColour(r.color)===col?1:0);
   return rows.map((r,i)=>({r,i,s:score(r)})).sort((a,b)=>b.s-a.s||a.i-b.i).map(x=>x.r);
 }
 function baseReferenceRows(task,item){
@@ -8299,12 +8307,14 @@ For EACH reference decide if it is the SAME PRODUCT as the listing:
 - same material family (smooth or grained leather, canvas, nylon, suede, exotic...). Colour may differ.
 - WATCHES: same reference family (2541.80 ≠ 2531.80), same movement (quartz ≠ automatic), same case size and material; dial colour must match.
 - condition at most one grade apart.
-If the reference photo shows another bag or another product, or you cannot tell the size/version apart from the listing (for example mini and regular look alike and nothing confirms it), it is NOT the same. A reference without photo can only be confirmed if its text gives the same size or measurements and version.
+SIZE WHEN THE LISTING GIVES NO MEASUREMENTS: do NOT reject a reference only because the listing text has no size. Judge the size from the photos as an expert would: proportions (width/height), number of quilting diamonds or stitched rows across the flap and the front, size of the turn-lock/logo and of the chain relative to the bag, strap length, hand or body for scale. Compare that with the reference photo and its measurements, and confirm it when they agree. Reject for size only when the photos point to a different size/version or are genuinely inconclusive between two sizes that look alike (for example mini vs regular with nothing to tell them apart).
+If the reference photo shows another bag or another product, it is NOT the same. A reference without photo can only be confirmed if its text gives the same size or measurements and version.
+Missing a reference that IS the same product is also an error: Nil checks your answers and an equal reference left out is as bad as a wrong one.
 Also re-judge the LISTING with all its photos (no prices): condition, completeness, quality and authenticity risk, as before.
 Return ONLY JSON:
 {"same":["B3","V2"],"not_same":{"B4":"motivo breve en español"},"flaws_zh":"desgaste visible del ANUNCIO en chino, máx. 15 caracteres (p. ej. 四角轻微磨损); vacío si no se ve ninguno","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
 async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,first}){
-  const listing=analyzeImages?await fetchGeminiImageParts(item,4):[];
+  const listing=analyzeImages?await fetchGeminiImageParts(item,Number(process.env.REF_LISTING_PHOTOS||6)):[];
   const photos=await Promise.all(refs.map(r=>refPhotoPart(r)));
   const head=`${REF_PHOTO_INSTRUCTION}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nFIRST IDENTIFICATION (text): ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour})}\n\nLISTING PHOTOS:`;
   const parts=[{text:head},...listing,{text:'REFERENCES (code | model | size | measurements | material | colour | condition | sold? | published | notes):'}];
@@ -8500,6 +8510,26 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   return a;
 }
 
+const BOT_CHECK_TEXT=/confirm(e|a)? que es humano|confirm you are (a )?human|verify you are (a )?human|just a moment|人間であることを確認|are you a robot/i;
+async function oneMapEnsureDetail(item){
+  let raw={};try{raw=JSON.parse(item.raw_json||'{}');}catch{}
+  if(item.source!=='yahoo-auctions-jp'||(raw.searchMode!=='list'&&!BOT_CHECK_TEXT.test(String(item.title||''))))return item;
+  const token=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
+  if(!token||!await macOneMapReady(token).catch(()=>false))return item;
+  const spec={id:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',detailWaitMs:1000};
+  try{
+    const d=await japanEnrichCandidate(spec,{href:item.url,title:item.title,blob:item.title,price:item.original_price,img:item.image_url||''},
+      {query:raw.query,searchUrl:raw.searchUrl},{macBridgeToken:token});
+    if(d.status==='sold'||!String(d.description||'').trim())return item;
+    const bid=Math.max(Number(d.original_price)||0,Number(item.original_price)||0);
+    d.source_id=item.source_id;d.original_price=bid;d.price_eur=toEur(bid,'JPY');d.purchase_via='One Map / FROM JAPAN';
+    if(!d.title)d.title=item.title;
+    d.raw={...raw,...d.raw,auction:raw.auction,searchMode:'browser',detailAt:new Date().toISOString()};
+    upsertListing(d);
+    return db.prepare('SELECT * FROM listings WHERE id=?').get(item.id)||item;
+  }catch(e){console.warn(`One Map ficha ${item.source_id}: ${e.message}`);return item;}
+}
+
 async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProgress=null,opts={}){
   const reportProgress=(pct,stage,detail='')=>{
     try{
@@ -8518,8 +8548,15 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const key=aiApiKey();
   if(!key)throw new Error(`${aiProvider()==='openai'?'OPENAI_API_KEY':'GEMINI_API_KEY'} is empty in .env`);
   const model=aiModel();
-  const row=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
+  let row=db.prepare('SELECT * FROM listings WHERE id=?').get(Number(listingId));
   if(!row)throw new Error('Listing not found');
+  // Subasta de One Map guardada solo con la lista (título y 1 foto): antes
+  // de analizarla se abre su ficha (descripción con medidas y galería).
+  row=await oneMapEnsureDetail(row);
+  {
+    const veto=row.source==='yahoo-auctions-jp'?fewSellerReviewsVeto('Yahoo! Auctions',row.seller_reviews):null;
+    if(veto&&taskId){storePrescreenReject(Number(taskId),row,veto);return {decision:'REJECT',decision_reasons_es:veto.reasons};}
+  }
   // Análisis manual por Telegram: todo se calcula con el precio de compra
   // que Nil ha negociado con el vendedor, no con el anunciado.
   const negotiatedEur=Number(opts?.priceEur);

@@ -128,7 +128,10 @@ export function sameModelRows(tab,rows,texts={},{requireNamed=false}={}){
       const byRef=list.find(x=>{const r=flat(x.f.size);return /\d{3}/.test(r)&&r.length>=5&&tf.includes(r);});
       if(byRef){key=byRef.key;break;}
       const tn=` ${sing(modelName(t))} `;
-      const byName=[...new Set(list.map(x=>x.key))].filter(k=>k.length>=3&&tn.includes(` ${sing(k)} `)).sort((a,b)=>b.length-a.length)[0];
+      // Un "modelo" que es solo la marca (p. ej. "Grand Seiko") no sirve para
+      // acotar: se miraría solo un trozo de la pestaña.
+      const generic=new Set([...list.map(x=>modelName(x.f.brand)),modelName(tab)].filter(Boolean));
+      const byName=[...new Set(list.map(x=>x.key))].filter(k=>k.length>=3&&!generic.has(k)&&tn.includes(` ${sing(k)} `)).sort((a,b)=>b.length-a.length)[0];
       if(byName){key=byName;break;}
     }
     explicit=!!key;
