@@ -63,22 +63,13 @@ jobs:
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-      JUSTONEAPI_TOKEN: ${{ secrets.JUSTONEAPI_TOKEN }}
       # Yahoo Subastas: solo One Map (FROM JAPAN) desde el Chrome del Mac.
       ONEMAP_MAC_BRIDGE_TOKEN: ${{ secrets.ONEMAP_MAC_BRIDGE_TOKEN }}
       ONEMAP_HEADED: '1'
       # Japón: Mercari (y Yahoo por el Mac). Bunjang y Rakuten apagados.
       JAPAN_SOURCES: ${{ vars.JAPAN_SOURCES || 'mercari-jp' }}
-      XIANYU_BASE_URL: http://127.0.0.1:8000
-      # justoneapi, direct (cuenta de Nil) o alternate (una búsqueda con cada uno).
-      XIANYU_PROVIDER: ${{ (vars.XIANYU_PROVIDER == 'direct' || vars.XIANYU_PROVIDER == 'alternate') && vars.XIANYU_PROVIDER || 'justoneapi' }}
-      XIANYU_JUSTONE_SORT: ${{ vars.XIANYU_JUSTONE_SORT || 'active' }}
-      # Páginas de Just One API por búsqueda (10 anuncios y una llamada cada una).
-      XIANYU_JUSTONE_PAGES: ${{ vars.XIANYU_JUSTONE_PAGES || '1' }}
-      # 1 = Just One API apagada: en modo alterno todas las tareas buscan con la cuenta.
-      XIANYU_JUSTONE_DISABLED: ${{ vars.XIANYU_JUSTONE_DISABLED || '' }}
-      # Xianyu con Just One API: solo una búsqueda, sin consultar fichas.
-      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || (vars.XIANYU_PROVIDER == 'direct' && '2' || '1') }}
+      # Xianyu: solo con la cuenta de Nil (página de búsqueda), una búsqueda por modelo.
+      XIANYU_MAX_QUERIES: ${{ vars.XIANYU_MAX_QUERIES || '1' }}
       XIANYU_MIN_INTERVAL_MIN: ${{ vars.XIANYU_MIN_INTERVAL_MIN || '60' }}
       XIANYU_MONTHLY_SEARCH_LIMIT: ${{ vars.XIANYU_MONTHLY_SEARCH_LIMIT || '650' }}
       XIANYU_DAILY_SEARCH_LIMIT: ${{ vars.XIANYU_DAILY_SEARCH_LIMIT || '20' }}
@@ -195,14 +186,8 @@ jobs:
         env:
           XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
           XIANYU_MODE: ${{ vars.XIANYU_MODE }}
-          XIANYU_PROVIDER: ${{ (vars.XIANYU_PROVIDER == 'direct' || vars.XIANYU_PROVIDER == 'alternate') && vars.XIANYU_PROVIDER || 'justoneapi' }}
         shell: bash
         run: |
-          if [ "${XIANYU_PROVIDER:-justoneapi}" = "justoneapi" ]; then
-            echo "XIANYU_SESSION_STATUS=not_required" >> "$GITHUB_ENV"
-            echo "Just One API selected; skipping Xianyu browser sessions and connector."
-            exit 0
-          fi
           shopt -s nullglob
           ACCOUNT_ENC=(cloud/xianyu-state.enc cloud/xianyu-accounts/*.enc)
           if [ ${#ACCOUNT_ENC[@]} -eq 0 ] || [ -z "${XIANYU_STATE_PASSWORD:-}" ]; then
@@ -210,7 +195,6 @@ jobs:
             echo "XIANYU_SESSION_STATUS=missing" >> "$GITHUB_ENV"
             exit 0
           fi
-          git clone --depth 1 https://github.com/wangdaguo/ai-goofish-monitor.git .xianyu || mkdir -p .xianyu
           mkdir -p .xianyu/state .xianyu/data .xianyu/logs .xianyu/images .xianyu/jsonl .xianyu/price_history .xianyu-tmp
           # Cada cuenta conserva su propio state. Para Nil se mantiene el formato
           # antiguo y así no se pierden los inicios de sesión ya configurados.
@@ -251,52 +235,12 @@ jobs:
           fi
           echo "XIANYU_STATE_DIR=$PWD/.xianyu/state" >> "$GITHUB_ENV"
           rm -rf .xianyu-tmp
-          # Modo directo (por defecto): Luxury Hunter lee solo la página de
-          # resultados con las cookies guardadas; no hace falta el conector
-          # Docker, que abría cada ficha y provocaba la verificación anti-bot.
-          if [ "${XIANYU_MODE:-direct}" != "connector" ]; then
-            if [ -f .xianyu/state/Nil.json ]; then
-              echo "XIANYU_STATE_FILE=$PWD/.xianyu/state/Nil.json" >> "$GITHUB_ENV"
-            fi
-            echo "Xianyu direct mode ready ($VALID available accounts)"
-            exit 0
+          # Luxury Hunter lee solo la página de resultados de Xianyu con las
+          # cookies guardadas (el conector Docker antiguo está eliminado).
+          if [ -f .xianyu/state/Nil.json ]; then
+            echo "XIANYU_STATE_FILE=$PWD/.xianyu/state/Nil.json" >> "$GITHUB_ENV"
           fi
-          if [ "$VALID" -eq 0 ]; then
-            echo "Xianyu session is not valid; skipping Xianyu in this run."
-            exit 0
-          fi
-          # Base de datos del conector de la ejecución anterior: los anuncios ya
-          # vistos se saltan al instante y solo se procesan los nuevos.
-          if [ -f .state/xianyu-app.sqlite3 ]; then
-            cp .state/xianyu-app.sqlite3 .xianyu/data/app.sqlite3
-            echo "Restored Xianyu connector database"
-          fi
-          cd .xianyu
-          cp .env.example .env
-          # docker --env-file no quita comillas: PROXY_URL="" se convertía en el
-          # proxy literal "" y el navegador fallaba con ERR_PROXY_CONNECTION_FAILED.
-          sed -i -E 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' .env
-          # Luxury Hunter uses Xianyu only as a crawler here; central AI remains in Luxury Hunter.
-          docker pull ghcr.io/usagi-org/ai-goofish:latest
-          docker run -d --name luxury-hunter-xianyu --init -p 8000:8000 \
-            --env-file .env \
-            -e APP_DATABASE_FILE=/app/data/app.sqlite3 \
-            -v "$PWD/.env:/app/.env" \
-            -v "$PWD/data:/app/data" \
-            -v "$PWD/state:/app/state" \
-            -v "$PWD/config.json:/app/config.json" \
-            -v "$PWD/prompts:/app/prompts" \
-            -v "$PWD/jsonl:/app/jsonl" \
-            -v "$PWD/logs:/app/logs" \
-            -v "$PWD/images:/app/images" \
-            -v "$PWD/price_history:/app/price_history" \
-            ghcr.io/usagi-org/ai-goofish:latest
-          for i in $(seq 1 45); do
-            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then echo "Xianyu ready"; exit 0; fi
-            sleep 2
-          done
-          echo "Xianyu did not become ready. Continuing with other sources."
-          docker logs luxury-hunter-xianyu --tail 80 || true
+          echo "Xianyu direct mode ready ($VALID available accounts)"
 
       - name: Run due tasks
         id: run_due_tasks
@@ -333,10 +277,6 @@ jobs:
         run: |
           mkdir -p lh-upload
           cp data/luxury-hunter.sqlite3 lh-upload/
-          if [ -f .xianyu/data/app.sqlite3 ]; then
-            docker stop luxury-hunter-xianyu >/dev/null 2>&1 || true
-            cp .xianyu/data/app.sqlite3 lh-upload/xianyu-app.sqlite3 || true
-          fi
           # Si esta ejecución no renovó la sesión de Xianyu, conserva la anterior.
           if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
             cp .state/xianyu-state.enc lh-upload/
@@ -371,13 +311,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run luxury-hunter.yml --ref "${GITHUB_REF_NAME}" -f auto_chain=true || echo "Could not chain next run"
 
-      - name: Xianyu logs
-        if: always()
-        shell: bash
-        run: |
-          docker logs luxury-hunter-xianyu --tail 60 2>/dev/null | grep -v "GET /health" || echo "Xianyu connector was not started"
-          # Logs del buscador interno de Xianyu (una búsqueda por fichero).
-          for f in $(ls -t .xianyu/logs/*.log 2>/dev/null | head -3); do
-            echo "===== $f ====="
-            tail -60 "$f"
-          done

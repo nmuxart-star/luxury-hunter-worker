@@ -25,15 +25,3 @@ export async function macOneMapSnapshot(url,token){
   }
   return result;
 }
-
-// Vestiaire: la extensión devuelve en "body" el JSON de su buscador
-// ({model, items...}) o, si Vestiaire pide verificación, status 403.
-export async function macVestiaireSearch(query,token){
-  if(!token)throw new Error('Puente de Mac no configurado');
-  const result=await call('/vestiaire',{token,body:{query},timeoutMs:90_000});
-  if(Number(result?.status)===403)return {blocked:true,reason:String(result.body||'').slice(0,120)};
-  if(Number(result?.status)!==200)throw new Error(`Vestiaire desde el Mac: ${String(result?.body||'sin respuesta').slice(0,160)}`);
-  let payload;
-  try{payload=JSON.parse(result.body);}catch{throw new Error('Vestiaire desde el Mac: respuesta no válida');}
-  return payload;
-}

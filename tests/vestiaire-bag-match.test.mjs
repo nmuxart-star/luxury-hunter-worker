@@ -94,26 +94,10 @@ function harness(extra={}){
     isWatchTask:s=>/Tudor/.test(s||''),vestiaireSheetCache:{tasks:{'Lady Dior':{source:'sheet',fichas:[row]}}},
     vestiaireSheetFresh:()=>true,parseJsonArray:(s,f)=>{try{return JSON.parse(s);}catch{return f;}},
     numberOrNull:v=>v==null?null:Number(v),...extra});
-  vm.runInContext(extract('function vestiaireComparables(task,','function vestiaireComparablesNote('),ctx);
-  vm.runInContext(extract('function finalizeVerifiedOpportunity(','function storeTaskAnalysis('),ctx);
   return ctx;
 }
 const preliminary={authenticity_risk:'LOW',liquidity:'HIGH'};
 const market={conservative_resale_eur:4000,market_high_eur:5000,market_confidence:'HIGH',relevant_comparable_count:8,exact_comparable_count:5,independent_source_count:3,bag_sheet_required:true,sheet_fresh:true};
-test('actual finalizer overrides a bullish market estimate with the exact Sheets row, otherwise WATCH',()=>{
-  const ctx=harness();
-  const calculate=m=>ctx.finalizeVerifiedOpportunity(preliminary,exact,m,{importedTotalEur:600});
-  const c=match();
-  const a=calculate({...market,sheet_comps:c});
-  assert.equal(a.resale_low_eur,918);assert.equal(a.resale_estimate_source,'VESTIAIRE_DB');assert.equal(a.decision,'BUY');
-  assert.equal(calculate(market).decision,'WATCH');
-  assert.equal(calculate({...market,sheet_comps:c,sheet_fresh:false}).decision,'WATCH');
-  assert.equal(calculate({...market,sheet_comps:c,market_confidence:'LOW',independent_source_count:0,relevant_comparable_count:0}).decision,'WATCH');
-});
-test('static fallback snapshots cannot authorize purchases',()=>{
-  const ctx=harness({vestiaireSheetCache:null,vestiaireRefs:()=>({tasks:{'Lady Dior':{source:'sheet',fichas:[row]}}})});
-  assert.equal(ctx.vestiaireComparables({task_name:'Lady Dior'},item,exact),null);
-});
 test('loader reads unknown tabs and all rows without overwriting a shared task mapping',async()=>{
   const seen=[];
   const properties=[{title:'Balenciaga Fotos',gridProperties:{rowCount:100,columnCount:26}},
@@ -135,32 +119,6 @@ test('loader reads unknown tabs and all rows without overwriting a shared task m
   assert.match(decodeURIComponent(seen[1]),/AB2505/);
   assert.match(decodeURIComponent(seen[1]),/X120/);
 });
-test('cached BUY is revised without AI; both tables persist WATCH consistently and repeated refreshes do not nest raw JSON',()=>{
-  const db=new DatabaseSync(':memory:');
-  db.exec(`CREATE TABLE listings(id INTEGER,title TEXT,description TEXT);
-    CREATE TABLE tasks(id INTEGER,task_name TEXT);
-    CREATE TABLE analyses(id INTEGER,listing_id INTEGER,brand TEXT,model TEXT,authenticity_risk TEXT,liquidity TEXT,decision TEXT,opportunity_score REAL,resale_low_eur REAL,resale_high_eur REAL,landed_cost_eur REAL,net_profit_low_eur REAL,net_profit_high_eur REAL,decision_reasons_es_json TEXT,raw_json TEXT,verification_json TEXT);
-    CREATE TABLE task_analyses AS SELECT *,0 AS task_id FROM analyses;
-    INSERT INTO tasks VALUES(1,'Lady Dior');`);
-  db.prepare('INSERT INTO listings VALUES(1,?,?)').run(item.title,item.description);
-  const v={status:'verified',exact,market,final:{decision:'STRONG BUY'}};
-  for(const table of ['analyses','task_analyses']){
-    db.prepare(`INSERT INTO ${table}(id,listing_id,brand,model,authenticity_risk,liquidity,decision,opportunity_score,resale_low_eur,resale_high_eur,landed_cost_eur,net_profit_low_eur,net_profit_high_eur,decision_reasons_es_json,raw_json,verification_json${table==='task_analyses'?',task_id':''}) VALUES(1,1,'Dior','Lady Dior','LOW','HIGH','STRONG BUY',95,4000,5000,600,3400,4400,'[]','{}',?${table==='task_analyses'?',1':''})`).run(JSON.stringify(v));
-  }
-  const ctx=harness({db,vestiaireSheetCache:{tasks:{}}});
-  vm.runInContext(extract('function revalidateStoredBagBuys(){','let googleSheetsToken='),ctx);
-  ctx.revalidateStoredBagBuys();ctx.revalidateStoredBagBuys();
-  for(const table of ['analyses','task_analyses']){
-    const a=db.prepare(`SELECT * FROM ${table}`).get();
-    assert.equal(a.decision,'WATCH');
-    assert.equal(JSON.parse(a.verification_json).final.decision,'WATCH');
-    assert.match(a.decision_reasons_es_json,/CONSULTAR PRECIO/);
-    assert.equal(JSON.parse(a.verification_json).final.market_verification,undefined);
-    assert.ok(a.raw_json.length<10000);
-  }
-  db.close();
-});
-
 test('las vendidas y las que tienen más likes pesan más en el precio',()=>{
   const rows=[{...row,id:'a',price_eur:1000,likes:0},{...row,id:'b',price_eur:1100,likes:0},{...row,id:'c',price_eur:2000,likes:300},{...row,id:'d',price_eur:2100,likes:250}];
   const c=match(rows);

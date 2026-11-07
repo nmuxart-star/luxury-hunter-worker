@@ -2,24 +2,22 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync, execFile } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { randomUUID, createSign } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
-import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
-import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearchIntervalMs,
-  XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
-import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,compWeight,compStats,refAgeDays,weightedQuantile} from './scripts/vestiaire-bag-match.mjs';
+import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
-import {macOneMapReady,macOneMapSnapshot,macVestiaireSearch} from './scripts/onemap-mac-client.mjs';
-import {vestiaireLiveQuery,vestiaireLiveRows,vestiaireLiveComparables,blendComparables,vestiaireTaskQuery,VESTIAIRE_LIVE_REALIZATION} from './scripts/vestiaire-live.mjs';
+import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
+// Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
+const VESTIAIRE_LIVE_REALIZATION=0.90;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -485,7 +483,6 @@ function importEconomics(item, settings=getEconomics()){
 }
 function enrichCosts(rows){ return (rows||[]).map(r=>({...r, import_costs:importEconomics(r)})); }
 
-const bunjangCli = path.join(__dirname, 'node_modules', '.bin', 'bunjang-cli');
 
 function json(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -600,22 +597,11 @@ function pick(obj, names) {
   for (const n of names) if (obj?.[n] !== undefined && obj?.[n] !== null && obj?.[n] !== '') return obj[n];
   return null;
 }
-function deepPick(obj, names, depth=0) {
-  if (depth > 8 || !obj || typeof obj !== 'object') return null;
-  const direct = pick(obj, names); if (direct != null) return direct;
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') { const found = deepPick(v, names, depth+1); if (found != null) return found; }
-  }
-  return null;
-}
 function parseMoney(v) {
   if (v == null) return null;
   if (typeof v === 'number') return v;
   const m = String(v).replaceAll(',', '').match(/\d+(?:\.\d+)?/);
   return m ? Number(m[0]) : null;
-}
-function normalizeUrl(url, base='') {
-  try { return new URL(url, base || undefined).toString(); } catch { return String(url || ''); }
 }
 
 function upsertListing(x, sessionId=null, sourceQuery='') {
@@ -1096,7 +1082,6 @@ function assertAiBudget(purpose=''){
 // Las verificaciones (búsqueda web + modelo potente, ~0,05-0,09 $ cada una)
 // tienen su propio tope diario para que nunca dejen sin presupuesto al
 // triaje y al análisis, que son los que encuentran oportunidades nuevas.
-function watchTaskIds(){return db.prepare('SELECT id,task_name FROM tasks').all().filter(t=>isWatchTask(t.task_name)).map(t=>Number(t.id));}
 // Análisis IA de hoy en tareas de relojes (sin contar los descartes del pre-filtro, que no gastan IA).
 function verifyBudgetLeftUsd(){
   if(manualAiStore.getStore())return Infinity;
@@ -1295,15 +1280,6 @@ async function buildQueryPlan(product) {
 
 // Asíncrono: la versión con execFileSync bloqueaba el servidor entero
 // mientras Bunjang buscaba, y con tareas en paralelo las demás fallaban.
-function runBunjangCli(args) {
-  if (!fs.existsSync(bunjangCli)) return Promise.reject(new Error('bunjang-cli no está instalado. Ejecuta npm install.'));
-  return new Promise((resolve, reject) => {
-    execFile(bunjangCli, args, { encoding: 'utf8', maxBuffer: 100 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(err);
-      try { resolve(JSON.parse(String(stdout).trim())); } catch (e) { reject(e); }
-    });
-  });
-}
 function chunks(arr, n) { const out=[]; for(let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; }
 
 // BUNJANG PUBLICATION PAGE AGE V2
@@ -1312,175 +1288,8 @@ function chunks(arr, n) { const out=[]; for(let i=0;i<arr.length;i+=n) out.push(
 // 2. Si no existe, leer la antigüedad visible del anuncio.
 // 3. Nunca usar updatedAt como sustituto de publication time.
 
-function bunjangRelativeAgeToMs(text, nowMs=Date.now()){
-  const s=String(text||'')
-    .replace(/\s+/g,' ')
-    .trim()
-    .toLowerCase();
 
-  if(!s)return null;
 
-  if(
-    /^(방금\s*전|방금전|just\s*now|ahora|hace\s+un\s+momento)$/i.test(s)
-  ){
-    return nowMs;
-  }
-
-  const rules=[
-    {
-      patterns:[
-        /^(\d+)\s*초\s*전$/i,
-        /^hace\s+(\d+)\s*(?:segundo|segundos|s)$/i,
-        /^(\d+)\s*(?:second|seconds|sec|secs)\s*ago$/i
-      ],
-      unit:1000
-    },
-    {
-      patterns:[
-        /^(\d+)\s*분\s*전$/i,
-        /^hace\s+(\d+)\s*(?:minuto|minutos|min)$/i,
-        /^(\d+)\s*(?:minute|minutes|min|mins)\s*ago$/i
-      ],
-      unit:60*1000
-    },
-    {
-      patterns:[
-        /^(\d+)\s*시간\s*전$/i,
-        /^hace\s+(\d+)\s*(?:hora|horas|h)$/i,
-        /^(\d+)\s*(?:hour|hours|hr|hrs)\s*ago$/i
-      ],
-      unit:60*60*1000
-    },
-    {
-      patterns:[
-        /^(\d+)\s*일\s*전$/i,
-        /^hace\s+(\d+)\s*(?:día|días|dia|dias)$/i,
-        /^(\d+)\s*(?:day|days)\s*ago$/i
-      ],
-      unit:24*60*60*1000,
-      forceOlder:true
-    },
-    {
-      patterns:[
-        /^(\d+)\s*주\s*전$/i,
-        /^hace\s+(\d+)\s*(?:semana|semanas)$/i,
-        /^(\d+)\s*(?:week|weeks)\s*ago$/i
-      ],
-      unit:7*24*60*60*1000,
-      forceOlder:true
-    },
-    {
-      patterns:[
-        /^(\d+)\s*개월\s*전$/i,
-        /^hace\s+(\d+)\s*(?:mes|meses)$/i,
-        /^(\d+)\s*(?:month|months)\s*ago$/i
-      ],
-      unit:30*24*60*60*1000,
-      forceOlder:true
-    },
-    {
-      patterns:[
-        /^(\d+)\s*년\s*전$/i,
-        /^hace\s+(\d+)\s*(?:año|años|ano|anos)$/i,
-        /^(\d+)\s*(?:year|years)\s*ago$/i
-      ],
-      unit:365*24*60*60*1000,
-      forceOlder:true
-    }
-  ];
-
-  for(const rule of rules){
-    for(const pattern of rule.patterns){
-      const m=s.match(pattern);
-      if(!m)continue;
-
-      const amount=Number(m[1]);
-      if(!Number.isFinite(amount))continue;
-
-      let publishedMs=nowMs-(amount*rule.unit);
-
-      // "1 día" ya no es "menos de 24 horas".
-      if(rule.forceOlder){
-        publishedMs-=1000;
-      }
-
-      return publishedMs;
-    }
-  }
-
-  return null;
-}
-
-function bunjangFindStructuredPublication(html){
-  const patterns=[
-    /"datePublished"\s*:\s*"([^"]+)"/ig,
-    /"publishedAt"\s*:\s*"([^"]+)"/ig,
-    /"published_at"\s*:\s*"([^"]+)"/ig,
-    /"postedAt"\s*:\s*"([^"]+)"/ig,
-    /"posted_at"\s*:\s*"([^"]+)"/ig,
-    /"registeredAt"\s*:\s*"([^"]+)"/ig,
-    /"registered_at"\s*:\s*"([^"]+)"/ig
-  ];
-
-  for(const pattern of patterns){
-    let m;
-
-    while((m=pattern.exec(html))!==null){
-      const value=String(m[1]||'').trim();
-      const ms=parseMarketplacePublishedMs(value,'+09:00');
-
-      if(ms!==null){
-        return {
-          publishedMs:ms,
-          raw:value,
-          source:'structured_publication_timestamp'
-        };
-      }
-    }
-  }
-
-  return null;
-}
-
-function bunjangVisibleAgeFromText(text){
-  const normalized=String(text||'')
-    .replace(/\s+/g,' ')
-    .trim();
-
-  const patterns=[
-    /방금\s*전/i,
-    /\d+\s*초\s*전/i,
-    /\d+\s*분\s*전/i,
-    /\d+\s*시간\s*전/i,
-    /\d+\s*일\s*전/i,
-    /\d+\s*주\s*전/i,
-    /\d+\s*개월\s*전/i,
-    /\d+\s*년\s*전/i,
-
-    /hace\s+\d+\s*(?:segundo|segundos|s)\b/i,
-    /hace\s+\d+\s*(?:minuto|minutos|min)\b/i,
-    /hace\s+\d+\s*(?:hora|horas|h)\b/i,
-    /hace\s+\d+\s*(?:día|días|dia|dias)\b/i,
-    /hace\s+\d+\s*(?:semana|semanas)\b/i,
-    /hace\s+\d+\s*(?:mes|meses)\b/i,
-    /hace\s+\d+\s*(?:año|años|ano|anos)\b/i,
-
-    /\d+\s*(?:second|seconds|sec|secs)\s*ago/i,
-    /\d+\s*(?:minute|minutes|min|mins)\s*ago/i,
-    /\d+\s*(?:hour|hours|hr|hrs)\s*ago/i,
-    /\d+\s*(?:day|days)\s*ago/i,
-    /\d+\s*(?:week|weeks)\s*ago/i,
-    /\d+\s*(?:month|months)\s*ago/i,
-    /\d+\s*(?:year|years)\s*ago/i
-  ];
-
-  for(const pattern of patterns){
-    const m=normalized.match(pattern);
-    if(m)return String(m[0]).trim();
-  }
-
-  return null;
-}
 
 // BUNJANG RECENCY ROBUSTNESS V1
 // BUNJANG PLAYWRIGHT PUBLICATION FALLBACK V1
@@ -1508,350 +1317,7 @@ async function getBunjangPublicationBrowser(){
   return bunjangPublicationBrowserPromise;
 }
 
-async function fetchBunjangPublicationRendered(item){
-  const id=String(item?.id||'').trim();
 
-  if(!id){
-    return {
-      publishedAt:null,
-      ageText:null,
-      source:'rendered_missing_product_id',
-      status:'UNKNOWN'
-    };
-  }
-
-  let page=null;
-
-  try{
-    const browser=await getBunjangPublicationBrowser();
-
-    page=await browser.newPage({
-      locale:'ko-KR',
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '+
-        'AppleWebKit/537.36 Chrome/150 Safari/537.36'
-    });
-
-    const url=
-      `https://m.bunjang.co.kr/products/${encodeURIComponent(id)}`;
-
-    await page.goto(url,{
-      waitUntil:'domcontentloaded',
-      timeout:25000
-    });
-
-    try{
-      await page.waitForFunction(
-        () => {
-          const t=(document.body?.innerText||'')
-            .replace(/\s+/g,' ');
-
-          return (
-            /방금\s*전/.test(t) ||
-            /\d+\s*초\s*전/.test(t) ||
-            /\d+\s*분\s*전/.test(t) ||
-            /\d+\s*시간\s*전/.test(t) ||
-            /\d+\s*일\s*전/.test(t) ||
-            /\d+\s*주\s*전/.test(t) ||
-            /\d+\s*개월\s*전/.test(t) ||
-            /\d+\s*년\s*전/.test(t) ||
-            /hace\s+\d+\s*(?:segundos?|minutos?|horas?|d[ií]as?|semanas?|mes(?:es)?|años?)/i.test(t) ||
-            /\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s*ago/i.test(t)
-          );
-        },
-        null,
-        {timeout:10000}
-      );
-    }catch{}
-
-    await page.waitForTimeout(700);
-
-    const renderedHtml=await page.content();
-
-    const structured=bunjangFindStructuredPublication(
-      renderedHtml
-    );
-
-    if(structured){
-      const ageMs=Date.now()-structured.publishedMs;
-
-      return {
-        publishedAt:
-          new Date(structured.publishedMs).toISOString(),
-        ageText:null,
-        source:'rendered_'+structured.source,
-        sourceValue:structured.raw,
-        status:
-          ageMs>=-10*60*1000 &&
-          ageMs<24*60*60*1000
-            ? 'FRESH'
-            : 'STALE'
-      };
-    }
-
-    let bodyText='';
-
-    try{
-      bodyText=await page.locator('body').innerText({
-        timeout:5000
-      });
-    }catch{}
-
-    bodyText=String(bodyText||'')
-      .replace(/\s+/g,' ')
-      .trim();
-
-    let relevantText=bodyText;
-
-    const title=String(item?.title||'')
-      .replace(/\s+/g,' ')
-      .trim();
-
-    if(title){
-      const index=bodyText.indexOf(title);
-
-      if(index>=0){
-        relevantText=bodyText.slice(
-          index,
-          index+3000
-        );
-      }
-    }
-
-    let ageText=bunjangVisibleAgeFromText(
-      relevantText
-    );
-
-    if(!ageText && relevantText!==bodyText){
-      ageText=bunjangVisibleAgeFromText(
-        bodyText.slice(0,7000)
-      );
-    }
-
-    if(!ageText){
-      return {
-        publishedAt:null,
-        ageText:null,
-        source:'rendered_visible_age_not_found',
-        status:'UNKNOWN'
-      };
-    }
-
-    const publishedMs=bunjangRelativeAgeToMs(
-      ageText
-    );
-
-    if(publishedMs===null){
-      return {
-        publishedAt:null,
-        ageText,
-        source:'rendered_visible_age_unparseable',
-        status:'UNKNOWN'
-      };
-    }
-
-    const ageMs=Date.now()-publishedMs;
-
-    return {
-      publishedAt:
-        new Date(publishedMs).toISOString(),
-      ageText,
-      source:'rendered_visible_listing_age',
-      status:
-        ageMs>=-10*60*1000 &&
-        ageMs<24*60*60*1000
-          ? 'FRESH'
-          : 'STALE'
-    };
-
-  }catch(e){
-    return {
-      publishedAt:null,
-      ageText:null,
-      source:
-        e?.name==='TimeoutError'
-          ? 'rendered_timeout'
-          : `rendered_error:${String(e?.message||e)}`,
-      status:'UNKNOWN'
-    };
-  }finally{
-    if(page){
-      try{
-        await page.close();
-      }catch{}
-    }
-  }
-}
-
-async function fetchBunjangPublication(item){
-  const id=String(item?.id||'').trim();
-
-  if(!id){
-    return {
-      publishedAt:null,
-      ageText:null,
-      source:'missing_product_id',
-      status:'UNKNOWN'
-    };
-  }
-
-  const url=
-    String(item?.url||'').trim()
-    ||
-    `https://m.bunjang.co.kr/products/${encodeURIComponent(id)}`;
-
-  const controller=new AbortController();
-  const timeout=setTimeout(()=>controller.abort(),15000);
-
-  try{
-    const r=await fetch(url,{
-      signal:controller.signal,
-      redirect:'follow',
-      headers:{
-        'user-agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '+
-          'AppleWebKit/537.36 Chrome/150 Safari/537.36',
-        'accept-language':'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-        'accept':'text/html,application/xhtml+xml'
-      }
-    });
-
-    if(!r.ok){
-      return {
-        publishedAt:null,
-        ageText:null,
-        source:`http_${r.status}`,
-        status:'UNKNOWN'
-      };
-    }
-
-    const html=await r.text();
-
-    const structured=bunjangFindStructuredPublication(html);
-
-    if(structured){
-      const ageMs=Date.now()-structured.publishedMs;
-
-      return {
-        publishedAt:new Date(structured.publishedMs).toISOString(),
-        ageText:null,
-        source:structured.source,
-        sourceValue:structured.raw,
-        status:
-          ageMs>=-10*60*1000 &&
-          ageMs<24*60*60*1000
-            ? 'FRESH'
-            : 'STALE'
-      };
-    }
-
-    const $=loadHtml(html);
-
-    const bodyText=$('body')
-      .text()
-      .replace(/\s+/g,' ')
-      .trim();
-
-    // La antigüedad del producto suele aparecer justo después
-    // de título/precio. Si podemos localizar el título,
-    // reducimos la búsqueda a esa zona para evitar edades
-    // correspondientes a otros productos o al vendedor.
-    let relevantText=bodyText;
-
-    const title=String(item?.title||'')
-      .replace(/\s+/g,' ')
-      .trim();
-
-    if(title){
-      const titleIndex=bodyText.indexOf(title);
-
-      if(titleIndex>=0){
-        relevantText=bodyText.slice(
-          titleIndex,
-          titleIndex+2500
-        );
-      }
-    }
-
-    let ageText=bunjangVisibleAgeFromText(relevantText);
-
-    if(!ageText && relevantText!==bodyText){
-      ageText=bunjangVisibleAgeFromText(
-        bodyText.slice(0,5000)
-      );
-    }
-
-    if(!ageText){
-      let rendered=
-        await fetchBunjangPublicationRendered(item);
-
-      if(
-        rendered?.status==='UNKNOWN' &&
-        String(rendered?.source||'').includes('timeout')
-      ){
-        await sleep(500);
-
-        rendered=
-          await fetchBunjangPublicationRendered(item);
-      }
-
-      if(
-        rendered?.publishedAt ||
-        rendered?.ageText ||
-        rendered?.status==='FRESH' ||
-        rendered?.status==='STALE'
-      ){
-        return rendered;
-      }
-
-      return {
-        publishedAt:null,
-        ageText:null,
-        source:
-          rendered?.source ||
-          'visible_age_not_found',
-        status:'UNKNOWN'
-      };
-    }
-
-    const publishedMs=bunjangRelativeAgeToMs(ageText);
-
-    if(publishedMs===null){
-      return {
-        publishedAt:null,
-        ageText,
-        source:'visible_age_unparseable',
-        status:'UNKNOWN'
-      };
-    }
-
-    const ageMs=Date.now()-publishedMs;
-
-    return {
-      publishedAt:new Date(publishedMs).toISOString(),
-      ageText,
-      source:'visible_listing_age',
-      status:
-        ageMs>=-10*60*1000 &&
-        ageMs<24*60*60*1000
-          ? 'FRESH'
-          : 'STALE'
-    };
-
-  }catch(e){
-    return {
-      publishedAt:null,
-      ageText:null,
-      source:
-        e?.name==='AbortError'
-          ? 'timeout'
-          : String(e?.message||e),
-      status:'UNKNOWN'
-    };
-  }finally{
-    clearTimeout(timeout);
-  }
-}
 
 
 // ── BUNJANG: WEB COREANA ─────────────────────────────────────────────────
@@ -1863,15 +1329,6 @@ const BUNJANG_API='https://api.bunjang.co.kr';
 const BUNJANG_HEADERS={'user-agent':'Mozilla/5.0','accept':'application/json','origin':'https://m.bunjang.co.kr','referer':'https://m.bunjang.co.kr/'};
 
 // Primera página del buscador coreano (unos 60 anuncios, los más recientes).
-async function bunjangKoreaSearch(q){
-  const params=new URLSearchParams({q,sort:'latest'});
-  const r=await fetch(`${BUNJANG_API}/api/search/v8/pw/product/specs/keyword?${params}`,{headers:BUNJANG_HEADERS,signal:AbortSignal.timeout(20000)});
-  if(!r.ok)throw new Error(`buscador de Bunjang HTTP ${r.status}`);
-  const j=await r.json();
-  const grid=(j?.data?.searchSpec?.uiBlockList||[]).find(b=>b?.id==='mainGrid'||b?.blockType==='productList.grid.main')?.searchResponse;
-  // Fuera los anuncios patrocinados de otras webs (EXT_AD) y los de pago.
-  return {items:(grid?.data||[]).filter(x=>x?.type==='PRODUCT'&&x?.pid&&x?.ad!==true),total:Number(grid?.totalCount)||null};
-}
 
 // Ficha de la web coreana: descripción, fotos, 번개케어 y la nota, reseñas y
 // ventas de la tienda. No se guarda el nombre del vendedor.
@@ -1905,279 +1362,31 @@ async function fetchBunjangDetail(id){
     };
   }catch{return null;}
 }
-async function fetchBunjangTrust(id){
-  const d=await fetchBunjangDetail(id);
-  return d?{...d.trust,description:d.description}:null;
-}
 
-async function searchBunjangLive({ queries, maxItems=60, minEur=null, maxEur=null, sessionId }) {
-  const maxQueries = clampInt(process.env.BUNJANG_MAX_QUERIES || 2, 2, 1, 5);
-  const selectedQueries = (queries || []).slice(0, maxQueries);
-  const unique = new Map();
-  const perQuery = [];
-  for (const q0 of selectedQueries) {
-    const q = String(q0).trim(); if (!q) continue;
-    try{
-      const res=await bunjangKoreaSearch(q);
-      const found=res.items.slice(0,Math.max(1,Number(maxItems)||60));
-      for(const it of found)if(!unique.has(String(it.pid)))unique.set(String(it.pid),{it,q});
-      perQuery.push({ query:q, count:found.length, total:res.total });
-    }catch(e){
-      perQuery.push({ query:q, count:0, error:e.message });
-    }
-    await sleep(700);
-  }
-  let kept=0, detailed=0;
-  for (const [pid,{it,q}] of unique) {
-    const p = Number(it.price);
-    const pe = toEur(p, 'KRW');
-    if (!Number.isFinite(p) || p<=0) continue;
-    if (Number.isFinite(Number(minEur)) && pe != null && pe < Number(minEur)) continue;
-    if (Number.isFinite(Number(maxEur)) && pe != null && pe > Number(maxEur)) continue;
 
-    // La ficha (descripción, fotos, Care y valoraciones) se reutiliza 3 días.
-    let prev=null, prevRaw={};
-    try{
-      prev=db.prepare("SELECT description,raw_json FROM listings WHERE source='bunjang' AND source_id=?").get(pid);
-      prevRaw=prev?JSON.parse(prev.raw_json||'{}'):{};
-    }catch{}
-    let detail=null;
-    const cached=prevRaw?.koreaDetail, pt=prevRaw?.luxuryHunterTrust;
-    if(cached&&pt?.checkedAt&&Date.now()-Date.parse(pt.checkedAt)<3*86400e3){
-      detail={...cached,description:prev?.description||'',trust:pt};
-    }else{
-      detail=await fetchBunjangDetail(pid);
-      detailed++;
-      await sleep(250);
-    }
-
-    // Antigüedad que muestra Bunjang ("hace 3 horas"): la del anuncio o su
-    // última subida al principio de la lista.
-    const updatedAt=it.updatedAt||detail?.updatedAt||null;
-    const updatedMs=Date.parse(updatedAt||'');
-    const ageMs=Date.now()-updatedMs;
-    const status=Number.isFinite(updatedMs)?(ageMs>=-10*60e3&&ageMs<24*3600e3?'FRESH':'STALE'):'UNKNOWN';
-    const images=detail?.images?.length?detail.images:[String(it.productImage||'').replace('{res}','900')].filter(Boolean);
-    const trust=detail?.trust||(it.care===true?{care:true,checkedAt:new Date().toISOString()}:null);
-
-    upsertListing({
-      source:'bunjang', source_id:pid, url:`https://m.bunjang.co.kr/products/${pid}`,
-      title:it.name||detail?.name||'', description:detail?.description||'',
-      original_price:p, currency:'KRW', price_eur:pe, seller_name:null,
-      seller_items:null, seller_sales:trust?.salesCount??null, seller_reviews:trust?.reviewCount??null,
-      image_url:images[0]||'', status:String(it.status||detail?.saleStatus||'').toUpperCase()==='SELLING'?'':String(it.status||detail?.saleStatus||'').toLowerCase(),
-      purchase_via:'Korea proxy',
-      raw:{
-        pid, name:it.name||null, price:p, care:it.care===true, favoriteCount:it.favoriteCount??null,
-        images,
-        koreaDetail:detail?{name:detail.name,images:detail.images,saleStatus:detail.saleStatus,condition:detail.condition,updatedAt:detail.updatedAt}:null,
-        luxuryHunterTrust:trust,
-        publishedAt:Number.isFinite(updatedMs)?new Date(updatedMs).toISOString():null,
-        luxuryHunterPublication:{
-          marketplace:'bunjang',
-          ageText:it.updatedBefore||null,
-          source:'korea_search_api',
-          sourceValue:updatedAt,
-          status,
-          checkedAt:new Date().toISOString()
-        }
-      }
-    }, sessionId, q);
-    kept++;
-  }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('bunjang','live-search',`Web coreana · consultas ${perQuery.length}; anuncios ${unique.size}; fichas ${detailed}; kept ${kept}`,new Date().toISOString());
-  const failed=perQuery.length&&perQuery.every(x=>x.error);
-  return { ok:!failed, mode:'korea', perQuery, uniqueIds:unique.size, detailed, kept, ...(failed?{error:perQuery[0].error}:{}) };
-}
-
-async function xianyuFetch(pathname, options={}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 30000);
-  try {
-    const r = await fetch(`${XIANYU_BASE_URL}${pathname}`, { ...options, signal:controller.signal, headers:{ ...(options.headers||{}) } });
-    let body = null;
-    const ct = r.headers.get('content-type') || '';
-    if (ct.includes('application/json')) body = await r.json(); else body = await r.text();
-    if (!r.ok) throw new Error(typeof body === 'object' ? (body.detail || body.error || `HTTP ${r.status}`) : `HTTP ${r.status}: ${String(body).slice(0,200)}`);
-    return body;
-  } finally { clearTimeout(timeout); }
-}
-function xianyuResultFilename(keyword) { return `${String(keyword || '').replaceAll(' ', '_')}_full_data.jsonl`; }
-function xianyuImage(raw) {
-  const info = raw?.['商品信息'] || {};
-  const direct = info['商品主图'] || info['主图'] || info['商品图片'] || info['图片'];
-  const list = info['商品图片列表'] || info['图片列表'];
-  const v = direct || list || deepPick(raw, ['image_url','main_image','pic_url','image','cover','imageUrl','product_image_urls','images','商品主图','主图','商品图片','商品图片列表','图片列表']);
-  if (Array.isArray(v)) return typeof v[0] === 'string' ? v[0] : (v[0]?.url || v[0]?.src || '');
-  if (v && typeof v === 'object') return v.url || v.src || '';
-  return typeof v === 'string' ? v : '';
-}
 // ── RAKUTEN ICHIBA (API oficial) ────────────────────────────────────────
 // Muchas tiendas japonesas de lujo de segunda mano (Brand Off, Komehyo,
 // Daikokuya, 2nd Street, Kindal...) venden también en Rakuten Ichiba.
 // Requiere RAKUTEN_APP_ID y RAKUTEN_ACCESS_KEY (webservice.rakuten.co.jp).
-const RAKUTEN_ENDPOINT='https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701';
 
-function rakutenConfigured(){
-  return !!(process.env.RAKUTEN_APP_ID&&process.env.RAKUTEN_ACCESS_KEY);
-}
 
 // Turno global: varias tareas en paralelo no deben superar 1 petición/s.
-let rakutenNextSlot=0;
-async function rakutenThrottle(){
-  const now=Date.now();
-  const wait=Math.max(0,rakutenNextSlot-now);
-  rakutenNextSlot=Math.max(now,rakutenNextSlot)+1200;
-  if(wait)await sleep(wait);
-}
 
-function rakutenFullImage(url){
-  // Las miniaturas llevan ?_ex=128x128; sin el parámetro es la imagen original.
-  return String(url||'').replace(/\?_ex=\d+x\d+$/,'');
-}
 
 // Exclusiones en la propia búsqueda: así las 30 plazas por página son para
 // bolsos y no para carteras o calzado de la misma línea. "ウォレット" no va
 // aquí porque excluiría los "chain wallet" (bolso pequeño).
-const RAKUTEN_NG_KEYWORDS='財布 コインケース カードケース 名刺入れ 小銭入れ キーケース キーホルダー 腕時計 靴 シューズ ローファー パンプス サンダル スニーカー ネックレス ピアス イヤリング ブレスレット 指輪 スカーフ 保存袋 ストラップのみ チャーム'; // la API admite menos de 128 caracteres
-const RAKUTEN_NG_KEYWORDS_LEGACY='保存袋 ストラップのみ チャーム';
 
-async function rakutenFetchPage(params){
-  // La API nueva valida el Origin contra los "Allowed websites" de la app
-  // (el Referer solo no basta) y admite ~1 petición por segundo.
-  const site=process.env.RAKUTEN_ORIGIN||'https://nmuxart-star.github.io';
-  let body={},ok=false,status=0;
-  try{
-    await rakutenThrottle();
-    const r=await fetch(`${RAKUTEN_ENDPOINT}?${params}`,{
-      headers:{origin:site,referer:`${site}/`},
-      signal:AbortSignal.timeout(20000)
-    });
-    status=r.status;
-    body=await r.json().catch(()=>({}));
-    ok=r.ok;
-  }catch(e){
-    body={error:e.message};
-  }
-  return {ok,status,body};
-}
 
-async function searchRakutenLive({queries,minEur=null,maxEur=null,sessionId}){
-  if(!rakutenConfigured())return {ok:false,state:'not_configured',error:'Faltan RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY'};
-  const maxQueries=clampInt(process.env.RAKUTEN_MAX_QUERIES||3,3,1,5);
-  const maxPages=clampInt(process.env.RAKUTEN_PAGES||2,2,1,5);
-  const perQuery=[];
-  let kept=0;
-  let ngKeywords=RAKUTEN_NG_KEYWORDS;
-  for(const q0 of (queries||[]).slice(0,maxQueries)){
-    const q=String(q0||'').trim();
-    if(!q)continue;
-    let count=0,total=null,error=null;
-    for(let page=1;page<=maxPages;page++){
-      const params=new URLSearchParams({
-        applicationId:process.env.RAKUTEN_APP_ID,
-        accessKey:process.env.RAKUTEN_ACCESS_KEY,
-        keyword:q,
-        sort:'-updateTimestamp',
-        hits:'30',
-        page:String(page),
-        availability:'1',
-        formatVersion:'2',
-        format:'json',
-        NGKeyword:ngKeywords
-      });
-      const minJpy=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),'JPY')||0):0;
-      const maxJpy=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),'JPY')||0):0;
-      if(minJpy>0)params.set('minPrice',String(minJpy));
-      if(maxJpy>minJpy)params.set('maxPrice',String(maxJpy));
-      let {ok,status,body}=await rakutenFetchPage(params);
-      // Si la API no acepta la lista larga de exclusiones, se vuelve a la
-      // corta de siempre (el pre-filtro por título descarta el resto gratis).
-      if(!ok&&status===400&&ngKeywords!==RAKUTEN_NG_KEYWORDS_LEGACY){
-        console.warn(`Rakuten: exclusiones rechazadas (${body?.error_description||body?.error||status}); uso la lista corta.`);
-        ngKeywords=RAKUTEN_NG_KEYWORDS_LEGACY;
-        params.set('NGKeyword',ngKeywords);
-        ({ok,status,body}=await rakutenFetchPage(params));
-      }
-      if(!ok){
-        error=body?.error_description||body?.error||`HTTP ${status}`;
-        break;
-      }
-      total=body?.count??total;
-      const items=Array.isArray(body?.Items)?body.Items:[];
-      for(const raw of items){
-        const it=raw?.Item||raw;
-        const price=Number(it.itemPrice);
-        const pe=toEur(price,'JPY');
-        if(!Number.isFinite(price)||pe==null)continue;
-        if(Number.isFinite(Number(minEur))&&pe<Number(minEur))continue;
-        if(Number.isFinite(Number(maxEur))&&pe>Number(maxEur))continue;
-        const images=(it.mediumImageUrls||[]).map(x=>rakutenFullImage(typeof x==='string'?x:x?.imageUrl)).filter(Boolean);
-        upsertListing({
-          source:'rakuten-jp',
-          source_id:it.itemCode,
-          url:it.itemUrl,
-          title:it.itemName,
-          description:String(it.itemCaption||'').slice(0,4000),
-          original_price:price,
-          currency:'JPY',
-          price_eur:pe,
-          seller_name:it.shopName||'',
-          image_url:images[0]||'',
-          status:'available',
-          purchase_via:'Rakuten (proxy/forwarder)',
-          // Sin las miniaturas originales: si no, se analizarían fotos duplicadas.
-          raw:{...it,mediumImageUrls:undefined,smallImageUrls:undefined,images,luxuryHunterSource:'rakuten-api'}
-        },sessionId,q);
-        count++;
-        kept++;
-      }
-      const pageCount=Number(body?.pageCount||0);
-      if(items.length<30||(pageCount&&page>=pageCount))break;
-    }
-    perQuery.push(error&&!count?{query:q,count:0,error}:{query:q,count,total,...(error?{error}:{})});
-  }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('rakuten','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
-  const failed=perQuery.length>0&&perQuery.every(x=>x.error);
-  return failed
-    ? {ok:false,state:'error',error:perQuery[0].error,perQuery}
-    : {ok:true,perQuery,kept};
-}
 
 // ── EBAY (Browse API oficial) ───────────────────────────────────────────
 // Requiere EBAY_CLIENT_ID y EBAY_CLIENT_SECRET (developer.ebay.com).
 // EBAY_MARKETPLACES: marketplaces a consultar (por defecto UE + UK + US).
 const EU_COUNTRIES=new Set(['AT','BE','BG','HR','CY','CZ','DK','EE','FI','FR','DE','GR','HU','IE','IT','LV','LT','LU','MT','NL','PL','PT','RO','SK','SI','ES','SE']);
-const EBAY_MARKETPLACE_CURRENCY={
-  EBAY_DE:'EUR',EBAY_FR:'EUR',EBAY_IT:'EUR',EBAY_ES:'EUR',EBAY_NL:'EUR',EBAY_BE:'EUR',EBAY_AT:'EUR',EBAY_IE:'EUR',
-  EBAY_GB:'GBP',EBAY_US:'USD'
-};
-let ebayToken=null;
 
-function ebayConfigured(){
-  return !!(process.env.EBAY_CLIENT_ID&&process.env.EBAY_CLIENT_SECRET);
-}
 
-async function getEbayToken(){
-  if(ebayToken&&ebayToken.expiresAt>Date.now()+60000)return ebayToken.value;
-  const basic=Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64');
-  const r=await fetch('https://api.ebay.com/identity/v1/oauth2/token',{
-    method:'POST',
-    headers:{'content-type':'application/x-www-form-urlencoded',authorization:`Basic ${basic}`},
-    body:new URLSearchParams({grant_type:'client_credentials',scope:'https://api.ebay.com/oauth/api_scope'}),
-    signal:AbortSignal.timeout(20000)
-  });
-  const body=await r.json().catch(()=>({}));
-  if(!r.ok||!body.access_token)throw new Error(`eBay token: ${body.error_description||body.error||r.status}`);
-  ebayToken={value:body.access_token,expiresAt:Date.now()+Number(body.expires_in||7200)*1000};
-  return ebayToken.value;
-}
 
-function ebayLargeImage(url){
-  return String(url||'').replace(/s-l\d+\.(jpg|jpeg|png|webp)/i,'s-l1600.$1');
-}
 
-const AUCTION_MAX_HOURS=Math.max(1,Number(process.env.AUCTION_MAX_HOURS||72));
 // SUBASTAS QUE SE ENSEÑAN (regla de Nil, 07-11-2026): como mucho
 // AUCTION_SHOW_HOURS (2 h) para terminar y AUCTION_MIN_BIDS (1) puja o más.
 const AUCTION_SHOW_HOURS=Math.max(0.5,Number(process.env.AUCTION_SHOW_HOURS||2));
@@ -2225,136 +1434,6 @@ function listingAuction(row){
 }
 // Guarda un anuncio de la búsqueda de eBay. En las subastas el precio es la
 // puja actual (no el precio final) y se guardan el fin y el número de pujas.
-function ebayUpsertItem(it,mp,currency,sessionId,product){
-  const auction=(it?.buyingOptions||[]).includes('AUCTION')&&!!it?.itemEndDate;
-  const money=auction&&it?.currentBidPrice?.value!=null?it.currentBidPrice:(it?.price||it?.currentBidPrice||{});
-  const cur=money.currency||currency;
-  const price=Number(money.value);
-  const pe=toEur(price,cur);
-  if(!Number.isFinite(price)||pe==null)return false;
-  const country=String(it?.itemLocation?.country||'').toUpperCase();
-  // Lo que decide la aduana es desde dónde se envía, no el marketplace.
-  const source=`ebay-${(country||mp.slice(5)).toLowerCase()}`;
-  const images=[it?.image?.imageUrl,...(it?.additionalImages||[]).map(x=>x?.imageUrl)].filter(Boolean).map(ebayLargeImage);
-  upsertListing({
-    source,
-    source_id:it.itemId,
-    url:it.itemWebUrl,
-    title:it.title,
-    description:[it.condition,it.shortDescription].filter(Boolean).join(' · '),
-    original_price:price,
-    currency:cur,
-    price_eur:pe,
-    // Sin nombre de usuario del vendedor: no guardamos datos personales
-    // de usuarios de eBay (exención de Marketplace Account Deletion).
-    seller_name:'',
-    seller_sales:it?.seller?.feedbackScore??null,
-    seller_reviews:it?.seller?.feedbackPercentage!=null?Number(it.seller.feedbackPercentage):null,
-    image_url:images[0]||'',
-    status:(it.buyingOptions||[]).join('+'),
-    purchase_via:EU_COUNTRIES.has(country)?'eBay (UE, sin aduana)':`eBay (${country||mp})`,
-    raw:{
-      ...it,
-      image:undefined,
-      additionalImages:undefined,
-      seller:it?.seller?{feedbackScore:it.seller.feedbackScore,feedbackPercentage:it.seller.feedbackPercentage,sellerAccountType:it.seller.sellerAccountType}:undefined,
-      thumbnailImages:undefined,
-      images,
-      publishedAt:it.itemCreationDate||null,
-      marketplace:mp,
-      authenticityGuarantee:(it.qualifiedPrograms||[]).includes('AUTHENTICITY_GUARANTEE'),
-      auction:auction?{endsAt:it.itemEndDate,bids:Number(it.bidCount)||0,currentBid:price,currency:cur}:undefined
-    }
-  },sessionId,product);
-  return true;
-}
-async function searchEbayLive({product,minEur=null,maxEur=null,sessionId}){
-  if(!ebayConfigured())return {ok:false,state:'not_configured',error:'Faltan EBAY_CLIENT_ID / EBAY_CLIENT_SECRET'};
-  const marketplaces=String(process.env.EBAY_MARKETPLACES||'EBAY_DE,EBAY_FR,EBAY_IT,EBAY_ES,EBAY_GB,EBAY_US')
-    .split(',').map(s=>s.trim().toUpperCase()).filter(m=>EBAY_MARKETPLACE_CURRENCY[m]);
-  const token=await getEbayToken();
-  const perMarketplace=[];
-  let kept=0;
-  for(const mp of marketplaces){
-    const currency=EBAY_MARKETPLACE_CURRENCY[mp];
-    // 2990/3000/3010 = segunda mano (excelente / bueno / aceptable).
-    const filters=['conditionIds:{2990|3000|3010}'];
-    const lo=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),currency)||0):null;
-    const hi=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),currency)||0):null;
-    if(lo!=null||hi!=null)filters.push(`price:[${lo??''}..${hi??''}]`,`priceCurrency:${currency}`);
-    const params=new URLSearchParams({
-      q:String(product||'').slice(0,100),
-      sort:'newlyListed',
-      limit:'40',
-      filter:filters.join(',')
-    });
-    let body={};
-    let ok=false;
-    let status=0;
-    try{
-      const r=await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,{
-        headers:{authorization:`Bearer ${token}`,'X-EBAY-C-MARKETPLACE-ID':mp},
-        signal:AbortSignal.timeout(25000)
-      });
-      status=r.status;
-      body=await r.json().catch(()=>({}));
-      ok=r.ok;
-    }catch(e){
-      body={errors:[{message:e.message}]};
-    }
-    if(!ok){
-      perMarketplace.push({marketplace:mp,count:0,error:body?.errors?.[0]?.message||`HTTP ${status}`});
-      continue;
-    }
-    let count=0;
-    for(const it of body.itemSummaries||[]){
-      if(ebayUpsertItem(it,mp,currency,sessionId,product))count++;
-    }
-    kept+=count;
-    perMarketplace.push({marketplace:mp,count,total:body.total??null});
-    await sleep(400);
-  }
-  // Subastas: la búsqueda normal de eBay solo devuelve anuncios con "Cómpralo
-  // ya". Aparte se piden las subastas de vendedores de los países de
-  // EBAY_AUCTION_LOCATIONS (por defecto Japón) que terminan en los próximos
-  // días; el bot calcula después la puja máxima con la base de Vestiaire.
-  const auctionLocations=String(process.env.EBAY_AUCTION_LOCATIONS??'JP').split(',').map(s=>s.trim().toUpperCase()).filter(c=>/^[A-Z]{2}$/.test(c));
-  for(const cc of auctionLocations){
-    const params=new URLSearchParams({
-      q:String(product||'').slice(0,100),
-      sort:'endingSoonest',
-      limit:'40',
-      filter:`buyingOptions:{AUCTION},conditionIds:{2990|3000|3010},itemLocationCountry:${cc}`
-    });
-    try{
-      const r=await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,{
-        headers:{authorization:`Bearer ${token}`,'X-EBAY-C-MARKETPLACE-ID':'EBAY_US'},
-        signal:AbortSignal.timeout(25000)
-      });
-      const body=await r.json().catch(()=>({}));
-      if(!r.ok){perMarketplace.push({marketplace:`AUCTION_${cc}`,count:0,error:body?.errors?.[0]?.message||`HTTP ${r.status}`});continue;}
-      const maxMs=Date.now()+AUCTION_MAX_HOURS*3600e3;
-      let count=0;
-      for(const it of body.itemSummaries||[]){
-        const end=Date.parse(it?.itemEndDate||'');
-        // Solo las que acaban dentro del horizonte y con margen para pujar.
-        if(!Number.isFinite(end)||end>maxMs||end<Date.now()+30*60e3)continue;
-        if(ebayUpsertItem(it,'EBAY_US','USD',sessionId,product))count++;
-      }
-      kept+=count;
-      console.log(`eBay subastas ${cc}: ${count} terminan en las próximas ${AUCTION_MAX_HOURS} h (de ${body.total??0}).`);
-      perMarketplace.push({marketplace:`AUCTION_${cc}`,count,total:body.total??null});
-    }catch(e){
-      perMarketplace.push({marketplace:`AUCTION_${cc}`,count:0,error:e.message});
-    }
-    await sleep(400);
-  }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('ebay','live-search',`Marketplaces ${perMarketplace.length}; kept ${kept}`,new Date().toISOString());
-  const failed=perMarketplace.length>0&&perMarketplace.every(x=>x.error);
-  return failed
-    ? {ok:false,state:'error',error:perMarketplace[0].error,perMarketplace}
-    : {ok:true,perMarketplace,kept};
-}
 
 // ── XIANYU DIRECT V1 ────────────────────────────────────────────────────
 // Lee solo la página de resultados de búsqueda (como un usuario que busca),
@@ -2391,12 +1470,7 @@ function xianyuDirectMode(){
   // Goofish es pública); XIANYU_MODE=connector vuelve al conector Docker.
   return String(process.env.XIANYU_MODE||'direct').toLowerCase()!=='connector';
 }
-function xianyuProvider(){
-  // alternate: una búsqueda con Just One API y la siguiente con la cuenta de
-  // Nil (modo directo), y así sucesivamente.
-  const p=String(process.env.XIANYU_PROVIDER||'justoneapi').trim().toLowerCase();
-  return p==='direct'||p==='alternate'?p:'justoneapi';
-}
+function xianyuProvider(){return 'direct';}
 
 async function getXianyuDirect(file=xianyuActiveAccount){
   const mtime=file?fs.statSync(file).mtimeMs:null;
@@ -2556,18 +1630,6 @@ function xianyuMarkSearch(){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
-function xianyuLastPaidSearchAt(){
-  const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_paid_search'").get();
-  return Number(row?.value_json||0)||0;
-}
-function xianyuMarkPaidSearch(){
-  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_paid_search',?,?)
-    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
-}
-function xianyuLastProvider(){
-  const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_provider'").get();
-  return row?.value_json==='direct'?'direct':row?.value_json==='justoneapi'?'justoneapi':null;
-}
 function xianyuMarkProvider(provider){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_provider',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(provider,new Date().toISOString());
@@ -2583,29 +1645,6 @@ function xianyuBlockAccount(reason){
 }
 function xianyuUnblockAccount(){
   db.prepare("DELETE FROM app_settings WHERE key='xianyu_account_blocked'").run();
-}
-function reserveXianyuSearch(){
-  const key='xianyu_search_usage';
-  const row=db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(key);
-  const limit=clampInt(process.env.XIANYU_MONTHLY_SEARCH_LIMIT??XIANYU_MONTHLY_SEARCH_LIMIT,
-    XIANYU_MONTHLY_SEARCH_LIMIT,0,XIANYU_MONTHLY_SEARCH_LIMIT);
-  const dailyLimit=clampInt(process.env.XIANYU_DAILY_SEARCH_LIMIT??XIANYU_DAILY_SEARCH_LIMIT,
-    XIANYU_DAILY_SEARCH_LIMIT,0,XIANYU_DAILY_SEARCH_LIMIT);
-  const now=new Date();
-  const next=nextXianyuSearchUsage(row?.value_json??null,xianyuBudgetMonth(now),limit,xianyuBudgetDay(now),dailyLimit);
-  const value=JSON.stringify(next.usage);
-  if(row?.value_json!==value){
-    db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
-      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
-      .run(key,value,new Date().toISOString());
-  }
-  if(next.allowed)console.log(`Xianyu Just One API: llamada reservada; hoy ${next.usage.dayAttempts}/${next.dailyLimit}, mes ${next.usage.attempts}/${next.limit}.`);
-  return next;
-}
-function xianyuBudgetWarning(budget){
-  return budget.reason==='daily_limit'
-    ?`Just One API pausado hoy: ${budget.usage.dayAttempts}/${budget.dailyLimit} llamadas usadas el ${budget.usage.day}. La cuenta de Xianyu conserva sus turnos.`
-    :`Just One API pausado este mes: ${budget.usage.attempts}/${budget.limit} llamadas usadas en ${budget.usage.month}. La cuenta de Xianyu conserva sus turnos.`;
 }
 
 function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
@@ -2712,107 +1751,6 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   return {kept:true};
 }
 
-async function searchXianyuJustOneApi({queries,maxItems=30,minEur=null,maxEur=null,sessionId,slotReserved=false,justOnePages=null}){
-  const token=String(process.env.JUSTONEAPI_TOKEN||'').trim();
-  if(!token){
-    const warning='Just One API está seleccionado, pero falta configurar el secreto JUSTONEAPI_TOKEN.';
-    await reportHealthIssue('xianyu-search',warning+' Las demás plataformas continúan funcionando.').catch(()=>{});
-    return {ok:false,state:'unconfigured',warning,perQuery:[],kept:0};
-  }
-  // Si se perdió el artefacto de estado de GitHub, no se puede saber cuánto se
-  // gastó este mes. Pausar evita reiniciar por accidente el contador a cero.
-  if(String(process.env.GITHUB_ACTIONS||'').toLowerCase()==='true'&&process.env.LH_STATE_RESTORED!=='1'){
-    const warning='No se pudo recuperar el estado persistente; Xianyu queda pausado para proteger el presupuesto mensual.';
-    await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
-    return {ok:false,state:'state_missing',mode:'justoneapi',warning,perQuery:[],kept:0};
-  }
-  const pages=clampInt(justOnePages??process.env.XIANYU_JUSTONE_PAGES??1,1,1,5);
-  const dailyLimit=clampInt(process.env.XIANYU_DAILY_SEARCH_LIMIT??XIANYU_DAILY_SEARCH_LIMIT,
-    XIANYU_DAILY_SEARCH_LIMIT,0,XIANYU_DAILY_SEARCH_LIMIT);
-  const paidInterval=xianyuPaidSearchIntervalMs(pages,dailyLimit);
-  const sincePaid=Date.now()-xianyuLastPaidSearchAt();
-  if(Number.isFinite(paidInterval)&&sincePaid<paidInterval){
-    console.log(`Xianyu Just One API: turno omitido; próxima búsqueda pagada en ~${Math.ceil((paidInterval-sincePaid)/60_000)} min.`);
-    return {ok:true,state:'paid_throttled',mode:'justoneapi',perQuery:[],kept:0};
-  }
-  const minInterval=clampInt(process.env.XIANYU_MIN_INTERVAL_MIN??60,60,60,1440);
-  if(!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
-    return {ok:true,state:'throttled',mode:'justoneapi',perQuery:[],kept:0};
-  }
-  // Una sola búsqueda por ventana de tiempo, incluso si una variable antigua
-  // XIANYU_MAX_QUERIES=2 sigue presente en GitHub.
-  const maxQueries=1;
-  const selected=(queries||[]).map(q=>String(q||'').trim()).filter(Boolean).slice(0,maxQueries);
-  if(selected.length){
-    let budget;
-    try{budget=reserveXianyuSearch();}
-    catch(error){
-      const warning=String(error?.message||'Presupuesto mensual de Xianyu no disponible.');
-      await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
-      return {ok:false,state:'budget_error',mode:'justoneapi',warning,perQuery:[],kept:0};
-    }
-    if(!budget.allowed){
-      const warning=xianyuBudgetWarning(budget);
-      console.log(warning);
-      await reportHealthIssue('xianyu-budget',warning).catch(()=>{});
-      return {ok:true,state:'budget_exhausted',mode:'justoneapi',warning,perQuery:[],kept:0};
-    }
-    clearHealthIssue('xianyu-budget');
-    xianyuMarkPaidSearch();
-    xianyuMarkSearch();
-  }
-  const perQuery=[];
-  let kept=0;
-  const min=Number.isFinite(Number(minEur))&&Number(minEur)>0?Number(minEur):null;
-  const max=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Number(maxEur):null;
-  // Páginas por búsqueda (10 anuncios cada una). Cada página es una llamada y
-  // cuenta en el cupo mensual; la primera ya se ha reservado arriba.
-  for(const keyword of selected){
-    try{
-      const items=[];
-      const seen=new Set();
-      let found=0,missingTag=0,requestId=null,pagesRead=0;
-      for(let page=1;page<=pages;page++){
-        if(page>1){
-          const extra=reserveXianyuSearch();
-          if(!extra.allowed){
-            await reportHealthIssue('xianyu-budget',xianyuBudgetWarning(extra)).catch(()=>{});
-            break;
-          }
-          await sleep(1200);
-        }
-        const result=await searchJustOneXianyu({keyword,page,sort:'newest'});
-        pagesRead++;
-        requestId=requestId||result.requestId;
-        found+=result.totalFound;
-        missingTag+=result.missingVerificationTag;
-        for(const it of result.items){
-          if(it?.id&&seen.has(it.id))continue;
-          if(it?.id)seen.add(it.id);
-          items.push(it);
-        }
-        if(!result.totalFound)break;
-      }
-      const rejected={noVerificationTag:missingTag,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
-      let localKept=0;
-      for(const it of items.slice(0,Math.max(1,Number(maxItems)))){
-        const saved=saveXianyuCandidate({...it,provider:'justoneapi'},{sessionId,sourceQuery:keyword,minEur:min,maxEur:max});
-        if(saved.kept){localKept++;kept++;}
-        else if(rejected[saved.reason]!==undefined)rejected[saved.reason]++;
-      }
-      perQuery.push({query:keyword,provider:'Just One API',requestId,pages:pagesRead,found,kept:localKept,rejected});
-      await sleep(1200);
-    }catch(error){
-      const message=String(error?.message||'Error de proveedor').slice(0,240);
-      perQuery.push({query:keyword,provider:'Just One API',errorCode:error?.code??null,error:message});
-      await reportHealthIssue('xianyu-search',`Just One API no pudo completar la búsqueda de Xianyu: ${message}. Las demás plataformas continúan funcionando.`).catch(()=>{});
-      break;
-    }
-  }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-justoneapi',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
-  if(perQuery.length&&perQuery.every(query=>!query.error))clearHealthIssue('xianyu-search');
-  return {ok:!perQuery.some(query=>query.error),mode:'justoneapi',perQuery,kept};
-}
 
 async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto',slotReserved=false}){
   // Como mucho una búsqueda de Xianyu cada XIANYU_MIN_INTERVAL_MIN minutos
@@ -2918,22 +1856,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
 let xianyuQueue=Promise.resolve();
 function searchXianyuLive(opts){
   // Una búsqueda de Xianyu a la vez (misma sesión, ritmo humano).
-  // Si la sesión no es válida ya se avisa una vez (xianyu-login); no repetir
-  // un error por cada tarea.
-  if(xianyuProvider()==='alternate'){
-    const run=xianyuQueue.then(()=>searchXianyuAlternate(opts));
-    xianyuQueue=run.catch(()=>{});
-    return run;
-  }
-  if(xianyuProvider()==='justoneapi'){
-    const run=xianyuQueue.then(()=>searchXianyuJustOneApi(opts));
-    xianyuQueue=run.catch(()=>{});
-    return run;
-  }
-  const blocked=xianyuDirectSessionBlock();
-  if(blocked)return Promise.resolve(blocked);
-  const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
-  const run=xianyuQueue.then(()=>fn(opts));
+  const run=xianyuQueue.then(()=>searchXianyuAlternate(opts));
   xianyuQueue=run.catch(()=>{});
   return run;
 }
@@ -2960,23 +1883,16 @@ function xianyuDirectSessionBlock(){
 // si ya vuelve a funcionar; entonces se vuelve a alternar con normalidad.
 // Si Just One API se queda sin saldo (error 601) o sin cupo (diario o mensual),
 // su turno lo hace la cuenta (30 anuncios, como en sus propios turnos). Cada turno de Just One API comprueba si ya puede volver a buscar.
-function xianyuJustOneNoCredit(){
-  return !!db.prepare("SELECT 1 FROM app_settings WHERE key='xianyu_justone_no_credit'").get();
-}
-function xianyuJustOneOutOfCredit(res){
-  return res?.state==='budget_exhausted'||
-    (res?.perQuery||[]).some(q=>Number(q?.errorCode)===601);
-}
+// XIANYU: solo con la cuenta de Nil (modo directo, página de búsqueda).
+// Just One API y el conector antiguo, eliminados (07-11-2026).
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
-  if(!queries.length)return {ok:true,mode:'alternate',perQuery:[],kept:0};
+  if(!queries.length)return {ok:true,mode:'direct',perQuery:[],kept:0};
   const accountBlocked=xianyuAccountBlocked();
 
   const runAccount=async()=>{
-    const fn=xianyuDirectMode()?searchXianyuDirect:searchXianyuLiveExclusive;
-    // La cuenta revisa siempre sus 30 anuncios (también cuando hace los
-    // turnos de Just One API por falta de saldo): la página ya trae 30, así
-    // que no hay más peticiones a Xianyu.
+    const fn=searchXianyuDirect;
+    // La cuenta revisa sus 30 anuncios: la página ya trae 30.
     const accountOpts={...opts,slotReserved:true,maxItems:30};
     const res=xianyuDirectSessionBlock()||await fn(accountOpts);
     const verification=String(process.env.XIANYU_SESSION_STATUS||'').trim()==='risk_control'||
@@ -2984,7 +1900,7 @@ async function searchXianyuAlternate(opts){
     if(verification){
       if(!accountBlocked){
         xianyuBlockAccount('verificación anti-bot');
-        await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. Mientras siga así, Xianyu usa Just One API cuando el presupuesto diario lo permite; en cada turno de tu cuenta se comprueba si ya funciona.').catch(()=>{});
+        await reportHealthIssue('xianyu-account-blocked','Tu cuenta de Xianyu ha pedido verificación. Mientras siga así, Xianyu queda en pausa; en cada búsqueda se comprueba si ya funciona.').catch(()=>{});
       }
       return {res,verification:true};
     }
@@ -2996,163 +1912,9 @@ async function searchXianyuAlternate(opts){
     }
     return {res,verification:false};
   };
-
-  const runJustOne=async pages=>{
-    const noCredit=xianyuJustOneNoCredit();
-    const res=await searchXianyuJustOneApi({...opts,slotReserved:true,...(pages?{justOnePages:pages}:{})});
-    const searched=!res.state&&(res.perQuery||[]).some(q=>!q?.error&&Number.isFinite(q?.found));
-    if(xianyuJustOneOutOfCredit(res)){
-      if(!noCredit){
-        db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_justone_no_credit',?,?)
-          ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
-          .run(JSON.stringify({at:new Date().toISOString()}),new Date().toISOString());
-        await reportHealthIssue('xianyu-justone-credit','Just One API se ha quedado sin saldo o sin cupo. Mientras tanto sus turnos los hace tu cuenta de Xianyu y revisa 30 anuncios en cada tarea; cuando Just One API vuelva a poder buscar, se vuelve a alternar solo.').catch(()=>{});
-      }
-    }else if(noCredit&&searched){
-      db.prepare("DELETE FROM app_settings WHERE key='xianyu_justone_no_credit'").run();
-      clearHealthIssue('xianyu-justone-credit');
-      console.log('Xianyu (alterno): Just One API vuelve a poder buscar; se vuelve a alternar con normalidad.');
-    }
-    return {res,searched};
-  };
-
-  // XIANYU_JUSTONE_DISABLED=1: Just One API queda apagada hasta nuevo aviso
-  // de Nil. Todas las tareas buscan con su cuenta y no se avisa de su saldo.
-  if(['1','true','yes','on'].includes(String(process.env.XIANYU_JUSTONE_DISABLED||'').toLowerCase())){
-    xianyuMarkProvider('direct');
-    console.log(`Xianyu: Just One API desactivada; esta tarea busca con la cuenta${accountBlocked?' (comprobando si ya funciona)':''}.`);
-    const acc=await runAccount();
-    return {...acc.res,provider:'direct',accountBlocked:acc.verification,justOneDisabled:true};
-  }
-  if(xianyuLastProvider()!=='justoneapi'){
-    xianyuMarkProvider('justoneapi');
-    console.log(`Xianyu (alterno): turno de Just One API${accountBlocked?' (la cuenta de Xianyu pide verificación: 1 página)':''}.`);
-    const jo=await runJustOne(accountBlocked?1:null);
-    if(jo.searched||accountBlocked||!xianyuJustOneNoCredit()){
-      return {...jo.res,provider:'justoneapi',accountBlocked,justOneNoCredit:xianyuJustOneNoCredit()};
-    }
-    console.log('Xianyu (alterno): Just One API sin saldo o sin cupo; esta tarea busca con la cuenta (30 anuncios).');
-    const acc=await runAccount();
-    return {...acc.res,provider:'direct',accountBlocked:acc.verification,justOneNoCredit:true};
-  }
   xianyuMarkProvider('direct');
-  console.log(`Xianyu (alterno): turno de la cuenta de Xianyu${accountBlocked?' (comprobando si ya funciona)':''}.`);
   const acc=await runAccount();
-  if(!acc.verification)return {...acc.res,provider:'direct'};
-  console.log('Xianyu (alterno): la cuenta pide verificación; este turno pasa a Just One API (1 página).');
-  const jo=await runJustOne(1);
-  return {...jo.res,provider:'justoneapi',accountBlocked:true,justOneNoCredit:xianyuJustOneNoCredit()};
-}
-async function searchXianyuLiveExclusive({ queries, pages=1, maxItems=30, minEur=null, maxEur=null, sessionId, product, personalOnly=false, freeShipping=false, newPublishOption=null, region=null, accountStateFile=null, accountStrategy='auto' }) {
-  // Xianyu es lento (visita el perfil de cada vendedor): 1 búsqueda por tarea por defecto.
-  const maxQueries = clampInt(process.env.XIANYU_MAX_QUERIES || 1, 1, 1, 2);
-  const selectedQueries = (queries || []).slice(0, maxQueries);
-  const health = await xianyuFetch('/health', { timeoutMs:7000 });
-  if (!health) throw new Error('No se pudo conectar con Xianyu Hunter.');
-  const perQuery=[];
-  let kept=0;
-  for (const keyword0 of selectedQueries) {
-    const keyword = String(keyword0).trim(); if (!keyword) continue;
-    const minLocal = Number.isFinite(Number(minEur)) ? Math.floor(eurTo(Number(minEur), 'CNY') || 0) : null;
-    const maxLocal = Number.isFinite(Number(maxEur)) ? Math.ceil(eurTo(Number(maxEur), 'CNY') || 0) : null;
-    const brandRule = keyword.split(/\s+/)[0] || keyword;
-    const payload = {
-      task_name:`LH ${String(product).slice(0,40)} ${Date.now()}`,
-      enabled:true,
-      keyword,
-      description:'Temporary live search created by Luxury Hunter. Central AI analysis is performed in Luxury Hunter.',
-      analyze_images:false,
-      max_pages:clampInt(pages,1,1,5),
-      personal_only:!!personalOnly,
-      min_price:minLocal ? String(minLocal) : null,
-      max_price:maxLocal ? String(maxLocal) : null,
-      cron:null,
-      account_state_file:accountStateFile || null,
-      account_strategy:accountStrategy || 'auto',
-      free_shipping:!!freeShipping,
-      new_publish_option:newPublishOption || null,
-      region:region || null,
-      decision_mode:'keyword',
-      keyword_rules:[brandRule]
-    };
-    let taskId=null;
-    const startedAt = Date.now();
-    try {
-      const created = await xianyuFetch('/api/tasks/', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload), timeoutMs:15000 });
-      taskId = created?.task?.id;
-      // La primera tarea del conector tiene id 0: comprobar null, no falsy.
-      if (taskId === undefined || taskId === null) throw new Error('Xianyu no devolvió el ID de la tarea temporal.');
-      await xianyuFetch(`/api/tasks/start/${taskId}`, { method:'POST', timeoutMs:15000 });
-      let seenRunning=false;
-      const deadline = Date.now() + clampInt(process.env.XIANYU_QUERY_TIMEOUT_SEC || 180, 180, 60, 600) * 1000;
-      while (Date.now() < deadline) {
-        await sleep(2000);
-        const t = await xianyuFetch(`/api/tasks/${taskId}`, { timeoutMs:10000 });
-        if (t?.is_running) seenRunning=true;
-        if (seenRunning && !t?.is_running) break;
-        if (!seenRunning && Date.now() - startedAt > 15000 && !t?.is_running) break;
-      }
-      const filename = xianyuResultFilename(keyword);
-      let result = { items:[], total_items:0 };
-      try {
-        result = await xianyuFetch(`/api/results/${encodeURIComponent(filename)}?page=1&limit=100&include_hidden=true&sort_by=crawl_time&sort_order=desc`, { timeoutMs:20000 });
-      } catch (e) {
-        if (!String(e.message).includes('404')) throw e;
-      }
-      let localKept=0;
-      const rejected={ staleTask:0, missingCoreFields:0, invalidPrice:0, belowMin:0, aboveMax:0 };
-      const allRecords = result.items || [];
-      const currentRecords = allRecords.filter(raw => {
-        const recordTask = String(raw?.['任务名称'] || '').trim();
-        if (
-          recordTask &&
-          recordTask !== payload.task_name &&
-          recordTask !== String(keyword || '').trim()
-        ) {
-          rejected.staleTask++;
-          return false;
-        }
-        return true;
-      });
-      for (const raw of currentRecords.slice(0, Math.max(1, Number(maxItems)))) {
-        // Current Xianyu result records use Chinese nested keys under 商品信息 / 卖家信息.
-        // Keep English fallbacks for older forks and legacy records.
-        const info = raw?.['商品信息'] || {};
-        const sellerInfo = raw?.['卖家信息'] || {};
-        const sourceId = info['商品ID'] ?? pick(raw, ['product_id','item_id','id']) ?? deepPick(raw, ['product_id','item_id','id','商品ID']);
-        const title = info['商品标题'] ?? pick(raw, ['title','name']) ?? deepPick(raw, ['title','name','商品标题']);
-        const url = info['商品链接'] ?? pick(raw, ['link','url','item_url']) ?? deepPick(raw, ['link','url','item_url','商品链接']);
-        const rawPrice = info['当前售价'] ?? info['价格'] ?? pick(raw, ['price','current_price']) ?? deepPick(raw, ['price','current_price','sold_price','当前售价']);
-        const price = parseMoney(rawPrice);
-        if (!sourceId || (!title && !url)) { rejected.missingCoreFields++; continue; }
-        if (!Number.isFinite(Number(price))) { rejected.invalidPrice++; continue; }
-        const pe = toEur(price, 'CNY');
-        if (Number.isFinite(Number(minEur)) && pe != null && pe < Number(minEur)) { rejected.belowMin++; continue; }
-        if (Number.isFinite(Number(maxEur)) && pe != null && pe > Number(maxEur)) { rejected.aboveMax++; continue; }
-        const seller = sellerInfo['卖家昵称'] ?? info['卖家昵称'] ?? pick(raw, ['seller_nick','seller_name']) ?? deepPick(raw, ['seller_nick','seller_name','nick','卖家昵称']);
-        const description = (info['商品描述'] ?? raw?.['商品描述'] ?? deepPick(raw, ['description','desc','detail','商品描述'])) || '';
-        upsertListing({
-          source:'xianyu', source_id:sourceId, url, title, description,
-          original_price:price, currency:'CNY', price_eur:pe, seller_name:seller, image_url:xianyuImage(raw),
-          status:raw?._status || pick(raw,['status','detail_fetch_status']) || '', purchase_via:'China agent', raw
-        }, sessionId, keyword);
-        localKept++; kept++;
-      }
-      perQuery.push({
-        query:keyword,
-        rawTotal:result.total_items || allRecords.length || 0,
-        currentTaskRecords:currentRecords.length,
-        kept:localKept,
-        rejected
-      });
-    } finally {
-      if (taskId !== null && taskId !== undefined) { try { await xianyuFetch(`/api/tasks/${taskId}`, { method:'DELETE', timeoutMs:10000 }); } catch {} }
-    }
-    // Keep Xianyu conservative. Do not hammer searches back-to-back.
-    await sleep(1200);
-  }
-  db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
-  return { ok:true, perQuery, kept };
+  return {...acc.res,provider:'direct',accountBlocked:acc.verification};
 }
 
 // JAPAN MULTI-SOURCE RADAR V2
@@ -4306,27 +3068,6 @@ async function searchJapanRadarLive(opts){
 }
 
 // POSITIVE MARKET VERIFICATION V1.6
-const CENTRAL_AI_INSTRUCTION = `You are the first-pass central AI screening engine for Luxury Hunter. Analyze this second-hand luxury handbag listing conservatively for resale in Europe. First verify that the listing appears to match the target product family; search-query similarity is not proof. The user's task requirements below are mandatory evaluation context. Never certify authenticity from photos alone.
-
-RESALE REFERENCE: when estimating the European resale price, use Vestiaire Collective prices as the primary reference (Nil resells against Vestiaire). Other resellers (Collector Square, The RealReal, Fashionphile, eBay...) are secondary evidence used to confirm or adjust. WATCHES are the exception: for watch tasks Nil resells on Chrono24 as a private seller, so Chrono24 prices for the exact reference (same reference number, similar year, condition and box/papers) are the primary resale reference; Watchfinder and similar dealers are secondary.
-
-EXOTIC SKIN POLICY (mandatory): if the title, description or photos indicate genuine exotic leather (crocodile, alligator, caiman, python or other snake, ostrich, lizard, stingray/galuchat, eel), decision MUST be REJECT with the reason "piel exótica (CITES)". Embossed/printed calf leather imitating these is NOT exotic.
-
-AUTHENTICITY RISK STABILITY RULES:
-- An implausibly low price is an authenticity RISK SIGNAL, but price alone is NOT sufficient evidence for HIGH authenticity risk or REJECT.
-- Missing seller sales, reviews or public history is a risk signal, but is NOT sufficient by itself, or combined only with a low price, to justify HIGH authenticity risk.
-- The fact that a model is frequently counterfeited is contextual risk only and is NOT sufficient evidence for HIGH authenticity risk.
-- When the product appears to match the target and the authenticity concerns are circumstantial or uncertain, use at most MEDIUM authenticity risk and prefer WATCH so that the exact-model and live-market verification stages can investigate it.
-- Use HIGH authenticity risk at the preliminary stage only when there is concrete listing-specific evidence of a serious authenticity problem, such as explicit replica/fake/counterfeit language, a failed marketplace verification, a seller explicitly refusing verification while disclaiming authenticity, clear visual/product inconsistencies strongly incompatible with the claimed item, or similarly strong grounded evidence.
-- A clearly wrong product, explicit counterfeit/replica listing, failed marketplace verification, or other objective disqualifier may be REJECT immediately.
-- Marketplace verification AVAILABLE is a positive risk-reduction signal only, never proof of authenticity. PASSED is stronger positive evidence. FAILED is disqualifying.
-- Do not invent authenticity defects that are not visible or grounded in the listing evidence.
-
-Luxury Hunter calculates import/shipping/tax costs deterministically and supplies the IMPORTED TOTAL; use that supplied total as landed_cost_eur and DO NOT invent a different import-cost figure. This is ONLY the preliminary screen. Any preliminary WATCH, BUY or STRONG BUY will be blocked from final publication until a second visual exact-model check and a live market-comparable check are completed.
-
-Return ONLY valid JSON with keys: brand, model, authenticity_risk (LOW|MEDIUM|HIGH), liquidity (LOW|MEDIUM|HIGH), decision (STRONG BUY|BUY|WATCH|REJECT), opportunity_score (0-100), resale_low_eur, resale_high_eur, landed_cost_eur, net_profit_low_eur, net_profit_high_eur, decision_reasons_es, notes.
-
-decision_reasons_es MUST be an array of 1 to 4 short bullet-style reasons written in Spanish. For REJECT, make the reasons specific, practical and grounded in concrete evidence. If the item plausibly matches the target but evidence is insufficient mainly because authenticity, exact variant or market value still requires verification, prefer WATCH rather than REJECT. Never invent facts.`
 
 const POSITIVE_DECISIONS = new Set(['WATCH','BUY','STRONG BUY']);
 
@@ -4401,70 +3142,7 @@ function percentile(values,p){
   if(lo===hi)return a[lo];
   return a[lo]+(a[hi]-a[lo])*(i-lo);
 }
-function weightedMean(entries){
-  const rows=(entries||[])
-    .map(x=>({
-      value:Number(x?.value),
-      weight:Number(x?.weight)
-    }))
-    .filter(x=>
-      Number.isFinite(x.value) &&
-      Number.isFinite(x.weight) &&
-      x.weight>0
-    );
 
-  if(!rows.length)return null;
-
-  const totalWeight=rows.reduce(
-    (sum,x)=>sum+x.weight,
-    0
-  );
-
-  if(!(totalWeight>0))return null;
-
-  return rows.reduce(
-    (sum,x)=>sum+(x.value*x.weight),
-    0
-  )/totalWeight;
-}
-
-function weightedPercentile(entries,p){
-  const rows=(entries||[])
-    .map(x=>({
-      value:Number(x?.value),
-      weight:Number(x?.weight)
-    }))
-    .filter(x=>
-      Number.isFinite(x.value) &&
-      Number.isFinite(x.weight) &&
-      x.weight>0
-    )
-    .sort((a,b)=>a.value-b.value);
-
-  if(!rows.length)return null;
-
-  const q=Math.max(
-    0,
-    Math.min(1,Number(p)||0)
-  );
-
-  const totalWeight=rows.reduce(
-    (sum,x)=>sum+x.weight,
-    0
-  );
-
-  const target=totalWeight*q;
-  let cumulative=0;
-
-  for(const row of rows){
-    cumulative+=row.weight;
-    if(cumulative>=target){
-      return row.value;
-    }
-  }
-
-  return rows[rows.length-1].value;
-}
 
 // VESTIAIRE SNAPSHOT V1: precios pedidos en Vestiaire que Nil captura a mano
 // (data/vestiaire-refs.json en local; en la nube viaja cifrado dentro de
@@ -4506,52 +3184,6 @@ function vestiaireSheetFresh(){
 }
 // Recheck cached positive decisions without new AI/API searches. Historical
 // analyses must not keep a BUY obtained with another size or an old snapshot.
-function revalidateStoredBagBuys(){
-  for(const table of ['task_analyses','analyses']){
-    const tasks=table==='task_analyses';
-    const rows=db.prepare(`SELECT a.*,l.title,l.description,${tasks?'t.task_name':"'' AS task_name"}
-      FROM ${table} a JOIN listings l ON l.id=a.listing_id
-      ${tasks?'LEFT JOIN tasks t ON t.id=a.task_id':''}
-      WHERE a.decision IN ('BUY','STRONG BUY','WATCH')`).all();
-    const update=db.prepare(`UPDATE ${table} SET decision=?,opportunity_score=?,resale_low_eur=?,resale_high_eur=?,net_profit_low_eur=?,net_profit_high_eur=?,decision_reasons_es_json=?,raw_json=?,verification_json=? WHERE id=?`);
-    for(const row of rows){
-      if(isWatchTask(row.task_name))continue;
-      let v={},raw={};try{v=JSON.parse(row.verification_json||'{}');raw=JSON.parse(row.raw_json||'{}');}catch{}
-      // Los análisis nuevos (referencias elegidas por la IA) ya llevan su precio: no se tocan.
-      if(v.match_version)continue;
-      const comps=vestiaireComparables({task_name:row.task_name},row,v.exact||{brand:row.brand,family:row.model});
-      let a={...raw,decision:row.decision,opportunity_score:row.opportunity_score,
-        resale_low_eur:row.resale_low_eur,resale_high_eur:row.resale_high_eur,
-        net_profit_low_eur:row.net_profit_low_eur,net_profit_high_eur:row.net_profit_high_eur,
-        decision_reasons_es:parseJsonArray(row.decision_reasons_es_json,[])};
-      delete a.market_verification;
-      if(v.final)delete v.final.market_verification;
-      if(v.status==='verified'&&v.exact&&v.market){
-        v.market={...v.market,sheet_comps:comps,sheet_anchor:comps,bag_sheet_required:true,sheet_fresh:vestiaireSheetFresh()};
-        const revised=finalizeVerifiedOpportunity({...a,authenticity_risk:row.authenticity_risk,liquidity:row.liquidity},v.exact,v.market,{importedTotalEur:row.landed_cost_eur},v.marketplace_verification);
-        // A cache refresh may downgrade, never issue a new purchase recommendation.
-        const rank={'REJECT':0,'REVIEW':1,'WATCH':2,'BUY':3,'STRONG BUY':4};
-        if(rank[revised.decision]>rank[row.decision])revised.decision=row.decision;
-        a={...a,...revised};
-      }
-      a=applyBagSheetPolicy(a,comps,{fresh:vestiaireSheetFresh()&&v.status==='verified'});
-      if(v.auction){
-        // Recomputing a live bid requires fresh auction data. Invalidate an old
-        // cap when its valuation/evidence changed, instead of retaining it.
-        if(!comps?.buy_eligible||!vestiaireSheetFresh()||a.resale_low_eur!==row.resale_low_eur){
-          v.auction={...v.auction,max_bid_eur:null,max_bid_local:null,resale_from_db:false};
-          if(['BUY','STRONG BUY'].includes(a.decision))a.decision='WATCH';
-          a.decision_reasons_es=['CONSULTAR PRECIO: revisar la puja máxima con la nueva valoración de Sheets.',...(a.decision_reasons_es||[])].slice(0,5);
-        }
-      }
-      v.bag_sheet_rule_version=BAG_SHEET_RULE_VERSION;
-      v.market={...(v.market||{}),sheet_comps:comps,sheet_fresh:vestiaireSheetFresh(),bag_sheet_required:true};
-      if(v.final)v.final={...v.final,...a};
-      a.market_verification=v;
-      update.run(a.decision,numberOrNull(a.opportunity_score),numberOrNull(a.resale_low_eur),numberOrNull(a.resale_high_eur),numberOrNull(a.net_profit_low_eur),numberOrNull(a.net_profit_high_eur),JSON.stringify(a.decision_reasons_es||[]),JSON.stringify(a),JSON.stringify(v),row.id);
-    }
-  }
-}
 let googleSheetsToken=null;
 let googleSheetsWriteToken=null;
 
@@ -4839,7 +3471,6 @@ async function refreshVestiaireSheet({force=false}={}){
     }finally{
       vestiaireSheetPromise=null;
     }
-    revalidateStoredBagBuys();
     return vestiaireSheetCache;
   })();
   return vestiaireSheetPromise;
@@ -4857,31 +3488,7 @@ function vestiaireWidthCm(text){
 function vestiaireSizeLabel(text){
   return (VESTIAIRE_SIZE_RE.find(([,re])=>re.test(String(text||'')))||[])[0]||null;
 }
-const sheetNorm=t=>String(t||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
-function vestiaireMatchFichas(fichas,item,taskName=''){
-  const text=`${item?.title||''} ${item?.description||''}`;
-  const size=vestiaireSizeLabel(text);
-  const width=vestiaireWidthCm(text);
-  const colorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(t))||[])[0];
-  const itemColor=colorOf(text);
-  // Solo el mismo modelo que el anuncio; si no se sabe cuál es, ninguno.
-  const pool=vestiaireSameModel(taskName,fichas.filter(f=>!f.excluded),item,null)?.rows||[];
-  // Antes se ordenaba por cercanía al precio de COMPRA, que no dice nada del
-  // precio de reventa: ahora cuentan la talla (medidas o etiqueta) y el color.
-  const scored=pool.map(f=>{
-    let score=0;
-    const fw=vestiaireWidthCm(f.dims);
-    if(width&&fw&&Math.abs(fw-width)/width<=0.12)score+=4;
-    else if(size&&vestiaireSizeLabel(`${f.size} ${f.notes}`)===size)score+=3;
-    if(itemColor&&colorOf(String(f.color||''))===itemColor)score+=2;
-    if(f.vintage&&/vintage|vintag|古着|빈티지/i.test(text))score+=1;
-    const dist=width&&fw?Math.abs(fw-width)/width:1;
-    return {f,score,dist};
-  });
-  scored.sort((a,b)=>b.score-a.score||a.dist-b.dist||(b.f.likes||0)-(a.f.likes||0));
-  const strong=scored.filter(x=>x.score>0).slice(0,12);
-  return strong.length?strong:scored.slice(0,8);
-}
+// ── FIN DE TALLAS Y COLORES ──
 // PRECIO DE REVENTA ANCLADO EN LA BASE DE DATOS DE NIL
 // Con los anuncios de la misma talla (por medidas o etiqueta) y modelo de su
 // hoja de Vestiaire, y el % al que se venden de verdad frente al precio pedido
@@ -4890,60 +3497,9 @@ function vestiaireMatchFichas(fichas,item,taskName=''){
 const VESTIAIRE_DEFAULT_REALIZATION=0.90; // vendido ≈ 90 % de lo pedido en la hoja de Nil (07-11-2026)
 // Anchura (cm) de cada talla en los modelos principales, para cuando el
 // anuncio dice la talla ("中号", "ミニ", "Medium"...) pero no las medidas.
-const VESTIAIRE_FAMILY_SIZES=[
-  [/chanel|classic flap/i,[['Mini',/\bmini\b|ミニ|迷你/i,17,21],['Small',/\bsmall\b|小号|スモール/i,22,24],['Jumbo',/jumbo|ジャンボ|大号/i,29,31],['Maxi',/maxi|マキシ/i,32,35],['Medium',/medium|中号|ミディアム/i,25,27]]],
-  [/lady dior/i,[['Micro',/micro|マイクロ/i,11,13],['Mini',/\bmini\b|ミニ|迷你/i,16,18],['Small',/\bsmall\b|小号|スモール/i,19,21],['Medium',/medium|中号|ミディアム/i,23,25],['Large',/large|大号|ラージ/i,30,33]]],
-  [/evelyne/i,[['TPM',/tpm|\b1[67]\b|mini|ミニ/i,15,19],['PM',/\bpm\b|\b29\b/i,27,30],['GM',/\bgm\b|\b33\b/i,32,35]]],
-  [/saddle/i,[['Mini',/\bmini\b|ミニ|迷你/i,18,21],['Medium',/medium|中号|ミディアム|classic/i,24,27]]]
-];
-function vestiaireSheetAnchor(task,item,exact){
-  if(!isWatchTask(task?.task_name))return vestiaireComparables(task,item,exact);
-  const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
-  if(!r||r.source!=='sheet'||!Array.isArray(r.fichas))return null;
-  // Solo el mismo modelo que el anuncio; si no se sabe cuál es, no hay ancla.
-  const m=vestiaireSameModel(task.task_name,r.fichas.filter(f=>Number.isFinite(f.price_eur)&&f.price_eur>0),item,exact);
-  if(!m)return null;
-  const pool=m.rows;
-  const width=vestiaireWidthCm(`${item?.title||''} ${item?.description||''}`);
-  const size=vestiaireSizeLabel(`${exact?.size||''} ${item?.title||''}`);
-  let basis='';
-  let matched=[];
-  if(width){
-    matched=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw&&Math.abs(fw-width)/width<=0.12;});
-    basis=`medidas ~${Math.round(width)} cm`;
-  }
-  const fam=(VESTIAIRE_FAMILY_SIZES.find(([re])=>re.test(task.task_name))||[])[1];
-  const famSize=!width&&fam?fam.find(([,re])=>re.test(`${exact?.size||''} ${item?.title||''}`)):null;
-  if(matched.length<4&&famSize){
-    const [name,re,lo,hi]=famSize;
-    matched=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw?fw>=lo&&fw<=hi:re.test(`${f.size} ${f.notes}`);});
-    basis=`talla ${name} (${lo}-${hi} cm)`;
-  }
-  if(matched.length<4&&size){
-    matched=pool.filter(f=>vestiaireSizeLabel(`${f.size} ${f.notes}`)===size);
-    basis=`talla ${size}`;
-  }
-  if(matched.length<4)return null;
-  const ratios=r.fichas.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)&&f.price_eur>0).map(f=>f.sold_price_eur/f.price_eur).filter(x=>x>0.4&&x<1.6).sort((a,b)=>a-b);
-  const ratio=ratios.length>=5?clampNum(ratios[Math.floor(ratios.length/2)],0.75,1):VESTIAIRE_DEFAULT_REALIZATION;
-  const values=[
-    ...matched.filter(f=>!f.excluded).map(f=>f.price_eur*ratio),
-    ...matched.filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>f.sold_price_eur)
-  ].sort((a,b)=>a-b);
-  if(values.length<4)return null;
-  const q=p=>values[Math.min(values.length-1,Math.max(0,Math.round((values.length-1)*p)))];
-  return {n:values.length,basis,ratio:Math.round(ratio*100)/100,low:Math.round(q(0.25)),mid:Math.round(q(0.5)),high:Math.round(q(0.75))};
-}
 // Ajusta una franja de reventa al ancla de la hoja: nunca por encima de lo que
 // se vende de verdad (la baja no pasa de la mediana realista y la alta no pasa
 // del p75 realista). Si la evidencia propia es más baja, se respeta.
-function clampResaleToAnchor(low,high,anchor){
-  if(!anchor)return {low,high,changed:false};
-  const l=Number.isFinite(low)?Math.min(low,anchor.mid):anchor.low;
-  let h=Number.isFinite(high)?Math.min(high,anchor.high):anchor.high;
-  if(h<l)h=l;
-  return {low:roundMoney(l),high:roundMoney(h),changed:l!==low||h!==high};
-}
 // COMPARABLES DE LA BASE DE NIL, POR NIVELES DE PARECIDO
 // El precio de reventa sale de los anuncios más parecidos de la hoja:
 //   1. "iguales": mismo modelo, talla, color y material (≥3 precios);
@@ -4952,9 +3508,6 @@ function clampResaleToAnchor(low,high,anchor){
 // Si la pestaña de la tarea no tiene el modelo (p. ej. Radar con un modelo
 // nuevo), se busca el modelo nombrado en las demás pestañas del mismo tipo.
 // Precios: pedidos × % al que se venden de verdad + ventas registradas.
-const VESTIAIRE_MATERIAL_RE=[['exotica',/croc|cocodril|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|鳄鱼|蟒/i],['charol',/charol|patent|vernis|verniz|漆皮/i],['ante',/\bante\b|suede|daim|scamosciato|麂皮|翻毛/i],['tweed',/tweed|粗花呢/i],['seda',/\bseda\b|silk|satin|raso|丝绸/i],['lona',/lona|canvas|toile|\btela\b|fabric|nylon|nailon|monogram|jacquard|denim|raf+ia|帆布|老花|尼龙/i],['piel',/piel|cuero|leather|cuir|pelle|leder|lambskin|calfskin|caviar|cordero|becerro|ternera|vachetta|羊皮|牛皮|小牛皮/i]];
-const vestiaireMaterialOf=t=>(VESTIAIRE_MATERIAL_RE.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
-const vestiaireColorOf=t=>(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 // Textos con los que se reconoce el modelo del anuncio: el título y lo que
 // identificaron la verificación y el análisis (marca, modelo, variante).
 function vestiaireItemTexts(item,exact){
@@ -4973,102 +3526,12 @@ function vestiaireSameModel(tab,rows,item,exact,opts){
   const mat=sameMaterialRows(m.rows,known(exact?.material)?exact.material:item?.title);
   return mat.rows.length?{...m,rows:mat.rows,material:mat.material}:null;
 }
-function vestiaireComparables(task,item,exact){
-  if(!isWatchTask(task?.task_name)){
-    const entries=Object.entries(vestiaireSheetCache?.tasks||{})
-      .filter(([tab,r])=>!isWatchTask(tab)&&r.source==='sheet')
-      .map(([tab,r])=>({tab,rows:r.fichas||[]}));
-    const c=strictBagComparables(entries,item,exact||{});
-    if(c)c.cross=c.tab!==task?.task_name;
-    return c;
-  }
-  const refs=vestiaireRefs().tasks||{};
-  const taskName=task?.task_name||'';
-  const watch=isWatchTask(taskName);
-  const raw=`${item?.title||''} ${item?.description||''}`;
-  const label=[exact?.brand,exact?.family,exact?.exact_variant_label,exact?.size].filter(Boolean).join(' ');
-  const usable=f=>Number.isFinite(f.price_eur)&&f.price_eur>0;
-  // Solo anuncios del MISMO modelo (regla de Nil): otro color, material o
-  // talla valen; otro modelo de la misma pestaña, no.
-  const own=refs[taskName];
-  let pool=[],tab=taskName,model=null,matClass=null;
-  if(own?.source==='sheet'&&Array.isArray(own.fichas)){
-    const m=vestiaireSameModel(taskName,own.fichas.filter(usable),item,exact);
-    if(m){pool=m.rows;model=m.key;matClass=m.material||null;}
-  }
-  // Si la pestaña de la tarea no tiene ese modelo, se busca en las demás del
-  // mismo tipo, solo si el anuncio lo nombra.
-  if(!pool.length){
-    let best=null;
-    for(const [name,r] of Object.entries(refs)){
-      if(name===taskName||r?.source!=='sheet'||!Array.isArray(r.fichas)||isWatchTask(name)!==watch)continue;
-      const m=vestiaireSameModel(name,r.fichas.filter(usable),item,exact,{requireNamed:true});
-      // Gana el modelo más concreto ("pochette accessoires" antes que "pochette"); a igualdad, más filas.
-      const spec=k=>String(k||'').split(' · ').pop().length;
-      if(m&&(!best||spec(m.key)>spec(best.key)||(spec(m.key)===spec(best.key)&&m.rows.length>best.rows.length)))best={name,...m};
-    }
-    if(best){pool=best.rows;model=best.key;tab=best.name;matClass=best.material||null;}
-  }
-  if(!pool.length)return null;
-  const ratios=(refs[tab]?.fichas||[]).filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)&&f.price_eur>0).map(f=>f.sold_price_eur/f.price_eur).filter(x=>x>0.4&&x<1.6).sort((a,b)=>a-b);
-  const ratio=ratios.length>=5?clampNum(ratios[Math.floor(ratios.length/2)],0.75,1):VESTIAIRE_DEFAULT_REALIZATION;
-  const realistic=f=>f.sold&&Number.isFinite(f.sold_price_eur)?f.sold_price_eur:(!f.excluded?f.price_eur*ratio:null);
-  // Vendidas, recientes y con más likes pesan más (compWeight).
-  const band=list=>{
-    const w=list.map(f=>({v:realistic(f),w:compWeight(f)})).filter(x=>Number.isFinite(x.v));
-    const q=p=>Math.round(weightedQuantile(w,p));
-    return w.length?{n:w.length,low:q(0.25),mid:q(0.5),high:q(0.75)}:{n:0};
-  };
-  // Talla: medidas del anuncio, talla de la familia o etiqueta (Mini, Medium...).
-  const width=vestiaireWidthCm(raw);
-  const sizeText=`${exact?.size||''} ${item?.title||''}`;
-  const fam=(VESTIAIRE_FAMILY_SIZES.find(([re])=>re.test(tab))||[])[1];
-  const famSize=!width&&fam?fam.find(([,re])=>re.test(sizeText)):null;
-  const sizeLbl=vestiaireSizeLabel(sizeText);
-  let sized=null,basis='';
-  // Relojes: la "talla" es la referencia; si el anuncio la da, solo valen esas filas.
-  const flatRef=v=>sheetNorm(v).replace(/[.\-\s\/]/g,'');
-  const rawFlat=flatRef(`${raw} ${label}`);
-  const refRows=watch?pool.filter(f=>{const r=flatRef(f.size);return /\d{3}/.test(r)&&r.length>=5&&rawFlat.includes(r);}):[];
-  if(refRows.length){sized=refRows;basis='misma referencia';}
-  if(!sized&&width){sized=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw&&Math.abs(fw-width)/width<=0.12;});basis=`medidas ~${Math.round(width)} cm`;}
-  if((!sized||band(sized).n<4)&&famSize){const [name,re,lo,hi]=famSize;sized=pool.filter(f=>{const fw=vestiaireWidthCm(f.dims);return fw?fw>=lo&&fw<=hi:re.test(`${f.size} ${f.notes}`);});basis=`talla ${name}`;}
-  if((!sized||band(sized).n<4)&&sizeLbl){sized=pool.filter(f=>vestiaireSizeLabel(`${f.size} ${f.notes}`)===sizeLbl);basis=`talla ${sizeLbl}`;}
-  // Color y material: primero lo que identificó la verificación visual.
-  const known=v=>v&&!/unknown|desconocid/i.test(String(v));
-  const itemColor=vestiaireColorOf(known(exact?.main_color)?exact.main_color:raw);
-  const itemMat=vestiaireMaterialOf(known(exact?.material)?exact.material:raw);
-  const same=sized&&itemColor&&itemMat?sized.filter(f=>vestiaireColorOf(f.color)===itemColor&&vestiaireMaterialOf(`${f.material} ${f.notes}`)===itemMat):[];
-  let tier=null,set=null;
-  if(band(same).n>=3){tier='iguales';set=same;}
-  else if(sized&&band(sized).n>=4){tier='misma_talla';set=sized;}
-  else if(band(pool).n>=6){tier='mismo_modelo';set=pool;basis='otras tallas';}
-  if(!tier)return null;
-  const b=band(set);
-  // Primero las que más pesan: vendidas, recientes y con más likes.
-  const usableSet=set.filter(f=>Number.isFinite(realistic(f)));
-  const picks=usableSet.slice().sort((x,y)=>compWeight(y)-compWeight(x))
-    .slice(0,5)
-    .map(f=>({url:f.url,size:f.size,dims:f.dims,material:f.material,color:f.color,condition:f.condition,price_eur:f.price_eur,sold:!!f.sold,sold_price_eur:f.sold_price_eur??null,likes:Number.isFinite(f.likes)?f.likes:null,published:f.published||null}));
-  const st=compStats(usableSet);
-  return {tier,tab,model,materialClass:matClass,cross:tab!==taskName,basis,colour:itemColor,material:itemMat,ratio:Math.round(ratio*100)/100,...b,
-    sold_n:st.sold_n,recent_n:st.recent_n,likes_max:st.likes_max,price_basis:st.sold_n?(st.sold_n===usableSet.length?'sold':'mixed'):'asking',picks};
-}
-function vestiaireComparablesNote(c){
-  if(!c)return '';
-  if(c.rule_version===BAG_SHEET_RULE_VERSION){
-    return `Sheets: ${c.n} referencia(s) del modelo ${c.model}, ${c.basis}, material ${c.material}${c.tier==='iguales'?`, color ${c.colour}`:', otro color'}${c.condition?`, estado ${c.condition}`:''}. Reventa estimada ${c.low}-${c.high} EUR; ${c.sold_n} ventas registradas. ${c.price_basis==='sold'?'Valoración basada en los precios de venta registrados, sin descuento adicional.':c.price_basis==='mixed'?'Vendidos y en venta; los vendidos, los recientes y los de más likes pesan más.':c.ratio_source==='assumption'?'Precios pedidos ajustados al 90 % como hipótesis, no ventas confirmadas.':'Ajuste basado en ventas registradas de estas referencias.'}`;
-  }
-  const what=c.tier==='iguales'?`iguales (${c.basis}, ${c.colour}, ${c.material})`:c.tier==='misma_talla'?`de la ${c.basis}`:'en otras tallas';
-  return `Reventa según tu base de Vestiaire: ${c.n} anuncios del modelo ${c.model||'del anuncio'}${c.materialClass?` en ${c.materialClass}`:''} ${what}${c.cross?` (pestaña ${c.tab})`:''}; se venden al ${Math.round(c.ratio*100)} % del precio pedido → venta realista ${c.low}-${c.high} EUR.`;
-}
 // ── VESTIAIRE EN DIRECTO (sin referencia en la base) ────────────────────
 // Si la base de Nil no tiene nada del modelo, se busca ese modelo en
 // Vestiaire desde el Chrome del Mac (mismo puente que One Map). Cada búsqueda
 // (marca + modelo) se guarda VESTIAIRE_LIVE_CACHE_HOURS (12 h) y como mucho se
 // hacen VESTIAIRE_LIVE_DAILY_MAX (40) al día. Si Vestiaire pide verificación,
 // se deja de buscar 6 h: nunca se resuelve ni se esquiva.
-let vestiaireLiveMacReady={at:0,ok:false};
 function saveSetting(key,value){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
@@ -5077,191 +3540,17 @@ function saveSetting(key,value){
 // Vestiaire en directo APAGADO (Nil, 07-11-2026): en dos días no dio ningún
 // resultado útil (tope diario, Mac apagado, errores) y frenaba los análisis.
 // El precio sale solo de la base de Nil. VESTIAIRE_LIVE=on lo vuelve a activar.
-function vestiaireLiveOn(){return ['1','on','true','yes'].includes(String(process.env.VESTIAIRE_LIVE||'').toLowerCase());}
-async function vestiaireLiveSearchRows(query,{maxAgeHours=null}={}){
-  if(!vestiaireLiveOn())return {status:'disabled'};
-  const token=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
-  if(!token)return {status:'no_mac'};
-  const now=Date.now();
-  const ttl=Number(process.env.VESTIAIRE_LIVE_CACHE_HOURS||12)*3600e3;
-  const cache=getSetting('vestiaire_live_cache',{})||{};
-  const hit=cache[query];
-  if(hit&&now-Date.parse(hit.at)<(maxAgeHours!=null?maxAgeHours*3600e3:ttl))return {status:'ok',cached:true,rows:hit.rows||[],model:hit.model||null};
-  const usage=getSetting('vestiaire_live_usage',{})||{};
-  if(Date.parse(usage.blocked_until||'')>now)return {status:'blocked'};
-  const day=new Date().toISOString().slice(0,10);
-  const used=usage.day===day?Number(usage.n)||0:0;
-  if(used>=Number(process.env.VESTIAIRE_LIVE_DAILY_MAX||200))return {status:'daily_limit'};
-  if(now-vestiaireLiveMacReady.at>120e3)vestiaireLiveMacReady={at:now,ok:await macOneMapReady(token)};
-  if(!vestiaireLiveMacReady.ok)return {status:'mac_offline'};
-  saveSetting('vestiaire_live_usage',{...usage,day,n:used+1});
-  const payload=await macVestiaireSearch(query,token);
-  if(payload?.blocked){
-    saveSetting('vestiaire_live_usage',{...usage,day,n:used+1,blocked_until:new Date(now+6*3600e3).toISOString()});
-    await reportHealthIssue('vestiaire-live','Vestiaire ha pedido una verificación en el Chrome del Mac; la búsqueda en directo queda en pausa 6 h (no se resuelve ni se esquiva). Los avisos siguen, con la reventa estimada sin Vestiaire.').catch(()=>{});
-    return {status:'blocked'};
-  }
-  const rows=vestiaireLiveRows(payload);
-  const model=payload?.model?.name||null;
-  saveRefThumbs(payload?.thumbs);
-  const fresh=Object.fromEntries(Object.entries(cache).filter(([,v])=>now-Date.parse(v.at)<ttl).slice(-59));
-  fresh[query]={at:new Date(now).toISOString(),model,rows};
-  saveSetting('vestiaire_live_cache',fresh);
-  console.log(`Vestiaire en directo: "${query}" → ${model||'sin modelo'} · ${rows.length} anuncios (${rows.filter(r=>r.sold).length} vendidos).`);
-  return {status:'ok',rows,model};
-}
-function saveRefThumbs(thumbs){
-  if(!thumbs||typeof thumbs!=='object')return;
-  const at=new Date().toISOString();
-  const put=db.prepare('INSERT OR REPLACE INTO ref_thumbs(id,jpeg,saved_at) VALUES(?,?,?)');
-  db.transaction(()=>{
-    for(const [id,b64] of Object.entries(thumbs)){
-      if(!/^\d{5,10}$/.test(id)||typeof b64!=='string'||b64.length>100000)continue;
-      put.run(id,Buffer.from(b64,'base64'),at);
-    }
-    db.prepare('DELETE FROM ref_thumbs WHERE saved_at<?').run(new Date(Date.now()-3*864e5).toISOString());
-  })();
-}
-async function vestiaireLiveFor(task,item,exact){
-  if(isWatchTask(task?.task_name))return null;
-  const query=vestiaireLiveQuery(item,exact||{});
-  if(!query)return {status:'no_query'};
-  const r=await vestiaireLiveSearchRows(query);
-  if(r.status!=='ok')return {status:r.status,query};
-  const c=vestiaireLiveComparables(r.rows,item,exact||{},{query,model:r.model});
-  return c?{...c,status:'ok'}:{status:'no_match',query,model:r.model,found:r.rows.length};
-}
-function vestiaireLiveNote(c){
-  if(c?.status!=='ok')return '';
-  return `Sin referencia en tu base: reventa según ${c.n} anuncios de Vestiaire en directo del modelo ${c.model}${c.material?` en ${c.material}`:''} (${c.basis}; ${c.sold_n} vendidos y ${c.active_n} en venta × 90 %; vendidos, recientes y con más likes pesan más) → ${c.low}-${c.high} EUR.`;
-}
 // ── VESTIAIRE COMO FUENTE ───────────────────────────────────────────────
 // En cada tarea de bolsos, los anuncios más nuevos de ese modelo en
 // Vestiaire (desde el Chrome del Mac) entran como un anuncio más: la IA los
 // revisa y el bot los valora igual que los de Asia, con los gastos de
 // comprador de Vestiaire en el coste. La búsqueda se repite como mucho cada
 // VESTIAIRE_SOURCE_REFRESH_HOURS (1 h) por modelo.
-async function searchVestiaireSource({sessionId,minEur=null,maxEur=null},taskName){
-  const query=vestiaireTaskQuery(taskName);
-  if(!query)return {ok:false,kept:0,error:'tarea sin modelo de Vestiaire'};
-  const r=await vestiaireLiveSearchRows(query,{maxAgeHours:Number(process.env.VESTIAIRE_SOURCE_REFRESH_HOURS||1)});
-  if(r.status!=='ok')return {ok:false,kept:0,query,error:VESTIAIRE_LIVE_WHY[r.status]||r.status};
-  let kept=0;
-  for(const x of (r.rows||[]).filter(x=>!x.sold&&x.price_eur>0)){
-    if(minEur!=null&&Number(x.price_eur)<Number(minEur))continue;
-    if(maxEur!=null&&Number(x.price_eur)>Number(maxEur))continue;
-    upsertListing({source:'vestiaire',source_id:String(x.id),url:x.url,title:x.title||x.model,
-      description:[x.model,x.size,x.dims?`${x.dims} cm`:'',x.color,x.condition,x.material,x.notes].filter(Boolean).join(' · '),
-      original_price:x.price_eur,currency:'EUR',price_eur:x.price_eur,image_url:x.picture,status:'active',
-      raw:{...x,publishedAt:x.created_at},purchase_via:'Vestiaire Collective'},sessionId,query);
-    kept++;
-  }
-  return {ok:true,kept,query,model:r.model,cached:!!r.cached};
-}
 
-function vestiaireFichasBlock(r,item,taskName=''){
-  const picked=vestiaireMatchFichas(r?.fichas||[],item,taskName);
-  if(!picked.length)return vestiaireSoldBlock(r,item,taskName);
-  const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | ${x.price_eur} EUR${x.original_eur?` (was ${x.original_eur})`:''} | ${x.country}${x.vintage?' | vintage':''}${Number.isFinite(x.likes)?` | ${x.likes} likes`:''}${x.notes?` | ${x.notes}`:''} | ${x.url}`).join('\n');
-  return `\n\nNIL'S VESTIAIRE DATABASE — LISTINGS FOR SALE (PRIMARY EVIDENCE: Nil's own database of real Vestiaire Collective listings, kept up to date daily (status, likes); more likes = more demand; CURRENT asking prices; size inferred from the listed measurements). These are the closest matches to THIS listing by size, colour and price:
-${rows}
-These ARE real comparables: when one matches the target's size, material, colour family and condition, include it in your comparables (source "Vestiaire Collective", status CURRENT, its URL) with the proper match_level, even if your own search did not surface it. Size matters a lot for City: Nano/Mini/Small/Part Time/Medium/Large are different price levels. All of them are the SAME MODEL as the target; never use listings of another model of the same brand as comparables.`+vestiaireSoldBlock(r,item,taskName);
-}
 // Ventas reales de la base de datos de Nil: el precio "Vendido a X €" de
 // Vestiaire. Es la mejor prueba de precio de reventa que tenemos.
-function vestiaireSoldBlock(r,item,taskName=''){
-  const sold=(r?.fichas||[]).filter(f=>f.sold&&Number.isFinite(f.sold_price_eur)).map(f=>({...f,price_eur:f.sold_price_eur,excluded:false}));
-  if(!sold.length)return '';
-  const picked=vestiaireMatchFichas(sold,item,taskName).slice(0,10);
-  const rows=picked.map(({f:x})=>`- ${x.size} ${x.dims} cm | ${x.material} ${x.color} | ${x.condition} | SOLD for ${x.sold_price_eur} EUR | ${x.country}${x.vintage?' | vintage':''}${Number.isFinite(x.likes)?` | ${x.likes} likes`:''} | ${x.url}`).join('\n');
-  const st=r.sold_stats?.n?` (all recorded sales for this model: n=${r.sold_stats.n}, median ${r.sold_stats.median} €, range ${r.sold_stats.min}-${r.sold_stats.max} €)`:'';
-  return `\n\nNIL'S VESTIAIRE DATABASE — CONFIRMED SALES (real Vestiaire Collective sales recorded by Nil: the listing page shows "Vendido a X €")${st}. Closest matches to THIS listing:
-${rows}
-These are the STRONGEST resale evidence available. When one matches the target's size, material, colour family and condition, include it in your comparables with source "Vestiaire Collective", listing_status SOLD, its URL and the sold price, and anchor resale_low_eur on these sold prices rather than on asking prices.`;
-}
-function vestiaireSnapshotBlock(task,item,exact=null){
-  if(!isWatchTask(task?.task_name)){
-    const c=vestiaireComparables(task,item,exact);
-    if(!c)return '\n\nNIL SHEETS: no matching model + all declared dimensions + material + known colour. Do not use other sizes or invent missing dimensions. Any valuation is provisional: WATCH / CONSULTAR PRECIO, never BUY or STRONG BUY. Identify the variant first; the database will be checked again after identification.';
-    return `\n\nNIL SHEETS — PRIMARY EVIDENCE (only these matching rows; never substitute a broader model/size average):\n${vestiaireComparablesNote(c)}\n${JSON.stringify(c.picks)}\nUse these rows first. Asking prices are not completed sales. A matching row alone does not prove a good deal; retain condition, authenticity and market confidence checks.`;
-  }
-  const r=task?.task_name?vestiaireRefs().tasks?.[task.task_name]:null;
-  if(!r)return '';
-  const fmt=s=>`n=${s.n}, p25 ${s.p25} €, median ${s.median} €, p75 ${s.p75} €, range ${s.min}-${s.max} €`;
-  let out='';
-  // Solo el mismo modelo que el anuncio: la pestaña mezcla variantes y formatos.
-  const active=Array.isArray(r.fichas)?r.fichas.filter(f=>!f.excluded&&Number.isFinite(f.price_eur)):[];
-  const same=r.source==='sheet'?vestiaireSameModel(task.task_name,active,item,null):null;
-  const list=same?.rows||(r.source==='sheet'?[]:null);
-  const all=list?priceStats(list.map(f=>f.price_eur)):r.all;
-  if(all?.n>=3){
-    const by={};if(list)for(const f of list)(by[(f.size||'Sin talla').trim()]||=[]).push(f.price_eur);
-    const groupList=list?Object.entries(by).map(([k,v])=>({label:k,...priceStats(v)})):Object.values(r.groups||{});
-    const groups=groupList.filter(g=>g.n>=2).map(g=>`  - ${g.label}: ${fmt(g)}`).join('\n');
-    const vintage=list?priceStats(list.filter(f=>f.vintage).map(f=>f.price_eur)):r.vintage;
-    const disc=list?(list.length?Math.round(list.filter(f=>Number.isFinite(f.original_eur)&&f.original_eur>f.price_eur).length/list.length*100):0):r.discounted_share;
-    out+=`\n\nVESTIAIRE MARKET SNAPSHOT${same?` — MODEL ${same.key} ONLY`:''} (${r.source==='sheet'?`computed live from Nil's own Vestiaire database on ${r.captured_on}, listings still for sale`:`captured manually by Nil from a full Vestiaire search on ${r.captured_on||'unknown date'}`}; CURRENT ASKING prices in EUR, not sold prices; covers listings not indexed by Google):
-- All listings${same?` of this model`:''}: ${fmt(all)}
-${vintage?.n>=3?`- Tagged vintage: ${fmt(vintage)}\n`:''}${groups?`- By format:\n${groups}\n`:''}- ${disc}% of listings already show a price reduction, so real sale prices are usually below asking.
-Use this snapshot to judge the realistic Vestiaire price level for THIS variant (size, format, material, condition) and whether individual comparables you find are representative. It is not a comparable itself and has no URLs; never cite it as one. Asking prices overstate achievable resale: treat the lower half (p25 to median) as the realistic resale zone unless the target is clearly superior.`;
-  }
-  return out+vestiaireFichasBlock(r,item,task.task_name);
-}
-const VESTIAIRE_VALUATION_WEIGHT=Math.max(1,Number(process.env.VESTIAIRE_VALUATION_WEIGHT||2));
-function hostOf(url){
-  try{return new URL(url).hostname.toLowerCase();}catch{return '';}
-}
 
-function luxuryComparableValuationWeight(c){
-  const url=String(c?.url||'').trim();
-  const tier=luxuryMarketTier(url);
-  const europe=europeanLuxuryMarketUrl(url);
-  const status=String(
-    c?.listing_status||'UNKNOWN'
-  ).toUpperCase();
 
-  let weight=1;
-
-  // eBay sigue siendo evidencia complementaria.
-  if(tier==='TIER_2'){
-    weight*=0.70;
-  }
-
-  // Mayor relevancia para el mercado europeo.
-  if(europe){
-    weight*=1.35;
-  }
-
-  // Vestiaire Collective es la referencia principal de Nil para revender:
-  // sus anuncios pesan el doble que los de otras webs (que siguen contando).
-  if(/(^|\.)(vestiairecollective\.com|chrono24\.[a-z.]+)$/i.test(hostOf(url))){
-    weight*=VESTIAIRE_VALUATION_WEIGHT;
-  }
-
-  // Una venta confirmada tiene más valor que un asking price.
-  if(status==='SOLD'){
-    weight*=1.50;
-  }else if(status==='UNKNOWN'){
-    weight*=0.75;
-  }
-
-  return weight;
-}
-
-function normalizeCurrency(v){
-  const s=String(v||'EUR').trim().toUpperCase();
-  if(s==='EURO'||s==='EUROS')return'EUR';
-  if(s==='US$')return'USD';
-  return s;
-}
-function comparableToEur(c){
-  const price=Number(c?.price);
-  if(!Number.isFinite(price)||price<=0)return null;
-  const currency=normalizeCurrency(c?.currency);
-  if(currency==='EUR')return roundMoney(price);
-  const converted=toEur(price,currency);
-  return Number.isFinite(Number(converted))?roundMoney(converted):null;
-}
 function sourceKey(c){
   const url=String(
     c?.url||
@@ -5485,142 +3774,7 @@ async function geminiJsonRequest({key,model,parts,googleSearch=false,purpose='ve
 
   return {data,groundingSources,webSearchQueries,jsonRepairUsed};
 }
-async function exactModelVerification({key,model,item,task,imageParts,preliminary}){
-  const visualPrompt=`You are the SECOND-STAGE exact handbag identification specialist for Luxury Hunter.
 
-IMPORTANT:
-- The seller title and search query are untrusted hints.
-- Base the identification primarily on the supplied product images.
-- Distinguish family vs exact variant. For example, Fendi Baguette is not enough: distinguish standard Baguette vs Mamma/mini/nano/chain/1997 and identify material, pattern, colour, hardware and likely era where evidence permits.
-- Do not invent a reference number or edition.
-- If images are insufficient, explicitly lower confidence.
-- This is model/variant identification, NOT an authenticity certificate.
-
-CONDITION ASSESSMENT:
-- In the SAME visual pass, assess the actual physical condition of THIS specific unit.
-- Inspect only what is genuinely visible in the supplied listing images.
-- Check, when visible: corners, edges, handles, straps, leather/canvas/textile surface, stains, scratches, cracking, discoloration, hardware wear, oxidation, shape loss, structure, base, interior, lining, closures, repairs, missing pieces and included accessories.
-- Never assume a hidden area is in good condition.
-- If important views are missing, lower condition confidence and list them in missing_views_es.
-- condition.score MUST use a 0-100 scale, where 100 means the best visible condition and 0 the worst. Do not return a 0-1 or 0-10 score.
-- condition.score is only a visual condition indicator. It MUST NEVER map to a fixed resale percentage or price adjustment.
-- Do not estimate resale value in this visual stage.
-
-TARGET TASK: ${task?.product_query||''}
-TASK CRITERIA:
-${task?.description||''}
-
-LISTING TITLE: ${item.title||''}
-LISTING DESCRIPTION: ${item.description||''}
-PRELIMINARY AI RESULT:
-${JSON.stringify(preliminary)}
-
-Return ONLY JSON:
-{
-  "target_match": true,
-  "brand": "string",
-  "family": "string",
-  "exact_variant_label": "string",
-  "size": "string or unknown",
-  "material": "string or unknown",
-  "main_color": "string or unknown",
-  "pattern": "string or unknown",
-  "hardware": "string or unknown",
-  "era": "string or unknown",
-  "reference_code": null,
-  "special_edition": null,
-  "confidence": 0.0,
-  "visual_evidence_es": ["1-4 short Spanish points"],
-  "uncertainties_es": [],
-  "condition": {
-    "grade": "EXCELLENT|VERY_GOOD|GOOD|FAIR|POOR|UNKNOWN",
-    "score": null,
-    "confidence": 0.0,
-    "visible_areas_es": [],
-    "defects_es": [],
-    "positive_signals_es": [],
-    "missing_views_es": [],
-    "notes_es": []
-  }
-}`;
-  const {data}=await geminiJsonRequest({key,model,parts:[{text:visualPrompt},...imageParts],googleSearch:false});
-  return {
-    target_match:data.target_match!==false,
-    brand:String(data.brand||preliminary.brand||'').trim(),
-    family:String(data.family||preliminary.model||'').trim(),
-    exact_variant_label:String(data.exact_variant_label||data.family||preliminary.model||'').trim(),
-    size:String(data.size||'unknown').trim(),
-    material:String(data.material||'unknown').trim(),
-    main_color:String(data.main_color||'unknown').trim(),
-    pattern:String(data.pattern||'unknown').trim(),
-    hardware:String(data.hardware||'unknown').trim(),
-    era:String(data.era||'unknown').trim(),
-    reference_code:data.reference_code?String(data.reference_code).trim():null,
-    special_edition:typeof data.special_edition==='boolean'?data.special_edition:null,
-    confidence:clampNum(data.confidence,0,1),
-    visual_evidence_es:Array.isArray(data.visual_evidence_es)?data.visual_evidence_es.slice(0,4):[],
-    uncertainties_es:Array.isArray(data.uncertainties_es)?data.uncertainties_es.slice(0,4):[],
-    condition:(()=>{
-      const c=data?.condition&&typeof data.condition==='object'?data.condition:{};
-
-      let grade=String(c.grade||'UNKNOWN')
-        .trim()
-        .toUpperCase()
-        .replace(/[ -]+/g,'_');
-
-      if(!['EXCELLENT','VERY_GOOD','GOOD','FAIR','POOR','UNKNOWN'].includes(grade)){
-        grade='UNKNOWN';
-      }
-
-      const scoreRaw=Number(c.score);
-
-      let conditionScore=null;
-
-      if(Number.isFinite(scoreRaw)){
-        if(scoreRaw>=0 && scoreRaw<=1){
-          conditionScore=clampNum(
-            scoreRaw*100,
-            0,
-            100
-          );
-        }else if(scoreRaw>1 && scoreRaw<=10){
-          conditionScore=clampNum(
-            scoreRaw*10,
-            0,
-            100
-          );
-        }else{
-          conditionScore=clampNum(
-            scoreRaw,
-            0,
-            100
-          );
-        }
-      }
-
-      return {
-        grade,
-        score:conditionScore,
-        confidence:clampNum(c.confidence,0,1),
-        visible_areas_es:Array.isArray(c.visible_areas_es)?c.visible_areas_es.slice(0,12):[],
-        defects_es:Array.isArray(c.defects_es)?c.defects_es.slice(0,12):[],
-        positive_signals_es:Array.isArray(c.positive_signals_es)?c.positive_signals_es.slice(0,12):[],
-        missing_views_es:Array.isArray(c.missing_views_es)?c.missing_views_es.slice(0,12):[],
-        notes_es:Array.isArray(c.notes_es)?c.notes_es.slice(0,6):[]
-      };
-    })()
-  };
-}
-
-function visionSourceName(url){
-  try{
-    return new URL(String(url||'')).hostname
-      .replace(/^www\./,'')
-      .trim() || 'Google Vision';
-  }catch{
-    return 'Google Vision';
-  }
-}
 
 // TRUSTED LUXURY MARKET SOURCES V1
 // Google / Vision se utiliza para DESCUBRIR.
@@ -5675,26 +3829,7 @@ const EUROPE_PRIORITY_LUXURY_MARKET_DOMAINS=Object.freeze([
   'ebay.es'
 ]);
 
-function europeanLuxuryMarketUrl(value){
-  const host=luxuryMarketHostname(value);
-  if(!host)return false;
-  return EUROPE_PRIORITY_LUXURY_MARKET_DOMAINS.some(
-    domain=>
-      host===domain ||
-      host.endsWith(`.${domain}`)
-  );
-}
 
-function luxuryMarketPriorityRank(value){
-  const tier=luxuryMarketTier(value);
-  const europe=europeanLuxuryMarketUrl(value);
-
-  if(tier==='TIER_1' && europe)return 0;
-  if(tier==='TIER_1')return 1;
-  if(tier==='TIER_2' && europe)return 2;
-  if(tier==='TIER_2')return 3;
-  return 9;
-}
 
 function luxuryMarketHostname(value){
   try{
@@ -5707,28 +3842,7 @@ function luxuryMarketHostname(value){
   }
 }
 
-function trustedLuxuryMarketUrl(value){
-  const host=luxuryMarketHostname(value);
 
-  if(!host)return false;
-
-  return TRUSTED_LUXURY_MARKET_DOMAINS.some(
-    domain=>
-      host===domain ||
-      host.endsWith(`.${domain}`)
-  );
-}
-
-function trustedLuxuryMarketEntry(entry){
-  const url=String(
-    entry?.url ||
-    entry?.link ||
-    entry?.uri ||
-    ''
-  ).trim();
-
-  return trustedLuxuryMarketUrl(url);
-}
 
 function secondaryLuxuryMarketUrl(value){
   const host=luxuryMarketHostname(value);
@@ -5740,28 +3854,8 @@ function secondaryLuxuryMarketUrl(value){
   );
 }
 
-function approvedLuxuryMarketUrl(value){
-  return (
-    trustedLuxuryMarketUrl(value) ||
-    secondaryLuxuryMarketUrl(value)
-  );
-}
 
-function approvedLuxuryMarketEntry(entry){
-  const url=String(
-    entry?.url ||
-    entry?.link ||
-    entry?.uri ||
-    ''
-  ).trim();
-  return approvedLuxuryMarketUrl(url);
-}
 
-function luxuryMarketTier(value){
-  if(trustedLuxuryMarketUrl(value))return 'TIER_1';
-  if(secondaryLuxuryMarketUrl(value))return 'TIER_2';
-  return 'UNAPPROVED';
-}
 
 function trustedLuxuryMarketSourceName(value){
   const host=luxuryMarketHostname(value);
@@ -5807,519 +3901,8 @@ function approvedLuxuryMarketSourceName(value){
   return trustedLuxuryMarketSourceName(value);
 }
 
-async function googleVisionWebDetection(item){
-  const apiKey=String(
-    process.env.GOOGLE_CLOUD_VISION_API_KEY||''
-  ).trim();
 
-  const imageUrl=String(item?.image_url||'').trim();
 
-  const base={
-    enabled:!!apiKey,
-    ok:false,
-    checked_at:new Date().toISOString(),
-    image_url:imageUrl||null,
-    best_guess_labels:[],
-    pages_with_matching_images:[],
-    full_matching_images:[],
-    partial_matching_images:[],
-    visually_similar_images:[],
-    error:null
-  };
-
-  if(!apiKey){
-    return {
-      ...base,
-      error:'GOOGLE_CLOUD_VISION_API_KEY no configurada'
-    };
-  }
-
-  if(!imageUrl){
-    return {
-      ...base,
-      error:'El anuncio no tiene image_url'
-    };
-  }
-
-  // Intentamos enviar a Vision los bytes reales de la imagen.
-  // Si el marketplace bloquea la descarga, usamos imageUri.
-  let visionImage=null;
-
-  try{
-    const controller=new AbortController();
-
-    const timer=setTimeout(
-      ()=>controller.abort(),
-      15000
-    );
-
-    try{
-      const imageResponse=await fetch(
-        imageUrl,
-        {
-          headers:{
-            'user-agent':
-              'Mozilla/5.0 LuxuryHunter/1.7',
-            'accept':
-              'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-          },
-          signal:controller.signal
-        }
-      );
-
-      if(imageResponse.ok){
-        const ab=await imageResponse.arrayBuffer();
-        const buffer=Buffer.from(ab);
-
-        if(
-          buffer.length>0 &&
-          buffer.length<=15*1024*1024
-        ){
-          visionImage={
-            content:buffer.toString('base64')
-          };
-        }
-      }
-    }finally{
-      clearTimeout(timer);
-    }
-
-  }catch{
-    // Fallback a URL pública.
-  }
-
-  if(!visionImage){
-    visionImage={
-      source:{
-        imageUri:imageUrl
-      }
-    };
-  }
-
-  const endpoint=
-    `https://vision.googleapis.com/v1/images:annotate?key=${
-      encodeURIComponent(apiKey)
-    }`;
-
-  const payload={
-    requests:[
-      {
-        image:visionImage,
-        features:[
-          {
-            type:'WEB_DETECTION',
-            maxResults:50
-          }
-        ]
-      }
-    ]
-  };
-
-  try{
-    const response=await fetch(
-      endpoint,
-      {
-        method:'POST',
-        headers:{
-          'content-type':'application/json'
-        },
-        body:JSON.stringify(payload)
-      }
-    );
-
-    let body={};
-
-    try{
-      body=await response.json();
-    }catch{}
-
-    if(!response.ok){
-      return {
-        ...base,
-        error:
-          body?.error?.message ||
-          `Vision HTTP ${response.status}`
-      };
-    }
-
-    const annotation=body?.responses?.[0]||{};
-
-    if(annotation?.error?.message){
-      return {
-        ...base,
-        error:annotation.error.message
-      };
-    }
-
-    const web=annotation.webDetection||{};
-
-    const imageRef=x=>({
-      url:String(x?.url||'').trim(),
-      score:Number.isFinite(Number(x?.score))
-        ? Number(x.score)
-        : null
-    });
-
-    const pages=(
-      Array.isArray(web.pagesWithMatchingImages)
-        ? web.pagesWithMatchingImages
-        : []
-    ).map(p=>({
-      url:String(p?.url||'').trim(),
-      page_title:String(p?.pageTitle||'').trim(),
-
-      score:Number.isFinite(Number(p?.score))
-        ? Number(p.score)
-        : null,
-
-      full_matching_images:
-        Array.isArray(p?.fullMatchingImages)
-          ? p.fullMatchingImages.map(imageRef)
-          : [],
-
-      partial_matching_images:
-        Array.isArray(p?.partialMatchingImages)
-          ? p.partialMatchingImages.map(imageRef)
-          : []
-    })).filter(
-      p=>
-        p.url &&
-        trustedLuxuryMarketUrl(p.url)
-    );
-
-    return {
-      enabled:true,
-      ok:true,
-      checked_at:new Date().toISOString(),
-      image_url:imageUrl,
-
-      best_guess_labels:(
-        Array.isArray(web.bestGuessLabels)
-          ? web.bestGuessLabels
-          : []
-      ).map(x=>({
-        label:String(x?.label||'').trim(),
-        language_code:String(
-          x?.languageCode||''
-        ).trim()
-      })).filter(x=>x.label),
-
-      pages_with_matching_images:pages,
-
-      full_matching_images:(
-        Array.isArray(web.fullMatchingImages)
-          ? web.fullMatchingImages
-          : []
-      ).map(imageRef).filter(x=>x.url),
-
-      partial_matching_images:(
-        Array.isArray(web.partialMatchingImages)
-          ? web.partialMatchingImages
-          : []
-      ).map(imageRef).filter(x=>x.url),
-
-      visually_similar_images:(
-        Array.isArray(web.visuallySimilarImages)
-          ? web.visuallySimilarImages
-          : []
-      ).map(imageRef).filter(x=>x.url),
-
-      error:null
-    };
-
-  }catch(e){
-    return {
-      ...base,
-      error:e?.message||String(e)
-    };
-  }
-}
-
-
-async function googleLensSerpApiSearch(item){
-
-  const apiKey=String(
-    process.env.SERPAPI_API_KEY||''
-  ).trim();
-
-  const imageUrl=String(
-    item?.image_url||''
-  ).trim();
-
-  const base={
-    enabled:!!apiKey,
-    ok:false,
-    checked_at:new Date().toISOString(),
-    image_url:imageUrl||null,
-    input_mode:null,
-    visual_matches:[],
-    exact_matches:[],
-    error:null
-  };
-
-  if(!apiKey){
-    return {
-      ...base,
-      error:'SERPAPI_API_KEY no configurada'
-    };
-  }
-
-  if(!imageUrl){
-    return {
-      ...base,
-      error:'El anuncio no tiene image_url'
-    };
-  }
-
-  const runLens=async params=>{
-
-    const qs=new URLSearchParams({
-      engine:'google_lens',
-      type:'all',
-      hl:'en',
-      api_key:apiKey,
-      ...params
-    });
-
-    const response=await fetch(
-      `https://serpapi.com/search.json?${qs.toString()}`,
-      {
-        headers:{
-          accept:'application/json'
-        },
-        signal:AbortSignal.timeout(45000)
-      }
-    );
-
-    let body={};
-
-    try{
-      body=await response.json();
-    }catch{}
-
-    if(!response.ok || body?.error){
-      throw new Error(
-        String(
-          body?.error ||
-          `SerpApi HTTP ${response.status}`
-        )
-      );
-    }
-
-    return body;
-  };
-
-  const normalizeMatches=body=>{
-
-    const visual=(
-      Array.isArray(body?.visual_matches)
-        ? body.visual_matches
-        : []
-    ).map((x,idx)=>({
-
-      position:
-        x?.position==null
-          ? idx+1
-          : Number.isFinite(Number(x.position))
-            ? Number(x.position)
-            : idx+1,
-
-      title:String(x?.title||'').trim(),
-
-      source:String(x?.source||'').trim(),
-
-      url:String(x?.link||'').trim(),
-
-      image_url:String(
-        x?.image ||
-        x?.thumbnail ||
-        ''
-      ).trim(),
-
-      exact_match:x?.exact_matches===true,
-
-      price:
-        x?.price?.extracted_value==null
-          ? null
-          : Number.isFinite(
-              Number(x.price.extracted_value)
-            )
-            ? Number(x.price.extracted_value)
-            : null,
-
-      currency:String(
-        x?.price?.currency||''
-      ).trim()||null,
-
-      condition:String(
-        x?.condition||''
-      ).trim()||null,
-
-      in_stock:
-        typeof x?.in_stock==='boolean'
-          ? x.in_stock
-          : null
-
-    })).filter(x=>x.url);
-
-    return {
-      visual,
-      exact:visual.filter(x=>x.exact_match)
-    };
-  };
-
-  try{
-
-    let body=null;
-    let inputMode='url';
-
-    try{
-
-      body=await runLens({
-        url:imageUrl
-      });
-
-      if(
-        !Array.isArray(body?.visual_matches) ||
-        body.visual_matches.length===0
-      ){
-        throw new Error(
-          'Lens por URL no devolvió coincidencias'
-        );
-      }
-
-    }catch(urlError){
-
-      const imageResponse=await fetch(
-        imageUrl,
-        {
-          headers:{
-            'user-agent':
-              'Mozilla/5.0 LuxuryHunter/1.7',
-            accept:
-              'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-          },
-          signal:AbortSignal.timeout(20000)
-        }
-      );
-
-      if(!imageResponse.ok){
-        throw urlError;
-      }
-
-      const contentType=String(
-        imageResponse.headers.get('content-type')||''
-      ).toLowerCase();
-
-      const buffer=Buffer.from(
-        await imageResponse.arrayBuffer()
-      );
-
-      if(
-        !buffer.length ||
-        buffer.length>500*1024
-      ){
-        throw urlError;
-      }
-
-      if(
-        !(
-          contentType.includes('jpeg') ||
-          contentType.includes('jpg') ||
-          contentType.includes('png') ||
-          contentType.includes('webp')
-        )
-      ){
-        throw urlError;
-      }
-
-      const form=new FormData();
-
-      form.append(
-        'api_key',
-        apiKey
-      );
-
-      form.append(
-        'image',
-        new Blob(
-          [buffer],
-          {type:contentType}
-        ),
-        contentType.includes('png')
-          ? 'listing.png'
-          : contentType.includes('webp')
-            ? 'listing.webp'
-            : 'listing.jpg'
-      );
-
-      const uploadResponse=await fetch(
-        'https://serpapi.com/image',
-        {
-          method:'POST',
-          body:form,
-          signal:AbortSignal.timeout(30000)
-        }
-      );
-
-      let uploadBody={};
-
-      try{
-        uploadBody=await uploadResponse.json();
-      }catch{}
-
-      const imageId=String(
-        uploadBody?.image_id||''
-      ).trim();
-
-      if(
-        !uploadResponse.ok ||
-        !imageId
-      ){
-        throw new Error(
-          String(
-            uploadBody?.error ||
-            'No se pudo subir la imagen a SerpApi'
-          )
-        );
-      }
-
-      body=await runLens({
-        image_id:imageId
-      });
-
-      inputMode='upload';
-    }
-
-    const matches=normalizeMatches(body);
-
-    return {
-      enabled:true,
-      ok:true,
-      checked_at:new Date().toISOString(),
-      image_url:imageUrl,
-      input_mode:inputMode,
-      visual_matches:matches.visual,
-      exact_matches:matches.exact,
-      search_metadata:{
-        id:String(
-          body?.search_metadata?.id||''
-        ).trim()||null,
-        status:String(
-          body?.search_metadata?.status||''
-        ).trim()||null
-      },
-      error:null
-    };
-
-  }catch(e){
-
-    return {
-      ...base,
-      error:e?.message||String(e)
-    };
-  }
-}
 
 
 // LENS TIER 1 BROWSER ENRICHMENT V1
@@ -6328,1328 +3911,8 @@ async function googleLensSerpApiSearch(item){
 // Esto NO convierte el candidato en comparable automaticamente:
 // Gemini sigue validando identidad, precio, estado y condicion.
 
-async function enrichLuxuryLensCandidatesRendered(
-  candidates,
-  {maxCandidates=8}={}
-){
-  const pool=(
-    Array.isArray(candidates)
-      ? candidates
-      : []
-  ).filter(
-    p=>
-      p?.url &&
-      trustedLuxuryMarketUrl(p.url)
-  );
 
-  if(!pool.length)return [];
 
-  const selected=[];
-  const selectedUrls=new Set();
-  const seenSources=new Set();
-
-  const pushCandidate=p=>{
-    const url=String(p?.url||'').trim();
-
-    if(
-      !url ||
-      selectedUrls.has(url) ||
-      selected.length>=maxCandidates
-    ){
-      return;
-    }
-
-    selected.push(p);
-    selectedUrls.add(url);
-  };
-
-  // Primero diversidad de fuentes Tier 1.
-  for(const candidate of pool){
-    const source=
-      approvedLuxuryMarketSourceName(candidate.url) ||
-      luxuryMarketHostname(candidate.url);
-
-    if(seenSources.has(source))continue;
-
-    seenSources.add(source);
-    pushCandidate(candidate);
-
-    if(selected.length>=maxCandidates)break;
-  }
-
-  // Luego completar con segundos resultados de las mismas fuentes.
-  if(selected.length<maxCandidates){
-    for(const candidate of pool){
-      pushCandidate(candidate);
-
-      if(selected.length>=maxCandidates)break;
-    }
-  }
-
-  let browser=null;
-  let context=null;
-
-  const results=[];
-
-  try{
-    const {chromium}=await import('playwright');
-
-    browser=await chromium.launch({
-      headless:true,
-      args:[
-        '--disable-dev-shm-usage',
-        '--no-sandbox'
-      ]
-    });
-
-    context=await browser.newContext({
-      locale:'es-ES',
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '+
-        'AppleWebKit/537.36 Chrome/152 Safari/537.36'
-    });
-
-    await context.route('**/*',route=>{
-      const type=route.request().resourceType();
-
-      if(
-        type==='image' ||
-        type==='media' ||
-        type==='font'
-      ){
-        return route.abort();
-      }
-
-      return route.continue();
-    });
-
-    for(const candidate of selected){
-      const originalUrl=String(
-        candidate?.url||''
-      ).trim();
-
-      let page=null;
-
-      try{
-        page=await context.newPage();
-
-        const response=await page.goto(
-          originalUrl,
-          {
-            waitUntil:'domcontentloaded',
-            timeout:25000
-          }
-        );
-
-        await page.waitForTimeout(2500);
-
-        const bodyText=String(
-          await page
-            .locator('body')
-            .innerText({timeout:5000})
-            .catch(()=>'')
-        ).trim();
-
-        const finalUrl=String(
-          page.url()||originalUrl
-        ).trim();
-
-        const httpStatus=
-          response?.status?.()??null;
-
-        const finalUrlTrusted=
-          trustedLuxuryMarketUrl(finalUrl);
-
-        const httpOk=
-          httpStatus==null ||
-          (
-            httpStatus>=200 &&
-            httpStatus<400
-          );
-
-        const pageOk=
-          !!bodyText &&
-          finalUrlTrusted &&
-          httpOk;
-
-        results.push({
-          url:originalUrl,
-          ok:pageOk,
-          final_url:finalUrl,
-          http_status:httpStatus,
-          title:String(
-            await page.title().catch(()=>'')
-          ).trim(),
-          text:pageOk
-            ? bodyText.slice(0,6000)
-            : '',
-          error:pageOk
-            ? null
-            : (
-                !finalUrlTrusted
-                  ? 'Redirect fuera de Tier 1'
-                  : !httpOk
-                    ? `HTTP ${httpStatus}`
-                    : 'Pagina sin texto util'
-              )
-        });
-
-      }catch(e){
-        results.push({
-          url:originalUrl,
-          ok:false,
-          final_url:page
-            ? String(page.url()||originalUrl)
-            : originalUrl,
-          http_status:null,
-          title:'',
-          text:'',
-          error:e?.message||String(e)
-        });
-
-      }finally{
-        if(page){
-          await page.close().catch(()=>{});
-        }
-      }
-    }
-
-  }catch(e){
-    return selected.map(candidate=>({
-      url:String(candidate?.url||'').trim(),
-      ok:false,
-      final_url:null,
-      http_status:null,
-      title:'',
-      text:'',
-      error:e?.message||String(e)
-    }));
-
-  }finally{
-    if(context){
-      await context.close().catch(()=>{});
-    }
-
-    if(browser){
-      await browser.close().catch(()=>{});
-    }
-  }
-
-  return results;
-}
-
-
-async function liveMarketResearch({key,model,item,task,exact,onProgress=null}){
-  const reportMarket=(pct,stage,detail='')=>{
-    try{
-      if(typeof onProgress==='function'){
-        onProgress(pct,stage,detail);
-      }
-    }catch{}
-  };
-
-  reportMarket(
-    68,
-    'Buscando comparables de mercado',
-    'Ronda 1 de búsqueda con Google'
-  );
-
-  if(typeof onProgress==='function'){
-    onProgress(
-      65,
-      'Búsqueda visual',
-      'Buscando coincidencias de la imagen en Google Vision'
-    );
-  }
-
-  const visionWeb=
-    await googleVisionWebDetection(item);
-
-  if(typeof onProgress==='function'){
-    onProgress(
-      67,
-      'Búsqueda visual',
-      'Buscando coincidencias de la imagen en Google Lens'
-    );
-  }
-
-  const lensWeb=
-    await googleLensSerpApiSearch(item);
-
-  const visionCandidates=(
-    Array.isArray(
-      visionWeb?.pages_with_matching_images
-    )
-      ? visionWeb.pages_with_matching_images
-      : []
-  ).slice(0,25);
-
-  const visionContext=visionCandidates.length
-    ? visionCandidates.map((p,idx)=>({
-        candidate:idx+1,
-        source:visionSourceName(p.url),
-        page_title:p.page_title||'',
-        url:p.url,
-        vision_score:p.score,
-
-        full_match_count:
-          Array.isArray(p.full_matching_images)
-            ? p.full_matching_images.length
-            : 0,
-
-        partial_match_count:
-          Array.isArray(p.partial_matching_images)
-            ? p.partial_matching_images.length
-            : 0
-      }))
-    : [];
-
-  const lensRawCandidates=(
-    Array.isArray(lensWeb?.visual_matches)
-      ? lensWeb.visual_matches
-      : []
-  );
-
-  const lensCandidates=lensRawCandidates
-    .filter(p=>approvedLuxuryMarketUrl(p?.url))
-    .sort((a,b)=>{
-      const priorityDiff=
-        luxuryMarketPriorityRank(a?.url)-
-        luxuryMarketPriorityRank(b?.url);
-
-      if(priorityDiff!==0)return priorityDiff;
-
-      const ap=
-        a?.position==null
-          ? 9999
-          : Number.isFinite(Number(a.position))
-            ? Number(a.position)
-            : 9999;
-
-      const bp=
-        b?.position==null
-          ? 9999
-          : Number.isFinite(Number(b.position))
-            ? Number(b.position)
-            : 9999;
-
-      return ap-bp;
-    })
-    .slice(0,30);
-
-  const lensContext=lensCandidates.map((p,idx)=>({
-    candidate:idx+1,
-    source:
-      approvedLuxuryMarketSourceName(p.url) ||
-      p.source ||
-      visionSourceName(p.url),
-    title:p.title||'',
-    url:p.url,
-    image_url:p.image_url||'',
-    position:p.position,
-    exact_match:p.exact_match===true,
-    price:p.price,
-    currency:p.currency,
-    condition:p.condition,
-    in_stock:p.in_stock,
-    market_tier:luxuryMarketTier(p.url)
-  }));
-
-  reportMarket(
-    70,
-    'Verificando candidatos Tier 1',
-    'Abriendo fichas directas encontradas por Google Lens'
-  );
-
-  const lensRenderedEvidence=
-    await enrichLuxuryLensCandidatesRendered(
-      lensCandidates,
-      {maxCandidates:6}
-    );
-
-  const lensRenderedContext=
-    lensRenderedEvidence.map((entry,idx)=>({
-      candidate:idx+1,
-      source:
-        approvedLuxuryMarketSourceName(
-          entry.final_url||entry.url
-        ) ||
-        approvedLuxuryMarketSourceName(entry.url),
-      original_url:entry.url,
-      final_url:entry.final_url,
-      http_status:entry.http_status,
-      ok:entry.ok===true,
-      page_title:entry.title||'',
-      visible_page_text:entry.text||'',
-      error:entry.error||null
-    }));
-
-  const prompt=`You are the LIVE MARKET COMPARABLES researcher for Luxury Hunter.
-Current date: ${new Date().toISOString().slice(0,10)}.
-
-You MUST use live web search grounding. Research the exact visually identified handbag variant below, not merely the broad model family.
-
-EXACT VISUAL IDENTIFICATION:
-${JSON.stringify(exact)}
-
-TARGET:
-${task?.product_query||''}
-
-CURRENT LISTING TO EXCLUDE:
-${item.url||''}
-
-GOOGLE CLOUD VISION WEB-DETECTION CANDIDATES:
-${JSON.stringify(visionContext)}
-
-GOOGLE LENS / SERPAPI VISUAL CANDIDATES:
-
-${JSON.stringify(lensContext)}
-
-RENDERED DIRECT-PAGE EVIDENCE FROM APPROVED TIER 1 LENS CANDIDATES:
-
-${JSON.stringify(lensRenderedContext)}
-
-RENDERED-EVIDENCE RULES:
-
-- This browser-rendered evidence comes from direct Tier 1 reseller pages that Google Lens discovered from the target image.
-- Treat visible_page_text as direct-page evidence for that specific URL when ok=true.
-- Use it to verify model wording, collaboration/edition, material, colour, condition, SOLD/CURRENT status and visible price when explicitly present.
-- A rendered candidate is still NOT automatically a valid comparable.
-- You must still classify product identity as EXACT, NEAR or ORIENTATIVE against EXACT VISUAL IDENTIFICATION.
-- Do not invent any field that is absent from the rendered page.
-- If the rendered page explicitly says sold, you may classify listing_status as SOLD.
-- If the rendered page explicitly shows a price, use that observed price and its visible currency.
-- Prefer this direct rendered evidence over an unverified Lens snippet when they conflict.
-- A redirect to a localized version of the same approved Tier 1 domain is acceptable.
-- Never promote a rendered page into valuation when its product match is only ORIENTATIVE.
-
-VISUAL-CANDIDATE RULES:
-- The URLs above were discovered from the LISTING IMAGE itself using Google Cloud Vision Web Detection and Google Lens via SerpApi.
-- They are research leads, NOT automatically valid comparables.
-- You MUST investigate these visual candidates before concluding that no market references exist.
-- A visual candidate may be old, archived or sold. Do not discard it merely because of age.
-- Historical exact-model references remain useful evidence of model identity and historic market activity.
-- For each grounded candidate classify it as EXACT, NEAR or ORIENTATIVE.
-- Extract the real source, title, URL, observed price, currency, SOLD/CURRENT status, publication/sale date when genuinely available and condition evidence.
-
-- A price supplied by Google Lens / SerpApi is a DISCOVERY HINT only. Do not treat it as validated market evidence by itself.
-
-- For every Lens candidate, verify the price against the final/direct approved reseller page or grounded Google evidence for that exact listing.
-
-- If Lens returns price=null, actively inspect the final/direct approved page and extract a price only when it is genuinely grounded.
-
-- Never invent, infer or silently reuse a stale snippet price when the direct listing evidence does not support it.
-- Different reseller terminology is NOT a reason to reject an otherwise matching product.
-- If the candidate is visually relevant but pricing/date evidence cannot be validated, preserve it as research evidence rather than inventing information.
-- Do not return zero research results without considering the visual candidates above when they exist.
-
-SOURCE POLICY — APPROVED LUXURY RESALE SOURCES:
-
-Google Search, Google Cloud Vision and Google Lens via SerpApi are DISCOVERY mechanisms only.
-
-A result becomes market evidence ONLY when its final/direct URL belongs to one of the approved Tier 1 or Tier 2 domains below.
-
-TIER 1 — PRIMARY VALUATION EVIDENCE:
-
-EUROPE-PRIORITY TIER 1:
-1. vestiairecollective.com — Vestiaire Collective
-2. collectorsquare.com — Collector Square
-3. hardlyeverwornit.com — HEWI
-4. saclab.com — SACLÀB
-5. sellierknightsbridge.com — Sellier Knightsbridge
-6. luxurypromise.com — Luxury Promise
-7. handbagclinic.co.uk — Handbag Clinic
-8. resee.com — ReSee
-
-OTHER TIER 1:
-9. therealreal.com — The RealReal
-10. fashionphile.com — Fashionphile
-11. rebag.com — Rebag
-12. 1stdibs.com — 1stDibs
-13. yoogiscloset.com — Yoogi's Closet
-14. whatgoesaroundnyc.com — What Goes Around Comes Around
-15. annsfabulousfinds.com — Ann's Fabulous Finds
-16. sothebys.com — Sotheby's
-17. christies.com — Christie's
-
-TIER 2 — COMPLEMENTARY EVIDENCE ONLY:
-- ebay.com
-- ebay.co.uk
-- ebay.de
-- ebay.fr
-- ebay.it
-- ebay.es
-
-EUROPEAN MARKET PRIORITY:
-
-- The resale target is Europe.
-- When product match quality and condition evidence are comparable, prioritize European or Europe-active Tier 1 evidence.
-- European preference must NEVER override product mismatch. EXACT/NEAR identity and condition similarity remain more important than geography.
-- Non-European Tier 1 evidence remains useful supporting market context when European evidence is insufficient.
-
-TIER RULES:
-
-- Tier 1 is the primary valuation evidence.
-- eBay is Tier 2 complementary evidence only.
-- eBay alone must never be treated as sufficient primary evidence for a strong market conclusion.
-- Treat all localized eBay domains as ONE independent market source.
-- Prefer genuinely SOLD / completed eBay evidence over active asking prices when available.
-- A SOLD label is valid only when the final/direct page or grounded evidence genuinely supports that the item sold.
-
-HARD SOURCE RULES:
-- Do NOT use or return YouTube.
-- Do NOT use or return Reddit, Pinterest, Instagram, TikTok or Facebook.
-- Do NOT use ShopMy.
-- Do NOT use blogs, SEO pages, generic shops, affiliate pages or unknown domains.
-- Do NOT use a Google search-result page itself as a comparable.
-- Do NOT treat an image-match host as market evidence unless the final/direct landing page belongs to an approved Tier 1 or Tier 2 domain above.
-- Brand-new retail MSRP pages are not resale comparables.
-- If the approved Tier 1 and Tier 2 sources do not provide enough evidence, report insufficient market evidence. Never relax the approved-source policy.
-
-COMPARABLE RULES:
-- Same exact variant/size/material/pattern/edition = EXACT.
-- Same variant and size/material but another ordinary colour = NEAR.
-- Same family but meaningfully different size/material/edition = ORIENTATIVE and must not drive valuation.
-- A sequined or special-edition Baguette is not an exact comparable for an ordinary Zucca canvas Baguette.
-- Prefer sold prices when genuinely visible. SOLD / completed transactions are stronger price evidence than active asking prices. Otherwise label CURRENT.
-- Do not use new-retail MSRP.
-- Do not fabricate a listing, price, URL, sold status or source.
-- Historical sold/archive listings are valid research references when they genuinely correspond to the identified model.
-- Do NOT discard a genuine exact/near reference only because it is old.
-- Historical references may provide product/model evidence, but do not pretend an old price is automatically today's market price.
-- For every comparable, extract listing/sale date ONLY when grounded evidence supports it.
-- Never invent a date.
-- If an exact YYYY-MM-DD date is unavailable, return null and optionally preserve the visible date wording in date_text.
-- SOLD means sold only when the source/search evidence genuinely indicates sold.
-- CURRENT means currently offered only when that is genuinely supported.
-- Return 5-12 evidence-backed comparables when possible.
-- Do NOT depend on one exact commercial name. Luxury handbags are frequently listed under incomplete, translated, reseller-created or alternative model names.
-- Search multiple naming variants automatically.
-- Build search queries from BRAND + MODEL FAMILY + SIZE + MATERIAL/CONSTRUCTION + COLOUR.
-- Also try common synonyms and reseller terminology. Examples: woven / intrecciato / intreccio / braided / nappa woven; multicolor / multicolore; shoulder bag / baguette bag.
-- Progressively remove over-specific wording if an exact query has weak recall.
-- A different listing title does NOT make a result irrelevant if the photographed object and defining visual attributes correspond to the same variant.
-- Use image-derived attributes from the exact visual identification as the primary matching criteria.
-- Search Europe-first across the approved Tier 1 sources above, then use other approved Tier 1 sources as supporting evidence and eBay only as Tier 2 complementary evidence.
-- Use ONLY these match_level values: EXACT, NEAR, ORIENTATIVE.
-- EXACT = same model variant with matching size, material/construction, pattern/edition and materially equivalent characteristics.
-- NEAR = same genuine model/variant and broadly equivalent size/material, with only ordinary colour, season or minor specification differences that still make it useful for resale valuation.
-- ORIENTATIVE = same family but meaningfully different size, material, construction, edition or other characteristics that make it unsuitable for direct valuation.
-- Never output CLOSE, CLOSE COMP, IRRELEVANT or any other match_level label.
-- A listing title does not need to contain every attribute. If the page clearly corresponds to the same product despite abbreviated reseller naming, classify it from the available evidence rather than rejecting it merely because words are missing.
-- Do not count a broad family match as an exact comparable.
-- If the first wording produces few results, actively reformulate the search instead of concluding that no market exists.
-- Price must be numeric in its listing currency.
-
-CONDITION-BASED VALUATION RULES:
-- The target unit condition is included inside EXACT VISUAL IDENTIFICATION.
-- For every EXACT or NEAR comparable, research its condition using only grounded evidence available from the reseller page, listing description, platform condition label or other directly supported information.
-- Never invent the condition of a comparable.
-- If its condition cannot be established, use condition_grade UNKNOWN, condition_relation_to_target UNKNOWN and low/zero confidence.
-- condition_relation_to_target MUST be one of SIMILAR, BETTER, WORSE, UNKNOWN.
-- SIMILAR means sufficiently comparable physical condition to value THIS target unit.
-- Different condition levels may remain useful as general model-market evidence, but MUST NOT be mathematically converted into the target resale price using a fixed percentage.
-- Do NOT apply fixed discounts or premiums for EXCELLENT, VERY_GOOD, GOOD, FAIR or POOR.
-- Do NOT apply an automatic discount to CURRENT asking prices.
-- The final condition-adjusted resale must come from observed prices of condition-SIMILAR comparables.
-- If there is insufficient condition-matched evidence, report insufficient evidence instead of inventing a resale adjustment.
-
-SOURCE ORDER (mandatory): (1) NIL'S VESTIAIRE DATABASE blocks below are the PRIMARY evidence: start from them, use its confirmed sales and current listings first. (2) Then your FIRST web search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>") and list Vestiaire comparables first. (3) Only after that, use the other approved sources and image-search (Google Lens) results to complete the evidence.${vestiaireSnapshotBlock(task,item,exact)}
-
-Return ONLY JSON:
-{
-  "comparables": [
-    {
-      "source": "Vestiaire Collective",
-      "title": "listing title",
-      "url": "https://...",
-      "price": 850,
-      "currency": "EUR",
-      "listing_status": "SOLD|CURRENT|UNKNOWN",
-      "country_or_market": "EU/France/US/etc",
-      "match_level": "EXACT|NEAR|ORIENTATIVE",
-      "match_reason_es": "short Spanish reason",
-      "condition_grade": "EXCELLENT|VERY_GOOD|GOOD|FAIR|POOR|UNKNOWN",
-      "condition_confidence": 0.0,
-      "condition_relation_to_target": "SIMILAR|BETTER|WORSE|UNKNOWN",
-      "condition_evidence_es": ["grounded evidence only"],
-      "listing_date": null,
-      "sold_date": null,
-      "date_text": null,
-      "date_type": "LISTED|SOLD|UPDATED|UNKNOWN",
-      "date_evidence_es": "grounded date evidence or empty string"
-    }
-  ],
-  "research_notes_es": []
-}`;
-  const result=await geminiJsonRequest({key,model,parts:[{text:prompt}],googleSearch:true});
-
-  reportMarket(
-    76,
-    'Primera búsqueda completada',
-    'Evaluando relevancia de las referencias encontradas'
-  );
-
-  const rawFirstPassComps=
-    Array.isArray(result.data?.comparables)
-      ? result.data.comparables
-      : [];
-
-  let comps=
-    rawFirstPassComps.filter(
-      approvedLuxuryMarketEntry
-    );
-
-  let rejectedUntrustedReferenceCount=
-    rawFirstPassComps.length-comps.length;
-
-  const rawFirstPassGrounding=
-    Array.isArray(result.groundingSources)
-      ? result.groundingSources
-      : [];
-
-  let marketGroundingSources=
-    rawFirstPassGrounding.filter(
-      approvedLuxuryMarketEntry
-    );
-  let marketWebSearchQueries=Array.isArray(result.webSearchQueries)
-    ? result.webSearchQueries
-    : [];
-
-  // Recall fallback:
-  // La calidad de la primera ronda se mide por comparables realmente
-  // utilizables, no por el numero bruto de resultados devueltos.
-  const firstPassRelevant=comps.filter(c=>
-    ['EXACT','NEAR'].includes(
-      String(c?.match_level||'').toUpperCase()
-    )
-  );
-
-  const firstPassSources=new Set(
-    firstPassRelevant
-      .map(sourceKey)
-      .filter(Boolean)
-  );
-
-  const targetConditionGrade=String(
-    exact?.condition?.grade||'UNKNOWN'
-  ).toUpperCase();
-
-  const targetConditionConfidence=clampNum(
-    exact?.condition?.confidence,
-    0,
-    1
-  );
-
-  const targetConditionUsable=
-    targetConditionGrade!=='UNKNOWN' &&
-    targetConditionConfidence>=0.50;
-
-  const firstPassConditionMatched=firstPassRelevant.filter(c=>
-    String(c?.condition_relation_to_target||'').toUpperCase()==='SIMILAR'
-  );
-
-  const firstPassConditionSources=new Set(
-    firstPassConditionMatched
-      .map(sourceKey)
-      .filter(Boolean)
-  );
-
-  const needsConditionRecall=
-    targetConditionUsable &&
-    (
-      firstPassConditionMatched.length<3 ||
-      firstPassConditionSources.size<2
-    );
-
-  const needsRecallFallback=
-    firstPassRelevant.length<3 ||
-    firstPassSources.size<2 ||
-    marketGroundingSources.length<2 ||
-    needsConditionRecall;
-
-  let recallFallbackUsed=false;
-
-  if(needsRecallFallback){
-    recallFallbackUsed=true;
-
-    reportMarket(
-      80,
-      'Ampliando búsqueda de mercado',
-      'Ronda 2 de 2 · nombres alternativos y referencias históricas'
-    );
-    const fallbackPrompt=`${prompt}
-
-SECOND-PASS MARKET RECALL SEARCH
-
-The first search returned too little usable evidence.
-
-Do a fresh Google-grounded search using BROADER ALTERNATIVE NOMENCLATURE.
-
-Requirements:
-1. Keep the visually identified handbag as the target.
-2. Generate AND EXECUTE multiple alternative Google search formulations. Do not stop after one wording.
-3. Use at least these search strategies when applicable:
-   - brand + exact variant/model label
-   - brand + model family + material/construction
-   - brand + model family + pattern/monogram
-   - brand + model family + colour
-   - brand + model family + size
-   - reference code when a reliable reference is available
-4. Progressively remove attributes that resellers commonly omit from titles.
-5. Try reseller vocabulary, translations, abbreviations and naming synonyms.
-6. Do not require the seller title to equal exact_variant_label.
-7. Missing words in the title are not enough to reject a comparable if the remaining evidence identifies the same product.
-8. Use ONLY match_level EXACT, NEAR or ORIENTATIVE.
-9. For each EXACT/NEAR result, actively look for grounded condition information.
-10. Prioritize finding comparables whose physical condition is SIMILAR to the target condition.
-11. Do not infer a condition from price alone.
-12. Do not convert better/worse condition listings into the target value using a fixed discount or premium.
-9. Search specifically for additional results ONLY on the approved Tier 1 sources above plus eBay as Tier 2 complementary evidence. Prioritize European Tier 1 sources. Do not use any other reseller domain, even when Google surfaces it.
-10. Continue broadening until you either obtain at least 3 useful EXACT/NEAR comparables from at least 2 independent sources, or the available grounded evidence is genuinely exhausted.
-11. Return real URLs and evidence-backed prices whenever available.
-12. Do not invent comparables if a page cannot be grounded.
-
-SOURCE ORDER (mandatory): (1) NIL'S VESTIAIRE DATABASE blocks below are the PRIMARY evidence: start from them, use its confirmed sales and current listings first. (2) Then your FIRST web search must target Vestiaire Collective (vestiairecollective.com, e.g. "site:vestiairecollective.com <brand> <model> <variant>") and list Vestiaire comparables first. (3) Only after that, use the other approved sources and image-search (Google Lens) results to complete the evidence.${vestiaireSnapshotBlock(task,item,exact)}
-
-This is a RECALL fallback. The goal is to find genuine listings that a visual Google search would reasonably surface even when their titles use different terminology.`;
-
-    const fallback=await geminiJsonRequest({
-      key,
-      model,
-      parts:[{text:fallbackPrompt}],
-      googleSearch:true
-    });
-
-    marketWebSearchQueries=[
-      ...new Set([
-        ...marketWebSearchQueries,
-        ...(Array.isArray(fallback.webSearchQueries)?fallback.webSearchQueries:[])
-      ].filter(Boolean))
-    ];
-
-    reportMarket(
-      88,
-      'Segunda búsqueda completada',
-      'Uniendo y deduplicando referencias'
-    );
-
-    const extra=Array.isArray(fallback.data?.comparables)
-      ? fallback.data.comparables
-      : [];
-
-    // Deduplicar por URL; si no hay URL, usar source/title/price.
-    const seen=new Set();
-
-    comps=[...comps,...extra].filter(c=>{
-      const keyPart=String(
-        c?.url ||
-        c?.link ||
-        `${c?.source||''}|${c?.title||''}|${c?.price_eur||c?.price||''}`
-      ).trim().toLowerCase();
-
-      if(!keyPart) return true;
-      if(seen.has(keyPart)) return false;
-
-      seen.add(keyPart);
-      return true;
-    });
-
-    const sourceSeen=new Set();
-
-    marketGroundingSources=[
-      ...marketGroundingSources,
-      ...(Array.isArray(fallback.groundingSources)?fallback.groundingSources:[])
-    ].filter(s=>{
-      const keyPart=String(
-        s?.uri ||
-        s?.url ||
-        s?.title ||
-        ''
-      ).trim().toLowerCase();
-
-      if(!keyPart) return true;
-      if(sourceSeen.has(keyPart)) return false;
-
-      sourceSeen.add(keyPart);
-      return true;
-    });
-  }
-  // BACKEND HARD GATE:
-  // Ninguna fuente fuera de la whitelist puede llegar a
-  // valoración, confidence, referencias o UI.
-  const preFinalTrustFilterCount=comps.length;
-
-  comps=comps.filter(
-    approvedLuxuryMarketEntry
-  );
-
-  rejectedUntrustedReferenceCount+=
-    preFinalTrustFilterCount-comps.length;
-
-  marketGroundingSources=
-    marketGroundingSources.filter(
-      approvedLuxuryMarketEntry
-    );
-
-  const structuredResearchReferences=
-    comps.slice(0,40).map(c=>({
-      source:String(c?.source||'').trim()||sourceKey(c),
-      title:String(c?.title||'').trim(),
-      url:String(c?.url||c?.link||'').trim(),
-
-      price:
-        c?.price==null
-          ? null
-          : Number.isFinite(Number(c.price))
-            ? Number(c.price)
-            : null,
-
-      currency:normalizeCurrency(c?.currency),
-      price_eur:comparableToEur(c),
-
-      listing_status:String(
-        c?.listing_status||'UNKNOWN'
-      ).toUpperCase(),
-
-      country_or_market:String(
-        c?.country_or_market||''
-      ).trim(),
-
-      match_level:String(
-        c?.match_level||'ORIENTATIVE'
-      ).toUpperCase(),
-
-      match_reason_es:String(
-        c?.match_reason_es||''
-      ).trim(),
-
-      condition_grade:String(
-        c?.condition_grade||'UNKNOWN'
-      ).toUpperCase(),
-
-      condition_confidence:
-        Number.isFinite(
-          Number(c?.condition_confidence)
-        )
-          ? clampNum(
-              Number(c.condition_confidence),
-              0,
-              1
-            )
-          : 0,
-
-      condition_relation_to_target:String(
-        c?.condition_relation_to_target||
-        'UNKNOWN'
-      ).toUpperCase(),
-
-      condition_evidence_es:
-        Array.isArray(c?.condition_evidence_es)
-          ? c.condition_evidence_es.slice(0,6)
-          : [],
-
-      listing_date:
-        c?.listing_date
-          ? String(c.listing_date)
-          : null,
-
-      sold_date:
-        c?.sold_date
-          ? String(c.sold_date)
-          : null,
-
-      date_text:
-        c?.date_text
-          ? String(c.date_text)
-          : null,
-
-      date_type:String(
-        c?.date_type||'UNKNOWN'
-      ).toUpperCase(),
-
-      date_evidence_es:String(
-        c?.date_evidence_es||''
-      ).trim(),
-      market_tier:luxuryMarketTier(
-        c?.url||c?.link||''
-      )
-    })).filter(r=>
-      r.source||
-      r.title||
-      r.url
-    );
-
-  const visionResearchReferences=
-    visionCandidates.map(p=>({
-      source:visionSourceName(p.url),
-
-      title:
-        p.page_title ||
-        `Coincidencia visual en ${
-          visionSourceName(p.url)
-        }`,
-
-      url:p.url,
-
-      price:null,
-      currency:'',
-      price_eur:null,
-
-      listing_status:'UNKNOWN',
-      country_or_market:'',
-
-      match_level:'VISUAL_CANDIDATE',
-
-      match_reason_es:
-        'Página localizada directamente a partir de la imagen mediante Google Cloud Vision Web Detection. Pendiente de validación como EXACT, NEAR u ORIENTATIVE.',
-
-      condition_grade:'UNKNOWN',
-      condition_confidence:0,
-      condition_relation_to_target:'UNKNOWN',
-      condition_evidence_es:[],
-
-      listing_date:null,
-      sold_date:null,
-      date_text:null,
-      date_type:'UNKNOWN',
-      date_evidence_es:'',
-
-      vision_score:
-        Number.isFinite(Number(p.score))
-          ? Number(p.score)
-          : null,
-
-      full_match_count:
-        Array.isArray(p.full_matching_images)
-          ? p.full_matching_images.length
-          : 0,
-
-      partial_match_count:
-        Array.isArray(p.partial_matching_images)
-          ? p.partial_matching_images.length
-          : 0
-    }));
-
-  const researchSeen=new Set();
-
-  const researchReferences=[
-    ...structuredResearchReferences,
-    ...visionResearchReferences
-  ].filter(r=>{
-    const key=String(
-      r.url ||
-      `${r.source}|${r.title}`
-    ).trim().toLowerCase();
-
-    if(!key)return false;
-
-    if(researchSeen.has(key)){
-      return false;
-    }
-
-    researchSeen.add(key);
-    return true;
-  });
-
-  const normalized=[];
-  const seen=new Set();
-
-  const compRank={
-    EXACT:0,
-    NEAR:1,
-    ORIENTATIVE:2
-  };
-
-  const rankedComps=[...comps].sort((a,b)=>{
-    const al=String(a?.match_level||'').toUpperCase();
-    const bl=String(b?.match_level||'').toUpperCase();
-
-    const matchDiff=
-      (compRank[al]??3)-
-      (compRank[bl]??3);
-
-    if(matchDiff!==0)return matchDiff;
-
-    const aUrl=String(
-      a?.url||a?.link||''
-    ).trim();
-
-    const bUrl=String(
-      b?.url||b?.link||''
-    ).trim();
-
-    return (
-      luxuryMarketPriorityRank(aUrl)-
-      luxuryMarketPriorityRank(bUrl)
-    );
-  });
-
-  for(const c of rankedComps.slice(0,24)){
-    const eur=comparableToEur(c);
-    const url=String(
-      c?.url||c?.link||''
-    ).trim();
-    const source=
-      approvedLuxuryMarketSourceName(url) ||
-      String(c?.source||'').trim() ||
-      sourceKey(c);
-    if(!eur||!source)continue;
-    const level=['EXACT','NEAR','ORIENTATIVE'].includes(String(c?.match_level||'').toUpperCase())?String(c.match_level).toUpperCase():'ORIENTATIVE';
-    const status=['SOLD','CURRENT','UNKNOWN'].includes(String(c?.listing_status||'').toUpperCase())?String(c.listing_status).toUpperCase():'UNKNOWN';
-    const keyId=`${source.toLowerCase()}|${url}|${Math.round(eur)}`;
-    if(seen.has(keyId))continue;
-    seen.add(keyId);
-    let conditionGrade=String(c?.condition_grade||'UNKNOWN')
-      .trim()
-      .toUpperCase()
-      .replace(/[ -]+/g,'_');
-
-    if(!['EXCELLENT','VERY_GOOD','GOOD','FAIR','POOR','UNKNOWN'].includes(conditionGrade)){
-      conditionGrade='UNKNOWN';
-    }
-
-    let conditionRelation=String(c?.condition_relation_to_target||'UNKNOWN')
-      .trim()
-      .toUpperCase();
-
-    if(!['SIMILAR','BETTER','WORSE','UNKNOWN'].includes(conditionRelation)){
-      conditionRelation='UNKNOWN';
-    }
-
-    const conditionConfidenceRaw=Number(c?.condition_confidence);
-    const conditionConfidence=Number.isFinite(conditionConfidenceRaw)
-      ? clampNum(conditionConfidenceRaw,0,1)
-      : 0;
-
-    normalized.push({
-      source,
-      title:String(c?.title||'').trim(),
-      url,
-      price:Number(c.price),
-      currency:normalizeCurrency(c.currency),
-      price_eur:eur,
-      listing_status:status,
-      country_or_market:String(c?.country_or_market||'').trim(),
-      match_level:level,
-      match_reason_es:String(c?.match_reason_es||'').trim(),
-      condition_grade:conditionGrade,
-      condition_confidence:conditionConfidence,
-      condition_relation_to_target:conditionRelation,
-      condition_evidence_es:Array.isArray(c?.condition_evidence_es)
-        ? c.condition_evidence_es.slice(0,6)
-        : [],
-      market_tier:luxuryMarketTier(url)
-    });
-  }
-  const relevant=normalized.filter(
-    c=>c.match_level==='EXACT'||c.match_level==='NEAR'
-  );
-
-  const exactOnly=relevant.filter(
-    c=>c.match_level==='EXACT'
-  );
-
-  const primaryRelevant=relevant.filter(
-    c=>c.market_tier==='TIER_1'
-  );
-
-  const secondaryRelevant=relevant.filter(
-    c=>c.market_tier==='TIER_2'
-  );
-
-  // ---------------------------------------------------------
-  // MODEL MARKET:
-  // precios observados reales, SIN aplicar 0.90 a CURRENT.
-  // ---------------------------------------------------------
-
-  const modelPrices=relevant
-    .map(c=>roundMoney(c.price_eur))
-    .filter(v=>Number.isFinite(v)&&v>0);
-
-  const modelSources=[
-    ...new Set(relevant.map(sourceKey).filter(Boolean))
-  ];
-
-  const primaryModelSources=[
-    ...new Set(
-      primaryRelevant.map(sourceKey).filter(Boolean)
-    )
-  ];
-
-  let modelMarketConfidence='LOW';
-
-  if(
-    relevant.length>=3 &&
-    primaryRelevant.length>=2 &&
-    primaryModelSources.length>=2 &&
-    exact.confidence>=0.85
-  ){
-    modelMarketConfidence='HIGH';
-  }else if(
-    relevant.length>=2 &&
-    primaryRelevant.length>=1 &&
-    exact.confidence>=0.70
-  ){
-    modelMarketConfidence='MEDIUM';
-  }
-
-  // ---------------------------------------------------------
-  // CONDITION MARKET:
-  // SOLO comparables cuyo estado se haya podido contrastar
-  // como SIMILAR al bolso que estamos comprando.
-  // ---------------------------------------------------------
-
-  const targetCondition=exact?.condition||{
-    grade:'UNKNOWN',
-    score:null,
-    confidence:0
-  };
-
-  const targetConditionConfidenceFinal=clampNum(
-    targetCondition.confidence,
-    0,
-    1
-  );
-
-  const targetConditionKnown=
-    String(targetCondition.grade||'UNKNOWN').toUpperCase()!=='UNKNOWN' &&
-    targetConditionConfidenceFinal>=0.50;
-
-  const conditionMatched=relevant.filter(c=>
-    c.condition_relation_to_target==='SIMILAR' &&
-    c.condition_confidence>=0.50
-  );
-
-  const conditionExact=conditionMatched.filter(
-    c=>c.match_level==='EXACT'
-  );
-
-  const primaryConditionMatched=
-    conditionMatched.filter(
-      c=>c.market_tier==='TIER_1'
-    );
-
-  const secondaryConditionMatched=
-    conditionMatched.filter(
-      c=>c.market_tier==='TIER_2'
-    );
-
-  const conditionSources=[
-    ...new Set(conditionMatched.map(sourceKey).filter(Boolean))
-  ];
-
-  const conditionPrices=conditionMatched
-    .map(c=>roundMoney(c.price_eur))
-    .filter(v=>Number.isFinite(v)&&v>0);
-
-  const primaryConditionSources=[
-    ...new Set(
-      primaryConditionMatched
-        .map(sourceKey)
-        .filter(Boolean)
-    )
-  ];
-
-  let conditionMarketConfidence='LOW';
-
-  if(
-    targetConditionKnown &&
-    targetConditionConfidenceFinal>=0.70 &&
-    conditionMatched.length>=3 &&
-    primaryConditionMatched.length>=2 &&
-    primaryConditionSources.length>=2
-  ){
-    conditionMarketConfidence='HIGH';
-  }else if(
-    targetConditionKnown &&
-    targetConditionConfidenceFinal>=0.50 &&
-    conditionMatched.length>=2 &&
-    primaryConditionMatched.length>=1
-  ){
-    conditionMarketConfidence='MEDIUM';
-  }
-
-  // Con un solo comparable o condition incierta NO publicamos
-  // un precio de reventa "ajustado". Eso sería inventarlo.
-  const conditionValuationUsable=
-    conditionMarketConfidence==='HIGH' ||
-    conditionMarketConfidence==='MEDIUM';
-
-  const valuationEntries=conditionValuationUsable
-    ? conditionMatched
-        .map(c=>({
-          value:roundMoney(c.price_eur),
-          weight:luxuryComparableValuationWeight(c),
-          source:c.source,
-          url:c.url,
-          listing_status:c.listing_status,
-          market_tier:c.market_tier,
-          europe:europeanLuxuryMarketUrl(c.url)
-        }))
-        .filter(x=>
-          Number.isFinite(x.value) &&
-          x.value>0 &&
-          Number.isFinite(x.weight) &&
-          x.weight>0
-        )
-    : [];
-
-  const conditionWeightedMean=valuationEntries.length
-    ? roundMoney(weightedMean(valuationEntries)??0)||null
-    : null;
-
-  const conditionLow=valuationEntries.length
-    ? roundMoney(weightedPercentile(valuationEntries,0.10)??0)||null
-    : null;
-
-  const conditionMedian=valuationEntries.length
-    ? roundMoney(weightedPercentile(valuationEntries,0.50)??0)||null
-    : null;
-
-  const conditionHigh=valuationEntries.length
-    ? roundMoney(weightedPercentile(valuationEntries,0.75)??0)||null
-    : null;
-
-  const conditionConservative=valuationEntries.length
-    ? roundMoney(weightedPercentile(valuationEntries,0.25)??0)||null
-    : null;
-
-  const conditionQuick=valuationEntries.length
-    ? roundMoney(weightedPercentile(valuationEntries,0.15)??0)||null
-    : null;
-
-  return {
-    comparables:normalized,
-    research_references:researchReferences,
-
-    vision_web_detection:visionWeb,
-    lens_serpapi:lensWeb,
-
-    lens_rendered_evidence:lensRenderedEvidence,
-    lens_rendered_candidate_count:lensRenderedEvidence.length,
-    lens_rendered_success_count:
-      lensRenderedEvidence.filter(x=>x?.ok===true).length,
-
-    visual_candidate_count:visionCandidates.length,
-    lens_candidate_count:lensCandidates.length,
-    total_visual_candidate_count:
-      visionCandidates.length+
-      lensCandidates.length,
-
-    research_candidate_count:researchReferences.length,
-
-    trusted_market_source_policy:'strict_allowlist',
-
-    trusted_market_domains:[
-      ...TRUSTED_LUXURY_MARKET_DOMAINS
-    ],
-
-    rejected_untrusted_reference_count:
-      rejectedUntrustedReferenceCount,
-
-    checked_at:new Date().toISOString(),
-
-    search_passes:recallFallbackUsed?2:1,
-    raw_comparable_count:comps.length,
-
-    first_pass_relevant_count:firstPassRelevant.length,
-    first_pass_independent_source_count:firstPassSources.size,
-    first_pass_condition_matched_count:firstPassConditionMatched.length,
-    first_pass_condition_source_count:firstPassConditionSources.size,
-
-    grounding_sources:marketGroundingSources,
-    web_search_queries:marketWebSearchQueries,
-
-    research_notes_es:Array.isArray(result.data?.research_notes_es)
-      ? result.data.research_notes_es.slice(0,4)
-      : [],
-
-    // Mercado general del modelo.
-    model_relevant_comparable_count:relevant.length,
-    model_exact_comparable_count:exactOnly.length,
-    model_independent_source_count:modelSources.length,
-    model_market_confidence:modelMarketConfidence,
-
-    model_market_low_eur:modelPrices.length
-      ? roundMoney(percentile(modelPrices,0.10)??0)||null
-      : null,
-
-    model_market_median_eur:modelPrices.length
-      ? roundMoney(percentile(modelPrices,0.50)??0)||null
-      : null,
-
-    model_market_high_eur:modelPrices.length
-      ? roundMoney(percentile(modelPrices,0.90)??0)||null
-      : null,
-
-    // Estado de la unidad que estamos comprando.
-    target_condition:targetCondition,
-
-    // Mercado realmente comparable por ESTADO.
-    condition_matched_comparable_count:conditionMatched.length,
-    condition_exact_comparable_count:conditionExact.length,
-    condition_independent_source_count:conditionSources.length,
-    condition_market_confidence:conditionMarketConfidence,
-
-    valuation_method:
-      'weighted_condition_similar_comparables',
-
-    condition_weighted_mean_eur:
-      conditionWeightedMean,
-
-    valuation_weight_policy:{
-      tier_1_base:1.00,
-      tier_2_ebay_base:0.70,
-      europe_multiplier:1.35,
-      vestiaire_multiplier:VESTIAIRE_VALUATION_WEIGHT,
-      sold_multiplier:1.50,
-      current_multiplier:1.00,
-      unknown_status_multiplier:0.75
-    },
-
-    valuation_entries:
-      valuationEntries.map(x=>({
-        source:x.source,
-        url:x.url,
-        price_eur:x.value,
-        listing_status:x.listing_status,
-        market_tier:x.market_tier,
-        europe:x.europe,
-        weight:x.weight
-      })),
-
-    condition_market_low_eur:conditionLow,
-    condition_market_median_eur:conditionMedian,
-    condition_market_high_eur:conditionHigh,
-    condition_conservative_resale_eur:conditionConservative,
-    condition_quick_sale_eur:conditionQuick,
-
-    pricing_method:
-      'Observed prices from condition-SIMILAR EXACT/NEAR comparables; no fixed condition or asking-price discount.',
-
-    // -------------------------------------------------------
-    // COMPATIBILIDAD:
-    // finalizeVerifiedOpportunity ya consume estos nombres.
-    // Desde ahora representan CONDITION-ADJUSTED MARKET.
-    // -------------------------------------------------------
-
-    relevant_comparable_count:conditionMatched.length,
-    exact_comparable_count:conditionExact.length,
-    independent_source_count:conditionSources.length,
-    market_confidence:conditionMarketConfidence,
-
-    market_low_eur:conditionLow,
-    market_median_eur:conditionMedian,
-    market_high_eur:conditionHigh,
-    conservative_resale_eur:conditionConservative,
-    quick_sale_eur:conditionQuick,
-
-    // Se mantiene la propiedad solo por compatibilidad histórica,
-    // pero ya NO se aplica ningún factor automático.
-    asking_realization_factor:null
-  };
-}
 
 // MARKETPLACE AUTHENTICITY SIGNAL V1.7
 function flattenMarketplaceVerificationValue(value){
@@ -7786,455 +4049,7 @@ function detectMarketplaceVerification(item){
 }
 
 // AI WESTERN RESALE FALLBACK V2
-async function aiWesternResaleEstimate({
-  key,
-  model,
-  task,
-  exact,
-  market
-}){
-  const exactConfidence=clampNum(
-    exact?.confidence,
-    0,
-    1
-  );
 
-  const context={
-    target_product:
-      task?.product_query||'',
-
-    identified_product:{
-      brand:
-        exact?.brand||'',
-
-      family:
-        exact?.family||'',
-
-      exact_variant:
-        exact?.exact_variant_label||'',
-
-      size:
-        exact?.size||'unknown',
-
-      material:
-        exact?.material||'unknown',
-
-      color:
-        exact?.main_color||'unknown',
-
-      pattern:
-        exact?.pattern||'unknown',
-
-      special_edition:
-        exact?.special_edition===true,
-
-      likely_era:
-        exact?.likely_era||'unknown',
-
-      identification_confidence:
-        exactConfidence
-    },
-
-    visible_condition:
-      exact?.condition||null,
-
-    live_market_result:{
-      relevant_comparables:
-        Number(
-          market?.relevant_comparable_count||0
-        ),
-
-      independent_sources:
-        Number(
-          market?.independent_source_count||0
-        ),
-
-      market_confidence:
-        String(
-          market?.market_confidence||'LOW'
-        )
-    }
-  };
-
-  const prompt=`You are the FALLBACK WESTERN RESALE VALUATION specialist for Luxury Hunter.
-
-The normal live-market research did not produce enough reliable evidence to publish a market-backed resale valuation.
-
-Estimate the CURRENT plausible Western second-hand resale range of the identified luxury item.
-
-THIS IS AN AI APPROXIMATION, NOT A LIVE MARKET OBSERVATION.
-
-STRICT RULES:
-- Do NOT use Google Search.
-- Do NOT claim that you found listings, sales or comparables.
-- Do NOT invent URLs, sources, listings or sold prices.
-- The purchase price is intentionally not supplied. Do NOT try to infer or anchor to it.
-- Base the estimate on brand, exact model/variant, size, material, colour, pattern/edition, likely era and visible physical condition.
-- Think primarily about the European and US luxury resale markets.
-- Estimate what a genuine example in THIS observed condition could plausibly resell for.
-- Use your learned understanding of luxury resale pricing only.
-- Do not apply a fixed percentage formula for condition.
-- If identification, rarity, era or condition is uncertain, widen the range.
-- Avoid false precision.
-- Round prices to sensible EUR increments.
-- confidence may ONLY be LOW or MEDIUM. Never HIGH.
-- This estimate must NEVER be described as market verified.
-- If a meaningful approximation is genuinely impossible, return estimate_available false.
-
-INPUT:
-${JSON.stringify(context)}
-
-Return ONLY JSON:
-{
-  "estimate_available": true,
-  "low_eur": 800,
-  "high_eur": 1100,
-  "confidence": "LOW|MEDIUM",
-  "rationale_es": "Explicación breve en español.",
-  "assumptions_es": [
-    "Supuesto relevante"
-  ]
-}`;
-
-  const result=await geminiJsonRequest({
-    key,
-    model,
-    parts:[{text:prompt}],
-    googleSearch:false
-  });
-
-  const data=result?.data||{};
-
-  if(data?.estimate_available===false){
-    return {
-      available:false,
-      source:'AI_ESTIMATE',
-      confidence:'LOW',
-      low_eur:null,
-      high_eur:null,
-      midpoint_eur:null,
-      rationale_es:
-        String(
-          data?.rationale_es||''
-        ).trim(),
-      assumptions_es:
-        Array.isArray(data?.assumptions_es)
-          ? data.assumptions_es
-              .map(x=>String(x||'').trim())
-              .filter(Boolean)
-              .slice(0,6)
-          : [],
-      generated_at:
-        new Date().toISOString()
-    };
-  }
-
-  let low=Number(data?.low_eur);
-  let high=Number(data?.high_eur);
-
-  if(
-    !Number.isFinite(low) ||
-    !Number.isFinite(high) ||
-    low<=0 ||
-    high<=0
-  ){
-    return {
-      available:false,
-      source:'AI_ESTIMATE',
-      confidence:'LOW',
-      low_eur:null,
-      high_eur:null,
-      midpoint_eur:null,
-      rationale_es:
-        'La IA no produjo un rango de precio utilizable.',
-      assumptions_es:[],
-      generated_at:
-        new Date().toISOString()
-    };
-  }
-
-  if(low>high){
-    const temp=low;
-    low=high;
-    high=temp;
-  }
-
-  low=Math.max(
-    25,
-    Math.round(low/25)*25
-  );
-
-  high=Math.max(
-    low,
-    Math.round(high/25)*25
-  );
-
-  let confidence=
-    String(
-      data?.confidence||'LOW'
-    ).toUpperCase();
-
-  if(
-    confidence!=='MEDIUM' ||
-    exactConfidence<0.80
-  ){
-    confidence='LOW';
-  }
-
-  return {
-    available:true,
-    source:'AI_ESTIMATE',
-    confidence,
-    low_eur:low,
-    high_eur:high,
-    midpoint_eur:
-      Math.round(
-        ((low+high)/2)/25
-      )*25,
-    rationale_es:
-      String(
-        data?.rationale_es||''
-      ).trim(),
-    assumptions_es:
-      Array.isArray(data?.assumptions_es)
-        ? data.assumptions_es
-            .map(x=>String(x||'').trim())
-            .filter(Boolean)
-            .slice(0,6)
-        : [],
-    generated_at:
-      new Date().toISOString(),
-    method:
-      'Gemini learned market knowledge; no Google Search; no live comparables'
-  };
-}
-
-function finalizeVerifiedOpportunity(preliminary,exact,market,economics,marketplaceVerification={}){
-  const landed=Number(economics.importedTotalEur)||0;
-  const marketNumber=v=>{
-    if(v===null||v===undefined||v==='')return null;
-    const n=Number(v);
-    return Number.isFinite(n)?n:null;
-  };
-
-  const marketConservative=
-    marketNumber(
-      market.conservative_resale_eur
-    );
-
-  const marketHigh=
-    marketNumber(
-      market.market_high_eur
-    );
-
-  const marketLow=
-    marketNumber(
-      market.market_low_eur
-    );
-
-  const aiEstimate=
-    market?.ai_resale_estimate &&
-    typeof market.ai_resale_estimate==='object'
-      ? market.ai_resale_estimate
-      : {};
-
-  const aiLow=
-    marketNumber(
-      aiEstimate?.low_eur
-    );
-
-  const aiHigh=
-    marketNumber(
-      aiEstimate?.high_eur
-    );
-
-  const marketEstimateAvailable=
-    Number.isFinite(
-      marketConservative
-    );
-
-  const aiEstimateAvailable=
-    aiEstimate?.available===true &&
-    Number.isFinite(aiLow) &&
-    Number.isFinite(aiHigh);
-
-  let resaleEstimateSource=
-    marketEstimateAvailable
-      ? 'MARKET_ANALYSIS'
-      : aiEstimateAvailable
-        ? 'AI_ESTIMATE'
-        : 'UNAVAILABLE';
-
-  const resaleEstimateConfidence=
-    resaleEstimateSource==='MARKET_ANALYSIS'
-      ? String(
-          market?.market_confidence||'LOW'
-        ).toUpperCase()
-      : resaleEstimateSource==='AI_ESTIMATE'
-        ? String(
-            aiEstimate?.confidence||'LOW'
-          ).toUpperCase()
-        : 'LOW';
-
-  let conservative=
-    resaleEstimateSource==='MARKET_ANALYSIS'
-      ? marketConservative
-      : resaleEstimateSource==='AI_ESTIMATE'
-        ? aiLow
-        : null;
-
-  let low=
-    resaleEstimateSource==='MARKET_ANALYSIS'
-      ? marketConservative
-      : resaleEstimateSource==='AI_ESTIMATE'
-        ? aiLow
-        : null;
-
-  let high=
-    resaleEstimateSource==='MARKET_ANALYSIS'
-      ? (
-          Number.isFinite(marketHigh)
-            ? marketHigh
-            : marketConservative
-        )
-      : resaleEstimateSource==='AI_ESTIMATE'
-        ? aiHigh
-        : null;
-
-  // Con anuncios iguales o de la misma talla en la base de Vestiaire de Nil,
-  // la reventa sale de ellos (precio al que de verdad se venden). Sin ellos,
-  // la base solo hace de techo y, si no hay nada parecido, queda el pronóstico.
-  const comps=market?.sheet_comps||null;
-  const dbTier=comps&&(comps.tier==='iguales'||comps.tier==='misma_talla');
-  const anchor=market?.sheet_anchor||null;
-  let anchorNote='';
-  if(dbTier){
-    low=comps.low;high=comps.high;conservative=comps.low;
-    resaleEstimateSource='VESTIAIRE_DB';
-    anchorNote=vestiaireComparablesNote(comps);
-  }else if(anchor&&Number.isFinite(low)){
-    const c=clampResaleToAnchor(low,high,anchor);
-    if(c.changed)anchorNote=`Reventa ajustada con tu base de Vestiaire (${anchor.n} anuncios, ${anchor.basis}; se venden al ${Math.round(anchor.ratio*100)} % del precio pedido): venta realista ${anchor.low}-${anchor.high} EUR.`;
-    low=c.low;high=c.high;conservative=c.low;
-  }
-
-  const profit=
-    Number.isFinite(conservative)
-      ? roundMoney(
-          conservative-landed
-        )
-      : null;
-
-  const highProfit=
-    Number.isFinite(high)
-      ? roundMoney(
-          high-landed
-        )
-      : profit;
-  const auth=String(preliminary.authenticity_risk||'').toUpperCase();
-  const liquidity=String(preliminary.liquidity||'').toUpperCase();
-  const conf=clampNum(exact.confidence,0,1);
-  // La base de Nil cuenta como una fuente más con sus anuncios parecidos.
-  const dbN=dbTier?Number(comps.n)||0:0;
-  const compN=Math.max(Number(market.relevant_comparable_count||0),dbN);
-  const exactN=Math.max(Number(market.exact_comparable_count||0),comps?.tier==='iguales'?dbN:0);
-  const sourceN=Number(market.independent_source_count||0)+(dbTier?1:0);
-  let mconf=String(market.market_confidence||'LOW').toUpperCase();
-  if(dbTier&&mconf==='LOW'&&dbN>=(comps.tier==='iguales'?3:6))mconf='MEDIUM';
-  const marketplaceStatus=String(marketplaceVerification?.status||'UNKNOWN').toUpperCase();
-  const reasons=[];
-  let decision='WATCH';
-  if(marketplaceStatus==='FAILED'){
-    decision='REJECT';
-    reasons.push(`La verificacion de ${marketplaceVerification?.service||'marketplace'} figura como no superada y bloquea la oportunidad.`);
-  }else if(!exact.target_match){
-    decision='REJECT';
-    reasons.push(`El chequeo visual exacto indica que no corresponde al target: ${exact.exact_variant_label||exact.family||'variante distinta'}.`);
-  }else if(auth==='HIGH'){
-    decision='REJECT';
-    reasons.push('El riesgo de autenticidad preliminar es alto y bloquea la oportunidad.');
-  }else if(resaleEstimateSource==='AI_ESTIMATE'){
-    decision='WATCH';
-
-    reasons.push(
-      `No hay evidencia de mercado suficiente para verificar la reventa. Se muestra una estimación IA occidental de ${Math.round(low)}-${Math.round(high)} EUR con confianza ${resaleEstimateConfidence}.`
-    );
-
-  }else if(!Number.isFinite(conservative)||compN===0){
-    decision='WATCH';
-    reasons.push('La variante se reviso, pero no hay comparables exactos o suficientemente cercanos ni una estimación IA utilizable para fijar una reventa.');
-  }else if(Number.isFinite(profit)&&profit<200){
-    decision='REJECT';
-    reasons.push(`Tras contrastar comparables, el margen conservador estimado es de ${Math.round(profit)} EUR, por debajo del minimo operativo.`);
-  }else if(conf<0.75||mconf==='LOW'||sourceN<2||compN<2||(exact.special_edition===true&&exactN<2)){
-    decision='WATCH';
-    reasons.push('El chequeo exacto y de mercado se completo, pero la evidencia aun no es suficientemente solida para elevarlo a BUY.');
-  }else if(Number.isFinite(profit)&&profit>400&&conf>=0.85&&mconf==='HIGH'&&compN>=3&&sourceN>=2&&liquidity!=='LOW'){
-    decision='STRONG BUY';
-  }else if(Number.isFinite(profit)&&profit>=300&&conf>=0.75&&mconf!=='LOW'&&compN>=2&&sourceN>=2){
-    decision='BUY';
-  }else{
-    decision='WATCH';
-  }
-  if(exact.target_match)reasons.push(`Variante visual: ${exact.exact_variant_label||exact.family||'sin etiqueta exacta'} (${Math.round(conf*100)}% de confianza).`);
-  if(marketplaceStatus==='PASSED')reasons.push(`${marketplaceVerification.service}: verificacion superada segun evidencia estructurada del marketplace; es una senal positiva adicional, no una garantia absoluta de autenticidad.`);
-  else if(marketplaceStatus==='AVAILABLE')reasons.push(`${marketplaceVerification.service}: disponible para este anuncio; reduce el riesgo operativo de compra, pero no demuestra por si sola la autenticidad.`);
-  if(compN)reasons.push(`${compN} comparables exactos/cercanos en ${sourceN} fuentes independientes; confianza de mercado ${mconf}.`);
-  if(anchorNote)reasons.unshift(anchorNote);
-  if(
-    Number.isFinite(conservative) &&
-    resaleEstimateSource==='MARKET_ANALYSIS'
-  ){
-    reasons.push(
-      `Reventa conservadora contrastada: ${Math.round(conservative)} EUR; margen conservador: ${Math.round(profit)} EUR.`
-    );
-  }
-
-  if(
-    Number.isFinite(conservative) &&
-    resaleEstimateSource==='AI_ESTIMATE'
-  ){
-    reasons.push(
-      `Reventa orientativa por IA: ${Math.round(low)}-${Math.round(high)} EUR; margen orientativo desde ${Math.round(profit)} EUR. No es una valoración de mercado verificada.`
-    );
-  }
-  const profitScore=Number.isFinite(profit)?clampNum((profit-150)/4,0,100):20;
-  const marketScore=mconf==='HIGH'?95:mconf==='MEDIUM'?68:35;
-  const authScore=auth==='LOW'?92:auth==='MEDIUM'?62:10;
-  const liquidityScore=liquidity==='HIGH'?90:liquidity==='MEDIUM'?65:35;
-  const verificationBonus=marketplaceStatus==='PASSED'?8:marketplaceStatus==='AVAILABLE'?4:0;
-  let score=Math.round(0.35*profitScore+0.20*(conf*100)+0.20*marketScore+0.15*authScore+0.10*liquidityScore+verificationBonus);
-  score=Math.round(clampNum(score,0,100));
-  if(marketplaceStatus==='FAILED')score=0;
-  else if(decision==='REJECT')score=Math.min(score,55);
-  if(decision==='WATCH')score=Math.min(score,79);
-
-  if(resaleEstimateSource==='AI_ESTIMATE'){
-    score=Math.min(score,69);
-  }
-
-  const final={
-    decision,
-    opportunity_score:score,
-    resale_low_eur:Number.isFinite(low)?low:null,
-    resale_high_eur:Number.isFinite(high)?high:null,
-
-    resale_estimate_source:
-      resaleEstimateSource,
-
-    resale_estimate_confidence:
-      resaleEstimateConfidence,
-
-    resale_estimate_market_verified:
-      resaleEstimateSource==='MARKET_ANALYSIS'||resaleEstimateSource==='VESTIAIRE_DB',
-
-    landed_cost_eur:landed,
-    net_profit_low_eur:Number.isFinite(profit)?profit:null,
-    net_profit_high_eur:Number.isFinite(highProfit)?highProfit:null,
-    decision_reasons_es:reasons.slice(0,4)
-  };
-  return market.bag_sheet_required===true?applyBagSheetPolicy(final,comps,{fresh:market.sheet_fresh===true}):final;
-}
 function storeTaskAnalysis(taskId,item,a,preliminaryDecision,verification,now){
   const reasons=reasonsForStorage(a);
   a.decision_reasons_es=reasons;
@@ -8242,14 +4057,6 @@ function storeTaskAnalysis(taskId,item,a,preliminaryDecision,verification,now){
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(task_id,listing_id) DO UPDATE SET brand=excluded.brand,model=excluded.model,authenticity_risk=excluded.authenticity_risk,liquidity=excluded.liquidity,decision=excluded.decision,opportunity_score=excluded.opportunity_score,resale_low_eur=excluded.resale_low_eur,resale_high_eur=excluded.resale_high_eur,landed_cost_eur=excluded.landed_cost_eur,net_profit_low_eur=excluded.net_profit_low_eur,net_profit_high_eur=excluded.net_profit_high_eur,notes=excluded.notes,decision_reasons_es_json=excluded.decision_reasons_es_json,raw_json=excluded.raw_json,updated_at=excluded.updated_at,preliminary_decision=excluded.preliminary_decision,verification_json=excluded.verification_json`)
     .run(Number(taskId),item.id,a.brand||'',a.model||'',a.authenticity_risk||'',a.liquidity||'',a.decision||'',numberOrNull(a.opportunity_score),numberOrNull(a.resale_low_eur),numberOrNull(a.resale_high_eur),numberOrNull(a.landed_cost_eur),numberOrNull(a.net_profit_low_eur),numberOrNull(a.net_profit_high_eur),a.notes||'',JSON.stringify(reasons),JSON.stringify(a),now,preliminaryDecision||a.decision||'',JSON.stringify(verification||{}));
-}
-function storeStandaloneAnalysis(item,a,now){
-  const reasons=reasonsForStorage(a);
-  a.decision_reasons_es=reasons;
-  db.prepare(`INSERT INTO analyses(listing_id,brand,model,authenticity_risk,liquidity,decision,opportunity_score,resale_low_eur,resale_high_eur,landed_cost_eur,net_profit_low_eur,net_profit_high_eur,notes,decision_reasons_es_json,raw_json,updated_at,preliminary_decision,verification_json)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(listing_id) DO UPDATE SET brand=excluded.brand,model=excluded.model,authenticity_risk=excluded.authenticity_risk,liquidity=excluded.liquidity,decision=excluded.decision,opportunity_score=excluded.opportunity_score,resale_low_eur=excluded.resale_low_eur,resale_high_eur=excluded.resale_high_eur,landed_cost_eur=excluded.landed_cost_eur,net_profit_low_eur=excluded.net_profit_low_eur,net_profit_high_eur=excluded.net_profit_high_eur,notes=excluded.notes,decision_reasons_es_json=excluded.decision_reasons_es_json,raw_json=excluded.raw_json,updated_at=excluded.updated_at,preliminary_decision=excluded.preliminary_decision,verification_json=excluded.verification_json`)
-    .run(item.id,a.brand||'',a.model||'',a.authenticity_risk||'',a.liquidity||'',a.decision||'',numberOrNull(a.opportunity_score),numberOrNull(a.resale_low_eur),numberOrNull(a.resale_high_eur),numberOrNull(a.landed_cost_eur),numberOrNull(a.net_profit_low_eur),numberOrNull(a.net_profit_high_eur),a.notes||'',JSON.stringify(reasons),JSON.stringify(a),now,a.decision||'',JSON.stringify(a.market_verification||{status:'not_applicable',reason:'no_task_context'}));
 }
 // ── ANÁLISIS CON REFERENCIAS ELEGIDAS POR LA IA (regla de Nil, 06-11-2026) ─
 // 1) Referencias candidatas: las del mismo modelo en la hoja de Nil (Google
@@ -8271,23 +4078,6 @@ const REF_MAX_LIVE=Number(process.env.REF_MAX_LIVE||96);
 const REF_MAT_CLASS=[['exotica',/croco|alligat|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|stingray|exotic/i],['ante',/suede|ante\b|daim|nubuck|绒/i],['tela',/canvas|lona|toile|nylon|nail[oó]n|tela|fabric|denim|tweed|jacquard|cotton|algod[oó]n|raffia|paja|帆布|尼龙/i],['sintetica',/vegana|vegan|sint[eé]tic|faux|imitaci|ecopiel|合成皮革|フェイクレザー/i],['charol',/charol|patent|vernis|エナメル|漆皮/i],['piel',/leather|cuero|piel|calf|lamb|caviar|cordero|becerro|charol|patent|皮/i]];
 const refMatClass=t=>(REF_MAT_CLASS.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 const refColour=t=>(typeof VESTIAIRE_COLOR_RE!=='undefined'?VESTIAIRE_COLOR_RE.find(([,re])=>re.test(String(t||''))):null)?.[0]||null;
-const refSize=t=>typeof vestiaireSizeLabel==='function'?vestiaireSizeLabel(String(t||'')):null;
-function rankByIdentity(rows,ident){
-  const size=refSize(`${ident?.size||''} ${ident?.variant||''}`), mat=refMatClass(ident?.material), col=refColour(ident?.colour);
-  // Relojes (y bolsos con código): la misma referencia o la misma familia de
-  // referencia (mismas 4-5 primeras letras/cifras) van delante.
-  const flat=v=>String(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
-  const idRefs=[...String(`${ident?.model||''} ${ident?.variant||''} ${ident?.size||''}`).toUpperCase().matchAll(/[A-Z0-9][A-Z0-9.\- ]{3,}[0-9][A-Z0-9]*/g)]
-    .map(m=>flat(m[0])).filter(x=>x.length>=5&&/\d{3}/.test(x));
-  const refScore=r=>{
-    if(!idRefs.length)return 0;
-    const rr=flat(`${r.size||''}`);if(rr.length<5)return 0;
-    if(idRefs.some(x=>x.includes(rr)||rr.includes(x)))return 6;
-    return idRefs.some(x=>x.slice(0,5)===rr.slice(0,5))?4:idRefs.some(x=>x.slice(0,4)===rr.slice(0,4))?2:0;
-  };
-  const score=r=>refScore(r)+(size&&refSize(`${r.size||''} ${r.model||''} ${r.notes||''}`)===size?3:0)+(mat&&refMatClass(`${r.material||''} ${r.notes||''}`)===mat?2:0)+(col&&refColour(r.color)===col?1:0);
-  return rows.map((r,i)=>({r,i,s:score(r)})).sort((a,b)=>b.s-a.s||a.i-b.i).map(x=>x.r);
-}
 function baseReferenceRows(task,item){
   const tabs=vestiaireRefs().tasks||{};
   const watch=isWatchTask(task?.task_name);
@@ -8307,24 +4097,10 @@ function baseReferenceRows(task,item){
   }
   return best||{tab:null,model:null,rows:[]};
 }
-async function liveReferenceRows(task,item,baseModel=null,baseBrand=''){
-  // Todos los anuncios se comparan también con Vestiaire en directo, relojes
-  // incluidos (regla de Nil, 07-11-2026).
-  const watch=isWatchTask(task?.task_name);
-  // El modelo que la base reconoce en el anuncio ("saint laurent · le 5 a 7",
-  // "black bay 58"), con la marca delante si no la lleva.
-  let fromBase=baseModel?String(baseModel).replace(/\s*·\s*/g,' ').trim():'';
-  const b=String(baseBrand||'').trim();
-  if(fromBase&&b&&!fromBase.toLowerCase().includes(b.toLowerCase()))fromBase=`${b} ${fromBase}`;
-  fromBase=fromBase.toLowerCase().slice(0,70);
-  // Relojes: primero el modelo concreto (en la tarea caben varios: Santos y Tank).
-  if(!vestiaireLiveOn())return {status:'disabled',rows:[]};
-  const query=(watch&&fromBase.length>=3?fromBase:'')||vestiaireTaskQuery(task?.task_name)||(fromBase.length>=3?fromBase:'')||vestiaireLiveQuery(item,{});
-  if(!query)return {status:'no_query',rows:[]};
-  try{
-    const r=await vestiaireLiveSearchRows(query);
-    return r.status==='ok'?{status:'ok',query,model:r.model,rows:(r.rows||[]).map(x=>({...x,sold_price_eur:x.sold?x.price_eur:null}))}:{status:r.status,query,rows:[]};
-  }catch(e){return {status:'error',query,rows:[],error:String(e.message||e).slice(0,160)};}
+// Vestiaire en directo eliminado (Nil, 07-11-2026): el precio sale solo de la
+// base de Nil. Se deja la función para que el análisis siga igual sin V….
+async function liveReferenceRows(){
+  return {status:'disabled',rows:[]};
 }
 const LISTING_AI_INSTRUCTION=`You are the listing inspector of Luxury Hunter (second-hand luxury bags and watches bought in Asia/Japan/eBay and resold in Europe).
 YOUR JOB IS NOT TO PRICE THE ITEM. Luxury Hunter computes the price from the references you select. Never estimate resale prices, never judge whether the price is good.
@@ -8498,19 +4274,6 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     const parts=analyzeImages?await fetchGeminiImageParts(item,images):[];
     const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:prompt},...parts],googleSearch:false,purpose});
     return {data:r.data||{},images:parts.length};
-  };
-  // Tandas extra de la base, solo texto, con lo que ya se ha identificado.
-  const inspectMoreBase=async(first)=>{
-    const rest=rankByIdentity(base.slice(REF_MAX_BASE),first);
-    const chunks=[];for(let i=0;i<rest.length;i+=REF_MAX_BASE)chunks.push(rest.slice(i,i+REF_MAX_BASE));
-    const ident=`LISTING ALREADY IDENTIFIED AS: ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour,condition_grade:first.condition_grade})}\nOnly fill base_same and base_similar for the references below (the rest of the JSON can repeat the identification).`;
-    const out=await Promise.all(chunks.map(async ch=>{
-      try{
-        const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:`${referencePrompt(task,item,ch,[],economics)}\n\n${ident}`}],googleSearch:false,purpose:'screen'});
-        return r.data||{};
-      }catch(e){if(isAiPolicyFlag(e)||e?.aiBudget||e?.geminiCapacity)throw e;console.warn('Tanda extra de referencias:',e.message);return {};}
-    }));
-    return {same:out.flatMap(d=>Array.isArray(d.base_same)?d.base_same:[]),similar:out.flatMap(d=>Array.isArray(d.base_similar)?d.base_similar:[]),chunks:chunks.length,rows:rest.length};
   };
   const evaluate=data=>{
     const basePrice=priceFromRefs(base,data.base_same,{ratio:realization,prefer:data.same_colour});
@@ -8718,418 +4481,16 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
   const item=negotiated
     ?{...row,price_eur:negotiatedEur,original_price:eurTo(negotiatedEur,row.currency||'EUR')??row.original_price}
     :row;
-  const task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
+  let task=taskId?taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(taskId))):null;
   await refreshVestiaireSheet();
-  // Análisis de tarea: la IA valora el anuncio y elige las referencias; el
-  // precio y la decisión los pone el bot (REF_ANALYSIS=0 vuelve al antiguo).
-  if(task&&!['0','off','false','no'].includes(String(process.env.REF_ANALYSIS||'').toLowerCase()))
-    return analyzeByReferences({key,item,task,taskId,analyzeImages,reportProgress,negotiated});
-  const taskContext=task?`\nTASK NAME: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nUSER REQUIREMENTS / AI CRITERIA:\n${task.description||''}\nDECISION MODE: ${task.decision_mode}\nKEYWORD RULES: ${(task.keyword_rules||[]).join(', ')}${vestiaireSnapshotBlock(task,item)}`:'';
-  const economics=importEconomics(item);
-  const marketplaceVerification=detectMarketplaceVerification(item);
-  const prompt=`${CENTRAL_AI_INSTRUCTION}${taskContext}\n\nSOURCE: ${item.source}\nPURCHASE VIA: ${item.purchase_via||''}\nTITLE: ${item.title}\nDESCRIPTION: ${item.description}\nITEM PRICE EUR: ${item.price_eur}${negotiated?`\nPRICE NOTE: ITEM PRICE EUR is the purchase price the reseller has already negotiated with the seller (the listing shows ${row.price_eur} EUR). Use the negotiated price as the purchase price.`:''}${listingAuction(item)?.live?`\nAUCTION NOTE: this is an AUCTION. ITEM PRICE EUR is only the current bid (${listingAuction(item).bids} bids, ends ${listingAuction(item).endsAt}); the final price will be higher. Focus on exact model, authenticity, condition and a realistic European resale; Luxury Hunter computes the maximum profitable bid from your resale estimate.`:''}\nIMPORT COST BREAKDOWN EUR: ${JSON.stringify(economics)}\nIMPORTED TOTAL / LANDED COST EUR: ${economics.importedTotalEur}\nMARKETPLACE VERIFICATION SIGNAL: ${JSON.stringify(marketplaceVerification)}\nMARKETPLACE VERIFICATION RULE: AVAILABLE or PASSED is a positive risk-reduction signal only. It is never proof of authenticity and must never override HIGH authenticity risk, an exact-model mismatch, severe condition issues or weak live-market evidence. UNKNOWN and UNAVAILABLE are neutral. FAILED is disqualifying and must be REJECT. A seller claim such as 正品 or 정품 alone is NOT a passed verification.\nSELLER: ${item.seller_name}\nSELLER SALES: ${item.seller_sales}\nSELLER REVIEWS: ${item.seller_reviews}${(()=>{try{const si=JSON.parse(item.raw_json||'{}')?.['卖家信息'];return si?`\nSELLER PROFILE (Xianyu): ${JSON.stringify(si)}`:'';}catch{return '';}})()}\nURL: ${item.url}`;
-  reportProgress(
-    8,
-    'Cargando imágenes',
-    'Preparando primera evaluación visual'
-  );
-
-  const initialImageParts=analyzeImages?await fetchGeminiImageParts(item,1):[];
-  reportProgress(
-    18,
-    'Screening inicial',
-    'Gemini está evaluando modelo, riesgo y oportunidad'
-  );
-
-  const first=await geminiJsonRequest({key,model,parts:[{text:prompt},...initialImageParts],googleSearch:false,purpose:'screen'});
-  const a=first.data||{};
-
-  reportProgress(
-    30,
-    'Screening completado',
-    `Decisión preliminar: ${String(a.decision||'pendiente')}`
-  );
-  a.landed_cost_eur=economics.importedTotalEur;
-  a.import_costs=economics;
-  a.marketplace_verification=marketplaceVerification;
-  a.decision_reasons_es=reasonsForStorage(a);
-  const aiPreliminaryDecision=String(a.decision||'').toUpperCase();
-
-  if(String(marketplaceVerification.status||'').toUpperCase()==='FAILED'){
-    a.decision='REJECT';
-    a.opportunity_score=0;
-    a.decision_reasons_es=[
-      `La verificacion de ${marketplaceVerification.service||'marketplace'} figura como no superada.`,
-      ...a.decision_reasons_es
-    ].slice(0,4);
+  // Sin modelo indicado (análisis manual o desde la web): se busca el modelo
+  // del bot al que corresponde; sin modelo no hay referencias con qué comparar.
+  if(!task){
+    const tid=await manualTaskFor(item).catch(()=>null);
+    if(tid){taskId=tid;task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(tid)));}
   }
-
-  const preliminaryDecision=String(a.decision||'').toUpperCase();
-  let verification={
-    status:'not_required',
-    preliminary_decision:preliminaryDecision,
-    ai_preliminary_decision:aiPreliminaryDecision,
-    marketplace_verification:marketplaceVerification
-  };
-  // Ahorro: la verificación cara (fotos + búsqueda web) solo para candidatos
-  // serios. Un WATCH flojo se guarda sin verificar y no se vuelve a pagar.
-  const verifyWatchMin=Number(process.env.VERIFY_WATCH_MIN_SCORE||60);
-  // Un WATCH con mucho margen también se verifica aunque puntúe poco
-  // (caso típico: buen precio pero fotos insuficientes).
-  const verifyWatchProfit=Number(process.env.VERIFY_WATCH_MIN_PROFIT_EUR||300);
-  const bigMarginWatch=preliminaryDecision==='WATCH'&&
-    Number(a.opportunity_score)>=50&&
-    Number(a.net_profit_low_eur)>=verifyWatchProfit;
-  const worthVerifying=['BUY','STRONG BUY'].includes(preliminaryDecision)||
-    (preliminaryDecision==='WATCH'&&Number(a.opportunity_score)>=verifyWatchMin)||
-    bigMarginWatch;
-  if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&worthVerifying&&verifyBudgetLeftUsd()<=0){
-    // Candidato serio pero sin presupuesto de verificación hoy: se verifica
-    // en cuanto haya presupuesto (mañana), en vez de perderlo.
-    verification={
-      status:'pending_budget',
-      preliminary_decision:preliminaryDecision,
-      ai_preliminary_decision:aiPreliminaryDecision,
-      marketplace_verification:marketplaceVerification
-    };
-    a.decision_reasons_es=[
-      ...reasonsForStorage(a),
-      'Verificación de mercado pendiente: el presupuesto de verificación de hoy está agotado; se hará en cuanto se renueve.'
-    ].slice(0,4);
-  }else if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)&&!worthVerifying){
-    verification={
-      status:'skipped_cost',
-      preliminary_decision:preliminaryDecision,
-      ai_preliminary_decision:aiPreliminaryDecision,
-      marketplace_verification:marketplaceVerification
-    };
-    a.decision_reasons_es=[
-      ...reasonsForStorage(a),
-      `Sin verificación de mercado (puntuación ${a.opportunity_score??'—'} < ${verifyWatchMin}) para ahorrar coste.`
-    ].slice(0,4);
-  }else if(taskId&&POSITIVE_DECISIONS.has(preliminaryDecision)){
-    // WATCH → modelo barato; BUY/STRONG BUY → modelo potente.
-    verifyTierStore.enterWith(
-      ['BUY','STRONG BUY'].includes(preliminaryDecision)||String(process.env.VERIFY_LITE_FOR_WATCH||'1')==='0'?'full':'lite'
-    );
-    try{
-      reportProgress(
-        38,
-        'Preparando verificación visual',
-        'Cargando imágenes adicionales'
-      );
-
-      const imageParts=analyzeImages?await fetchGeminiImageParts(item,4):[];
-      if(!imageParts.length){
-        verification={status:'error',preliminary_decision:preliminaryDecision,ai_preliminary_decision:aiPreliminaryDecision,marketplace_verification:marketplaceVerification,error:'No listing image could be loaded for exact variant verification.'};
-        a.decision='REVIEW';
-        a.opportunity_score=null;
-        a.decision_reasons_es=[`La primera pasada detecto ${preliminaryDecision}, pero no se pudo completar el chequeo visual exacto.`,'No se publica como WATCH/BUY/STRONG BUY hasta completar la verificacion.'];
-      }else{
-        reportProgress(
-          48,
-          'Identificando modelo exacto',
-          'Chequeando variante, tamaño, material y condición'
-        );
-
-        const exact=await exactModelVerification({
-          key,model,item,task,imageParts,preliminary:a
-        });
-
-        reportProgress(
-          62,
-          'Modelo y condición identificados',
-          `${exact.exact_variant_label||exact.family||'Modelo'} · condition ${exact?.condition?.grade||'UNKNOWN'}`
-        );
-
-        const market=await liveMarketResearch({
-          key,
-          model,
-          item,
-          task,
-          exact,
-          onProgress:reportProgress
-        });
-
-        const marketResaleAvailable=
-          market?.conservative_resale_eur!==null &&
-          market?.conservative_resale_eur!==undefined &&
-          market?.conservative_resale_eur!=='' &&
-          Number.isFinite(
-            Number(
-              market.conservative_resale_eur
-            )
-          );
-
-        market.ai_resale_estimate=null;
-
-        market.resale_estimate_source=
-          marketResaleAvailable
-            ? 'MARKET_ANALYSIS'
-            : 'UNAVAILABLE';
-
-        market.resale_estimate_confidence=
-          marketResaleAvailable
-            ? String(
-                market?.market_confidence||'LOW'
-              ).toUpperCase()
-            : 'LOW';
-
-        if(
-          !marketResaleAvailable &&
-          exact?.target_match
-        ){
-          reportProgress(
-            91,
-            'Estimando reventa con IA',
-            'Sin evidencia de mercado suficiente · calculando aproximación occidental'
-          );
-
-          try{
-            const aiEstimate=
-              await aiWesternResaleEstimate({
-                key,
-                model,
-                task,
-                exact,
-                market
-              });
-
-            market.ai_resale_estimate=
-              aiEstimate;
-
-            if(aiEstimate?.available===true){
-              market.resale_estimate_source=
-                'AI_ESTIMATE';
-
-              market.resale_estimate_confidence=
-                String(
-                  aiEstimate?.confidence||
-                  'LOW'
-                ).toUpperCase();
-            }
-
-          }catch(aiEstimateError){
-            if(aiEstimateError?.geminiCapacity===true){
-              throw aiEstimateError;
-            }
-
-            console.error(
-              `AI resale fallback failed for listing ${item.id}:`,
-              aiEstimateError?.message||
-              aiEstimateError
-            );
-
-            market.ai_resale_estimate={
-              available:false,
-              source:'AI_ESTIMATE',
-              confidence:'LOW',
-              low_eur:null,
-              high_eur:null,
-              midpoint_eur:null,
-              rationale_es:
-                aiEstimateError?.message||
-                String(aiEstimateError),
-              assumptions_es:[],
-              generated_at:
-                new Date().toISOString()
-            };
-          }
-        }
-
-        reportProgress(
-          94,
-          'Calculando oportunidad',
-          'Aplicando mercado, condición, costes y beneficio'
-        );
-
-        try{market.sheet_anchor=vestiaireSheetAnchor(task,item,exact);}catch(e){market.sheet_anchor=null;}
-        try{market.sheet_comps=vestiaireComparables(task,item,exact);}catch(e){market.sheet_comps=null;}
-        market.bag_sheet_required=!isWatchTask(task?.task_name);
-        market.sheet_fresh=vestiaireSheetFresh();
-        const final=finalizeVerifiedOpportunity(
-          a,
-          exact,
-          market,
-          economics,
-          marketplaceVerification
-        );
-        verification={status:'verified',verified_at:new Date().toISOString(),preliminary_decision:preliminaryDecision,ai_preliminary_decision:aiPreliminaryDecision,marketplace_verification:marketplaceVerification,exact,market,final};
-        a.brand=exact.brand||a.brand;
-        a.model=exact.exact_variant_label||exact.family||a.model;
-        a.decision=final.decision;
-        a.opportunity_score=final.opportunity_score;
-        a.resale_low_eur=final.resale_low_eur;
-        a.resale_high_eur=final.resale_high_eur;
-        a.landed_cost_eur=final.landed_cost_eur;
-        a.net_profit_low_eur=final.net_profit_low_eur;
-        a.net_profit_high_eur=final.net_profit_high_eur;
-        a.resale_estimate_source=final.resale_estimate_source;
-        a.resale_estimate_confidence=final.resale_estimate_confidence;
-        a.resale_estimate_market_verified=final.resale_estimate_market_verified;
-        a.decision_reasons_es=final.decision_reasons_es;
-        a.notes=[a.notes,`Exact-model + live-market verification completed. Market confidence: ${market.market_confidence}.`].filter(Boolean).join(' ');
-      }
-    }catch(e){
-      if(e?.geminiCapacity===true){
-        throw e;
-      }
-
-      verification={status:'error',preliminary_decision:preliminaryDecision,ai_preliminary_decision:aiPreliminaryDecision,marketplace_verification:marketplaceVerification,error:e?.message||String(e),failed_at:new Date().toISOString()};
-      a.decision='REVIEW';
-      a.opportunity_score=null;
-      a.decision_reasons_es=[`La primera pasada detecto ${preliminaryDecision}, pero el chequeo exacto de modelo/mercado fallo.`,'No se publica como WATCH/BUY/STRONG BUY hasta que la verificacion se complete.'];
-      a.notes=[a.notes,`Market verification error: ${e?.message||String(e)}`].filter(Boolean).join(' ');
-    }
-  }
-  // Primera pasada sin verificación completa: mismo techo con la base de Vestiaire.
-  if(task&&verification?.status!=='verified'&&Number.isFinite(Number(a.resale_low_eur))){
-    try{
-      const ident={brand:a.brand,family:a.model};
-      const comps=vestiaireComparables(task,{...item,model:a.model},ident);
-      const anchor=vestiaireSheetAnchor(task,item,ident);
-      const landed=Number(a.landed_cost_eur)||Number(economics.importedTotalEur)||0;
-      let c=null,note='';
-      if(comps&&(comps.tier==='iguales'||comps.tier==='misma_talla')){
-        c={low:comps.low,high:comps.high,changed:true};note=vestiaireComparablesNote(comps);
-      }else if(anchor){
-        c=clampResaleToAnchor(Number(a.resale_low_eur),Number(a.resale_high_eur),anchor);
-        note=`Reventa ajustada con tu base de Vestiaire (${anchor.n} anuncios, ${anchor.basis}): venta realista ${anchor.low}-${anchor.high} EUR.`;
-      }
-      if(c?.changed){
-        a.resale_low_eur=c.low;a.resale_high_eur=c.high;
-        if(landed){a.net_profit_low_eur=roundMoney(c.low-landed);a.net_profit_high_eur=roundMoney(c.high-landed);}
-        a.decision_reasons_es=[...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[]),note].slice(0,5);
-      }
-    }catch{}
-  }
-  // Subastas: el precio del anuncio es la puja actual, no lo que acabará
-  // costando. Se calcula la puja máxima rentable y el beneficio a esa puja.
-  const auc=task?listingAuction(item):null;
-  if(auc){
-    try{
-      const ident=verification?.exact||{brand:a.brand,family:a.model};
-      const comparableItem={...item,model:a.model};
-      const comps=verification?.market?.sheet_comps??vestiaireComparables(task,comparableItem,ident);
-      const anchor=verification?.market?.sheet_anchor??vestiaireSheetAnchor(task,comparableItem,ident);
-      const sameSize=comps&&(comps.tier==='iguales'||comps.tier==='misma_talla');
-      const dbLow=sameSize?Number(comps.low):anchor?Number(anchor.low):null;
-      const fromDb=Number.isFinite(dbLow)&&dbLow>0&&(isWatchTask(task?.task_name)||(vestiaireSheetFresh()&&comps?.buy_eligible===true));
-      const estimate=Number(a.resale_low_eur);
-      const requiresDatabase=auc.requiresDatabase===true;
-      const resale=requiresDatabase
-        ? fromDb?(estimate>0?Math.min(dbLow,estimate):dbLow):null
-        : sameSize?Number(comps.low):estimate;
-      const current=Number(item.price_eur);
-      const usable=auc.live&&resale>0&&(!requiresDatabase||fromDb);
-      const rawMax=usable?auctionMaxBidEur(item,resale,task.task_name):null;
-      const maxLocal=rawMax!=null?auctionLocalBid(rawMax,auc.currency):null;
-      const maxEur=maxLocal!=null?toEur(maxLocal,auc.currency):null;
-      const plan={ends_at:auc.endsAt,bids:auc.bids,currency:auc.currency,current_bid:auc.currentBid,current_bid_eur:roundMoney(current),
-        resale_eur:resale>0?roundMoney(resale):null,resale_from_db:!!fromDb,db_comparables:fromDb?(sameSize?comps.n:anchor.n):null,
-        db_basis:fromDb?(sameSize?comps.basis:anchor.basis):null,requires_database:requiresDatabase,
-        min_profit_eur:AUCTION_MIN_PROFIT_EUR,max_bid_eur:maxEur!=null?roundMoney(maxEur):null,max_bid_local:maxLocal};
-      verification={...(verification||{}),auction:plan};
-      if(requiresDatabase&&!fromDb){
-        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='WATCH';
-        a.opportunity_score=null;
-        a.decision_reasons_es=['Subasta: no hay comparables suficientes del mismo modelo y talla en la base de Luxury Hunter; no se propone una puja máxima.',
-          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
-      }else if(!auc.live){
-        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REVIEW';
-        a.opportunity_score=null;
-        a.decision_reasons_es=['Subasta finalizada; la puja ya no está disponible.',
-          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
-      }else if(!(resale>0)){
-        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REVIEW';
-        a.opportunity_score=null;
-        a.decision_reasons_es=['Subasta: no hay un precio de reventa conservador para calcular una puja máxima.',
-          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
-      }else if(maxEur==null||maxLocal<=Number(auc.currentBid)||current>=maxEur){
-        if(String(a.decision||'').toUpperCase()!=='REJECT')a.decision='REJECT';
-        a.decision_reasons_es=[maxEur==null
-          ? `Subasta: ni pujando muy bajo deja ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €.`
-          : `Subasta: la puja actual (${Math.round(current)} €) ya supera la puja máxima rentable (${Math.round(maxEur)} €).`,
-          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
-      }else{
-        const atMax=auctionNetProfit(item,maxEur,resale,task.task_name);
-        a.landed_cost_eur=roundMoney(atMax.landed);
-        a.net_profit_low_eur=roundMoney(atMax.net);
-        if(Number(a.resale_high_eur)>0)a.net_profit_high_eur=roundMoney(auctionNetProfit(item,maxEur,Number(a.resale_high_eur),task.task_name).net);
-        a.decision_reasons_es=[`Subasta: puja como máximo ${plan.max_bid_local??Math.round(maxEur)} ${plan.max_bid_local!=null?auc.currency:'€'} (≈ ${Math.round(maxEur)} €) para ganar al menos ${AUCTION_MIN_PROFIT_EUR} € limpios vendiendo a ${Math.round(resale)} €${fromDb?' (anuncios parecidos de tu base)':' (pronóstico)'}.`,
-          ...(Array.isArray(a.decision_reasons_es)?a.decision_reasons_es:[])].slice(0,5);
-      }
-    }catch(e){console.error('Subasta, puja máxima:',e.message);}
-  }
-  if(!isWatchTask(task?.task_name)){
-    const ident=verification?.exact||{brand:a.brand,family:a.model};
-    const comps=vestiaireComparables(task,{...item,model:a.model},ident);
-    // Sin nada del modelo en la base de Nil: Vestiaire en directo.
-    let live=null;
-    if(String(a.decision||'').toUpperCase()!=='REJECT'&&!listingAuction(item)){
-      try{live=await vestiaireLiveFor(task,{...item,model:a.model},ident);}
-      catch(e){live={status:'error',error:String(e.message||e).slice(0,160)};console.warn('Vestiaire en directo:',e.message);}
-      if(!comps&&live?.status==='ok'){
-        const landed=Number(a.landed_cost_eur)||Number(economics?.importedTotalEur)||0;
-        a.resale_low_eur=live.low;a.resale_high_eur=live.high;
-        if(landed){a.net_profit_low_eur=roundMoney(live.low-landed);a.net_profit_high_eur=roundMoney(live.high-landed);}
-      }
-    }
-    // Con referencias en la base: contraste con Vestiaire en directo. Precio
-    // combinado (la base pesa el doble; vendidos, recientes y con más likes pesan más).
-    // Si baja el beneficio, la decisión baja con él; nunca sube por esto.
-    let blend=null;
-    if(comps&&live?.status==='ok'){
-      blend=blendComparables(comps,live);
-      if(blend){
-        const landed=Number(a.landed_cost_eur)||Number(economics?.importedTotalEur)||0;
-        const before=Number(a.net_profit_low_eur);
-        a.resale_low_eur=blend.low;a.resale_high_eur=blend.high;
-        if(landed){
-          a.net_profit_low_eur=roundMoney(blend.low-landed);a.net_profit_high_eur=roundMoney(blend.high-landed);
-          const profit=a.net_profit_low_eur;
-          const d=String(a.decision||'').toUpperCase();
-          if(Number.isFinite(before)&&profit<before){
-            if(profit<200&&d!=='REJECT'){a.decision='REJECT';a.opportunity_score=Math.min(Number(a.opportunity_score)||0,55);}
-            else if(['BUY','STRONG BUY'].includes(d)&&profit<300){a.decision='WATCH';a.opportunity_score=Math.min(Number(a.opportunity_score)||0,79);}
-            else if(d==='STRONG BUY'&&profit<=400)a.decision='BUY';
-          }
-        }
-        a.decision_reasons_es=[`Precio combinado: ${blend.n_sheet} de tu base (pesan el doble) + ${blend.n_live} de Vestiaire en directo de la misma talla; ${blend.sold_n} vendidos; vendidos, recientes y con más likes pesan más → ${blend.low}-${blend.high} EUR.`,
-          ...(a.decision_reasons_es||[])].slice(0,5);
-      }
-    }
-    Object.assign(a,applyBagSheetPolicy(a,comps,{fresh:vestiaireSheetFresh()}));
-    if(blend&&a.resale_estimate_source!=='UNVERIFIED_ESTIMATE')a.resale_estimate_source='VESTIAIRE_DB+LIVE';
-    if(!comps&&live?.status==='ok'){
-      a.resale_estimate_source='VESTIAIRE_LIVE';
-      a.resale_estimate_confidence=live.tier==='misma_talla'?'MEDIUM':'LOW';
-      const note=vestiaireLiveNote(live);
-      a.decision_reasons_es=(a.decision_reasons_es||[]).map(r=>String(r).startsWith('CONSULTAR PRECIO:')?`CONSULTAR PRECIO: ${note} Posible oportunidad; la compra solo se recomienda con referencias de tu base.`:r);
-      if(!a.decision_reasons_es.some(r=>String(r).includes('Vestiaire en directo')))a.decision_reasons_es=[note,...a.decision_reasons_es].slice(0,5);
-    }
-    verification={...(verification||{}),bag_sheet_rule_version:BAG_SHEET_RULE_VERSION,
-      market:{...(verification?.market||{}),sheet_comps:comps,vestiaire_live:live,vestiaire_blend:blend,sheet_fresh:vestiaireSheetFresh(),bag_sheet_required:true}};
-    if(verification.final)verification.final={...verification.final,...a};
-  }
-  a.market_verification=verification;
-  const now=new Date().toISOString();
-  reportProgress(
-    97,
-    'Guardando resultado',
-    'Actualizando Luxury Hunter'
-  );
-
-  if(taskId)storeTaskAnalysis(taskId,item,a,preliminaryDecision,verification,now);
-  else storeStandaloneAnalysis(item,a,now);
-
-  reportProgress(
-    100,
-    'Análisis finalizado',
-    'Resultado guardado'
-  );
-
-  return a;
+  if(!task)throw new Error('Este anuncio no corresponde a ningún modelo del bot: no hay referencias de tu base con las que compararlo.');
+  return analyzeByReferences({key,item,task,taskId,analyzeImages,reportProgress,negotiated});
 }
 
 function sessionListings(sessionId) {
@@ -9159,6 +4520,12 @@ function safeTaskSnapshot(task) {
   const copy = JSON.parse(JSON.stringify(task));
   return copy;
 }
+// Las búsquedas de la tarea; solo si no tiene ninguna se generan.
+async function taskQueryPlan(task){
+  const x=normalizeLines(task?.xianyu_queries||[]), j=normalizeLines(task?.japan_queries||[]);
+  if(x.length||j.length)return {product:task.product_query,xianyu:x,japan:j,generatedBy:'configured'};
+  return effectivePlan(await buildQueryPlan(task.product_query),task);
+}
 function effectivePlan(basePlan, taskOrBody={}) {
   const plan={...basePlan};
   const x = taskOrBody.xianyu_queries ?? taskOrBody.xianyuQueries;
@@ -9187,80 +4554,37 @@ function radarRotatePlan(plan,taskId){
   }
   return out;
 }
+// Qué va a hacer una tarea (para la pantalla de detalle): fuentes, consultas,
+// límites, IA y avisos. Solo describe; no busca nada.
 function buildExecutionManifest(task, plan, run=null, session=null) {
-  const sources = task.sources || ['xianyu','bunjang','buyee'];
-  const pages=clampInt(task.max_pages,1,1,5);
+  const sources=(task.sources||['xianyu','buyee']).filter(s=>['xianyu','buyee'].includes(s));
   const maxItems=clampInt(task.max_items,20,5,100);
-  const minEur=task.min_eur ?? null, maxEur=task.max_eur ?? null;
-  const xLimit=clampInt(process.env.XIANYU_MAX_QUERIES || 2,2,2,2);
-  const bLimit=clampInt(process.env.BUNJANG_MAX_QUERIES || 2,2,1,5);
-  const jLimit=clampInt(process.env.BUYEE_MAX_QUERIES || 2,2,1,4);
+  const xLimit=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
+  const jLimit=clampInt(process.env.BUYEE_MAX_QUERIES||2,2,1,4);
+  const oLimit=clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4);
   const xQueries=(plan?.xianyu||[]).slice(0,xLimit);
-  const bQueries=(plan?.bunjang||[]).slice(0,bLimit);
   const jQueries=(plan?.japan||[]).slice(0,jLimit);
-  const minCny=Number.isFinite(Number(minEur))?Math.floor(eurTo(Number(minEur),'CNY')||0):null;
-  const maxCny=Number.isFinite(Number(maxEur))?Math.ceil(eurTo(Number(maxEur),'CNY')||0):null;
-  const xianyuCalls=xQueries.map((q,idx)=>({
-    query:q,
-    createTask:{method:'POST',url:`${XIANYU_BASE_URL}/api/tasks/`,body:{
-      task_name:`LH ${String(task.product_query||'').slice(0,40)} <timestamp>`,enabled:true,keyword:q,
-      description:'Temporary live search created by Luxury Hunter. Central AI analysis is performed in Luxury Hunter.',
-      analyze_images:false,max_pages:pages,personal_only:!!task.personal_only,
-      min_price:minCny?String(minCny):null,max_price:maxCny?String(maxCny):null,cron:null,
-      account_state_file:task.account_state_file||null,account_strategy:task.account_strategy||'auto',
-      free_shipping:!!task.free_shipping,new_publish_option:task.new_publish_option||null,region:task.region||null,
-      decision_mode:'keyword',keyword_rules:[q.split(/\s+/)[0]||q]
-    }},
-    then:[
-      'POST /api/tasks/start/<temporaryTaskId>',
-      'GET /api/tasks/<temporaryTaskId> every 2s until finished',
-      `GET /api/results/${xianyuResultFilename(q)}?page=1&limit=100&include_hidden=true&sort_by=crawl_time&sort_order=desc`,
-      'DELETE /api/tasks/<temporaryTaskId>'
-    ]
-  }));
-  const bunjangCalls=bQueries.map(q=>({
-    query:q,
-    searchCommand:`bunjang-cli --json --preferred-transport browser search ${JSON.stringify(q)} --pages ${pages} --max-items ${maxItems}`,
-    detailCommand:'bunjang-cli --json item list --ids <IDs encontrados, lotes de 40>'
-  }));
-  const oneMapCalls=jQueries.slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4)).map(q=>({
-    source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',
-    mode:'mac-chrome-or-api',query:q,method:'MAC CHROME GET; REEFAPI POST if offline or failed',
-    url:oneMapSearchUrl(q),
-    fallbackCreditsPerSearch:2
-  }));
-  const japanCalls=[...oneMapCalls,...JAPAN_RADAR_SPECS.flatMap(spec=>
-    jQueries.map(q=>({
-      source:spec.id,
-      label:spec.label,
-      purchaseVia:spec.purchaseVia,
-      mode:spec.mode,
-      query:q,
-      method:spec.mode==='browser'?'BROWSER GET':'GET',
-      url:spec.searchUrl(q)
-    }))
-  )];
   let liveStatus={};
-  try { liveStatus=JSON.parse(session?.source_status_json||run?.source_status_json||'{}'); } catch {}
+  try{liveStatus=JSON.parse(session?.source_status_json||run?.source_status_json||'{}');}catch{}
   return {
-    version:'1.7.1',
+    version:'1.8.0',
     task:{id:task.id,task_name:task.task_name,product_query:task.product_query,enabled:task.enabled,sources},
     run:run?{id:run.id,status:run.status,started_at:run.started_at,finished_at:run.finished_at,session_id:run.session_id,error:run.error||null}:null,
     searchSession:session?{id:session.id,status:session.status,started_at:session.started_at,finished_at:session.finished_at}:null,
-    queryPlan:{generatedBy:plan?.generatedBy||'unknown',xianyu:plan?.xianyu||[],bunjang:plan?.bunjang||[],japan:plan?.japan||[]},
-    effectiveLimits:{xianyuMaxQueries:xLimit,bunjangMaxQueries:bLimit,japanMaxQueries:jLimit,
-      oneMapMaxQueries:clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4),
-      oneMapDetailsPerRun:clampInt(process.env.ONEMAP_DETAIL_LIMIT||8,8,1,20),pages,maxItemsPerQuery:maxItems},
-    filters:{minEur,maxEur,newPublishOption:task.new_publish_option||null,personalOnly:!!task.personal_only,freeShipping:!!task.free_shipping,region:task.region||null,accountStrategy:task.account_strategy||'auto',accountStateFile:task.account_state_file||null},
-    connectors:{
-      xianyu:{enabled:sources.includes('xianyu'),baseUrl:XIANYU_BASE_URL,queriesExecuted:xQueries,calls:xianyuCalls},
-      bunjang:{enabled:sources.includes('bunjang'),binary:bunjangCli,queriesExecuted:bQueries,calls:bunjangCalls},
-      japan:{enabled:sources.includes('buyee'),provider:'Japan multi-source radar v2',queriesExecuted:jQueries,calls:japanCalls}
+    queryPlan:{generatedBy:plan?.generatedBy||'unknown',xianyu:plan?.xianyu||[],japan:plan?.japan||[]},
+    effectiveLimits:{xianyuMaxQueries:xLimit,japanMaxQueries:jLimit,oneMapMaxQueries:oLimit,maxItemsPerQuery:maxItems,
+      auctionShowHours:AUCTION_SHOW_HOURS,auctionMinBids:AUCTION_MIN_BIDS},
+    filters:{minEur:task.min_eur??null,maxEur:task.max_eur??null,newPublishOption:task.new_publish_option||null},
+    sources:{
+      xianyu:{enabled:sources.includes('xianyu'),mode:'cuenta de Nil, solo la página de búsqueda',queries:xQueries},
+      mercari:{enabled:sources.includes('buyee'),queries:jQueries,url:jQueries.map(q=>JAPAN_RADAR_SPECS.find(s=>s.id==='mercari-jp')?.searchUrl(q))},
+      oneMap:{enabled:sources.includes('buyee'),mode:'Chrome del Mac',queries:jQueries.slice(0,oLimit),url:jQueries.slice(0,oLimit).map(q=>oneMapSearchUrl(q))}
     },
-    ai:{enabled:task.decision_mode==='ai',provider:aiProvider(),configured:aiConfigured(),model:aiModel(),triageModel:aiTriageModel(),analyzeImages:!!task.analyze_images,centralInstruction:CENTRAL_AI_INSTRUCTION,userCriteria:task.description||'',keywordRules:task.keyword_rules||[],positiveVerification:{mandatory:true,stages:['preliminary-screen','exact-visual-model-check','live-google-market-comparables','deterministic-final-decision'],prioritySources:['Vestiaire Collective','Collector Square','EU specialist resellers','The RealReal','Fashionphile','Rebag'],strongBuyMinimum:{modelConfidence:0.85,relevantComparables:3,independentSources:2,marketConfidence:'HIGH'},marketplaceAuthenticitySignal:{enabled:true,xianyu:'Xianyu Verification / 验货宝',bunjang:'Bunjang Care / 번개케어',scores:{AVAILABLE:4,PASSED:8,UNKNOWN:0,UNAVAILABLE:0},failed:'REJECT',sellerAuthenticityClaimIsNotPassed:true}}},
+    ai:{enabled:task.decision_mode==='ai',provider:aiProvider(),configured:aiConfigured(),model:aiModel(),triageModel:aiTriageModel(),analyzeImages:!!task.analyze_images,
+      method:'filtros sin IA → triaje → referencias de tu base elegidas por el bot → comprobación con fotos (modelo bueno) → precio orientativo',userCriteria:task.description||''},
     economics:getEconomics(),
-    schedule:{mode:task.interval_minutes?'interval':task.cron?'cron':'manual',intervalMinutes:task.interval_minutes||null,cron:task.cron||null,runIfMissed:task.run_if_missed!==false},
-    email:{enabled:!!task.email_enabled,to:task.email_to||null,decisions:task.notify_decisions||[],minScore:task.notify_min_score??null,minProfitEur:task.notify_min_profit_eur??null,maxItems:task.notify_max_items??8,onlyNew:task.notify_only_new!==false},
+    schedule:{mode:task.interval_minutes?'interval':task.cron?'cron':'manual',intervalMinutes:task.interval_minutes||null,cron:task.cron||null},
+    alerts:{decisions:task.notify_decisions||[],minScore:task.notify_min_score??null,minProfitEur:task.notify_min_profit_eur??null},
     liveStatus
   };
 }
@@ -9272,7 +4596,9 @@ async function globalSearch(body) {
   // Pasada de subastas: solo Yahoo por One Map (las que acaban en ≤2 h).
   const auctionLane=body.fast==='auction';
   const fastLane=!!body.fast&&!auctionLane;
-  const sources=auctionLane?['buyee']:fastLane?['xianyu','buyee']:Array.isArray(body.sources)&&body.sources.length?body.sources:['xianyu','bunjang','buyee'];
+  // Solo Xianyu y Japón (Mercari + One Map); Corea y el resto, eliminados.
+  const asked=Array.isArray(body.sources)&&body.sources.length?body.sources.filter(s=>['xianyu','buyee'].includes(s)):['xianyu','buyee'];
+  const sources=auctionLane?['buyee']:fastLane?['xianyu','buyee']:(asked.length?asked:['xianyu','buyee']);
   const sessionId=randomUUID();
   const startedAt=new Date().toISOString();
 
@@ -9300,10 +4626,6 @@ async function globalSearch(body) {
     (
       !sources.includes('xianyu') ||
       configuredPlan.xianyu.length>0
-    ) &&
-    (
-      !sources.includes('bunjang') ||
-      configuredPlan.bunjang.length>0
     ) &&
     (
       !sources.includes('buyee') ||
@@ -9337,22 +4659,10 @@ async function globalSearch(body) {
       finally{status[name]={...(status[name]||{}),ms:Date.now()-t0};persistStatus();}
     })());
   };
-  // Canales de compra (regla de Nil, 07-11-2026): Xianyu, Mercari y Yahoo
-  // Subastas por One Map. Corea (Bunjang), eBay, Rakuten y Vestiaire como
-  // fuente quedan fuera salvo que se activen a mano (BUNJANG_ENABLED=1,
-  // EBAY_ENABLED=1, RAKUTEN_ENABLED=1, VESTIAIRE_SOURCE=1). Vestiaire se
-  // sigue usando para comparar precios.
-  const on=k=>['1','on','true','yes'].includes(String(process.env[k]||'').toLowerCase());
-  if(!fastLane&&sources.includes('bunjang')&&on('BUNJANG_ENABLED'))run('bunjang',()=>searchBunjangLive({...opts,queries:plan.bunjang}));
+  // Canales de compra (regla de Nil, 07-11-2026): solo Xianyu, Mercari y
+  // Yahoo Subastas por One Map. Corea, eBay, Rakuten y Vestiaire, eliminados.
   if(sources.includes('buyee'))run('buyee',()=>searchJapanRadarLive({...opts,queries:plan.japan}));
-  const extraOff=['0','off','false','no'].includes(String(process.env.EXTRA_SOURCES||'').toLowerCase());
-  if(!fastLane&&!extraOff&&on('RAKUTEN_ENABLED')&&rakutenConfigured())run('rakuten',()=>searchRakutenLive({...opts,queries:plan.japan}));
-  if(!fastLane&&!extraOff&&on('EBAY_ENABLED')&&(sources.includes('ebay')||ebayConfigured()))run('ebay',()=>searchEbayLive({...opts,product}));
   if(sources.includes('xianyu'))run('xianyu',()=>searchXianyuLive({...opts,queries:plan.xianyu}));
-  // Vestiaire como fuente de compra: apagado (VESTIAIRE_SOURCE=1 lo vuelve a encender).
-  const taskName=taskId?db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId)?.task_name:null;
-  if(!fastLane&&taskName&&!isWatchTask(taskName)&&on('VESTIAIRE_SOURCE'))
-    run('vestiaire',()=>searchVestiaireSource(opts,taskName));
   await Promise.all(jobs);
   const finishedAt=new Date().toISOString();
   db.prepare('UPDATE search_sessions SET source_status_json=?,status=?,finished_at=? WHERE id=?').run(JSON.stringify(status),'finished',finishedAt,sessionId);
@@ -11083,9 +6393,8 @@ function vestiaireCompsFor(taskName,item){
   let v={};try{v=JSON.parse(item?.verification_json||'{}')||{};}catch{}
   // Análisis nuevo: las referencias que eligió la IA, tal cual se guardaron.
   if(v?.market?.match_version)return v.market.sheet_comps||null;
-  if(isWatchTask(taskName)&&v?.market&&'sheet_comps' in v.market)return v.market.sheet_comps;
-  try{return vestiaireComparables({task_name:taskName},item,v?.exact&&v.exact.target_match!==false?v.exact:{brand:item?.brand,family:item?.model});}
-  catch{return null;}
+  // Análisis antiguos (método anterior, ya eliminado): sin referencias.
+  return v?.market?.sheet_comps||null;
 }
 const VESTIAIRE_LIVE_WHY={mac_offline:'el Chrome del Mac no estaba encendido',no_mac:'el puente del Mac no está configurado',
   blocked:'Vestiaire pidió una verificación y la búsqueda está en pausa',daily_limit:'ya se hicieron las búsquedas de hoy',
@@ -11176,22 +6485,11 @@ const ALERT_WORDS_ES=[[/lambskin/gi,'piel de cordero'],[/calfskin/gi,'piel de be
   [/black/gi,'negro'],[/white/gi,'blanco'],[/beige/gi,'beige'],[/brown/gi,'marrón'],[/grey|gray/gi,'gris'],[/red/gi,'rojo'],[/pink/gi,'rosa'],
   [/blue/gi,'azul'],[/green/gi,'verde'],[/burgundy/gi,'burdeos'],[/gold/gi,'dorado'],[/silver/gi,'plateado']];
 const alertEs=t=>ALERT_WORDS_ES.reduce((a,[re,w])=>a.replace(re,w),String(t||''));
-function alertSection(title,lines){
-  const list=(lines||[]).filter(Boolean);
-  return list.length?['',`<b>${title}</b>`,...list]:[];
-}
 function alertAgo(ms){
   if(!Number.isFinite(ms))return '';
   const h=(Date.now()-ms)/3600e3;
   if(h<0)return '';
   return h<1?`hace ${Math.max(1,Math.round(h*60))} min`:h<48?`hace ${Math.round(h)} h`:`hace ${Math.round(h/24)} días`;
-}
-function alertResaleSource(x,v){
-  if(vestiaireCompsFor(x._task_name,x))return v?.market?.vestiaire_blend?'según tu base + Vestiaire en directo (ver abajo cada uno)':'según tu base de Vestiaire';
-  if(v?.market?.vestiaire_live?.status==='ok')return 'según Vestiaire en directo (no está en tu base)';
-  const src=String(v?.final?.resale_estimate_source||'').toUpperCase();
-  if(src==='MARKET_ANALYSIS')return 'según anuncios de otras webs de reventa';
-  return '🔮 estimación sin verificar';
 }
 // OFERTA AL VENDEDOR DE XIANYU (regla de Nil, 07-11-2026): el aviso trae el
 // mensaje en chino listo para copiar. Precio máximo = el que todavía deja el
@@ -11218,16 +6516,6 @@ function sellerOfferPlan(x,v){
   const flaws=String(v?.final?.flaws_zh||'').trim();
   const msg=`您好，诚心想要这只${model}。${flaws?`看图片${flaws}，`:''}${openCny}元可以吗？走验货宝，同意的话我马上拍下付款，不来回砍价。谢谢！`;
   return {openCny,openEur:Math.round(openCny/rate),maxCny,maxEur:Math.round(maxCny/rate),profitOpen:Math.round(at(openCny/rate).clean),profitMax:Math.round(at(maxCny/rate).clean),msg,minProfit};
-}
-function sellerOfferLines(x,v){
-  const o=sellerOfferPlan(x,v);
-  if(!o)return [];
-  return [
-    `Ofrece <b>¥${o.openCny}</b> (≈ ${eur0(o.openEur)}) → beneficio limpio ${eur0(o.profitOpen)}`,
-    `Tu máximo: <b>¥${o.maxCny}</b> (≈ ${eur0(o.maxEur)}) → beneficio limpio ${eur0(o.profitMax)} (mínimo ${eur0(o.minProfit)})`,
-    'Mensaje para el vendedor (toca para copiar):',
-    `<code>${htmlEsc(o.msg)}</code>`
-  ];
 }
 // AVISOS CORTOS (regla de Nil, 07-11-2026): solo lo que hace falta para
 // decidir, una idea por línea: qué es, cuánto cuesta, por cuánto se vende,
@@ -13537,25 +8825,6 @@ function globalDigestMadridFullLabel(date=new Date(),timezone='Europe/Madrid'){
     hour12:false
   }).format(date);
 }
-function globalDigestVerificationHtml(x){
-  let v={};
-  try{v=JSON.parse(x.verification_json||'{}')}catch{}
-  const mv=v.marketplace_verification||{};
-  const mvStatus=String(mv.status||'').toUpperCase();
-  const mvHtml=['AVAILABLE','PASSED','FAILED'].includes(mvStatus)
-    ? `<div style="margin-top:7px"><b>${htmlEsc(mv.service||'Marketplace verification')}:</b> ${htmlEsc(mvStatus)}</div>`
-    : '';
-  if(v.status==='verified'){
-    const exact=v.exact||{},market=v.market||{};
-    const comps=Array.isArray(market.comparables)?market.comparables:[];
-    const links=comps.slice(0,3).map(c=>{
-      const label=`${c.source||'Source'} - ${moneyEmail(c.price_eur)} - ${c.match_level||''}`;
-      return c.url?`<a href="${htmlEsc(c.url)}">${htmlEsc(label)}</a>`:htmlEsc(label);
-    }).join('<br>');
-    return `${mvHtml}<div style="margin-top:7px;color:#4b5563"><b>Exact model:</b> ${htmlEsc(exact.exact_variant_label||exact.family||'-')} - ${Math.round(Number(exact.confidence||0)*100)}%<br><b>Market confidence:</b> ${htmlEsc(market.market_confidence||'LOW')} - ${Number(market.relevant_comparable_count||0)} comparables${links?`<br>${links}`:''}</div>`;
-  }
-  return mvHtml;
-}
 async function sendGlobalDigest({to=null,force=false,config={}}={}){
   const setting=globalEmailSetting(config);
   if(setting.enabled===false)return {sent:false,reason:'disabled'};
@@ -13885,7 +9154,7 @@ function statusPayload() {
     app:'Luxury Hunter v1.7.1', port:PORT, xianyuBaseUrl:XIANYU_BASE_URL,
     xianyuProvider:xianyuProvider(),justOneApiConfigured:!!String(process.env.JUSTONEAPI_TOKEN||'').trim(),
     oneMapAccountStatus,
-    bunjangCliExists:fs.existsSync(bunjangCli), geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
+    geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
     listingCount:db.prepare('SELECT COUNT(*) n FROM listings').get().n,
     taskCount:db.prepare('SELECT COUNT(*) n FROM tasks').get().n,
     runningTasks:[...runningTaskIds],
@@ -14019,7 +9288,7 @@ const server=http.createServer(async(req,res)=>{
         }));
         return json(res,200,{accounts});
       }
-      try{return json(res,200,{accounts:await xianyuFetch('/api/accounts',{timeoutMs:7000})});}catch(e){return json(res,200,{accounts:[],error:e.message});}
+      return json(res,200,{accounts:[]});
     }
     if(req.method==='POST'&&u.pathname==='/api/telegram/test-alert'){
       const b=await readBody(req);
@@ -14095,7 +9364,7 @@ const server=http.createServer(async(req,res)=>{
     const ti=u.pathname.match(/^\/api\/tasks\/(\d+)\/inspect$/);
     if(ti&&req.method==='GET'){
       const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(ti[1]))); if(!task)return json(res,404,{error:'Tarea no encontrada'});
-      const basePlan=await buildQueryPlan(task.product_query); const plan=effectivePlan(basePlan,task);
+      const plan=await taskQueryPlan(task);
       const latestRun=db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1').get(task.id)||null;
       return json(res,200,{manifest:buildExecutionManifest(task,plan,null,null)});
     }
@@ -14138,7 +9407,7 @@ const server=http.createServer(async(req,res)=>{
       if(!task) task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(run.task_id));
       let session=null,plan=null;
       if(run.session_id){session=db.prepare('SELECT * FROM search_sessions WHERE id=?').get(run.session_id)||null;try{plan=JSON.parse(session?.query_plan_json||'null')}catch{}}
-      if(!plan){const base=await buildQueryPlan(task.product_query);plan=effectivePlan(base,task);}
+      if(!plan)plan=await taskQueryPlan(task);
       return json(res,200,{manifest:buildExecutionManifest(task,plan,run,session)});
     }
 
@@ -14275,7 +9544,6 @@ server.listen(PORT,'127.0.0.1',async()=>{
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
   if(vestiaireSheetConfigured())await refreshVestiaireSheet({force:true}).catch(()=>{});
   else console.log('Hoja de Vestiaire no configurada (VESTIAIRE_SHEET_ID + GOOGLE_SHEETS_SA_JSON o GOOGLE_SHEETS_SA_FILE): se usa la copia fija.');
-  if(!vestiaireSheetConfigured())revalidateStoredBagBuys();
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();
   if(!['1','true','yes','on'].includes(schedulerDisabled)){
     setInterval(()=>schedulerTick().catch(e=>console.error('Scheduler:',e.message)),30000);

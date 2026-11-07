@@ -82,7 +82,7 @@ function harness({screen,photo,extraRows=[],extra={},landed=1000,colour=null,liv
       return {data:{...base,...screen}};
     },
     storeTaskAnalysis:(...args)=>stored.push(args)});
-  vm.runInContext(extract('const VESTIAIRE_SIZE_RE=','const sheetNorm='),ctx);
+  vm.runInContext(extract('const VESTIAIRE_SIZE_RE=','// ── FIN DE TALLAS Y COLORES ──'),ctx);
   vm.runInContext(extract('const REF_MAX_BASE=','async function analyzeWithGemini('),ctx);
   const run=()=>ctx.analyzeByReferences({key:'k',item:{id:1,source:'xianyu',title:'Lady Dior medium',description:''},task:{task_name:'Lady Dior',product_query:'Lady Dior',notify_min_profit_eur:200},
     taskId:5,analyzeImages:true,reportProgress:()=>{},negotiated:false});
@@ -102,7 +102,7 @@ test('análisis: la IA preselecciona por texto y solo cuentan las comprobadas co
   const v=h.stored[0][4];
   assert.equal(v.market.match_version,MATCH_VERSION);
   assert.equal(v.market.sheet_comps.n,3);                 // B4 (Mini) fuera por la foto
-  assert.equal(v.market.vestiaire_live.n,2);
+  assert.equal(v.market.candidates.vestiaire,0);           // Vestiaire en directo eliminado
   assert.equal(JSON.stringify(v.market.photo_check.not_same),JSON.stringify({B4:'Es un Mini'}));
   assert.equal(a.resale_estimate_market_verified,true);
 });
