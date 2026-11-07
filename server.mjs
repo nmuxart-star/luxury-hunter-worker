@@ -2181,6 +2181,8 @@ const AUCTION_MAX_HOURS=Math.max(1,Number(process.env.AUCTION_MAX_HOURS||72));
 // SUBASTAS QUE SE ENSEÑAN (regla de Nil, 07-11-2026): como mucho
 // AUCTION_SHOW_HOURS (2 h) para terminar y AUCTION_MIN_BIDS (1) puja o más.
 const AUCTION_SHOW_HOURS=Math.max(0.5,Number(process.env.AUCTION_SHOW_HOURS||2));
+// Un anuncio ya analizado se vuelve a valorar solo si su precio cambia al menos un 3 %.
+const PRICE_CHANGE_REVALUE=Math.max(0.005,Number(process.env.PRICE_CHANGE_REVALUE||0.03));
 const AUCTION_MIN_BIDS=Math.max(0,Number(process.env.AUCTION_MIN_BIDS??1));
 function auctionInWindow(x){
   const a=listingAuction(x);
@@ -8597,6 +8599,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const exact={brand:d.brand,family:d.model,exact_variant_label:d.variant,size:d.size,material:d.material,main_color:d.colour,hardware:d.hardware,
     condition:{grade:d.condition_grade||null},target_match:d.target_match!==false,confidence:Number(d.confidence)||null};
   let verification={status:confirmed?'verified':'screen_only',match_version:MATCH_VERSION,preliminary_decision:dec.decision,exact,
+    analyzed_price_eur:roundMoney(Number(item.price_eur)),
     marketplace_verification:marketplaceVerification,
     market:{match_version:MATCH_VERSION,
       sheet_comps:unprofitableAnyway?null:referenceCompsForAlert(basePrice,{tab:baseInfo.tab,model:baseInfo.model,source:'base'}),
@@ -10176,7 +10179,8 @@ function storePrescreenReject(taskId,item,pre){
     notes:`Descartado por pre-filtro determinista (${pre.code}: ${pre.term}) sin llamar a Gemini.`,
     prescreen:pre
   };
-  storeTaskAnalysis(taskId,item,a,'REJECT',{status:'not_required',prescreen:pre},now);
+  // Descartado por precio: si baja, se vuelve a valorar (el resto de descartes no dependen del precio).
+  storeTaskAnalysis(taskId,item,a,'REJECT',{status:'not_required',prescreen:pre,...(pre.code==='price_ceiling'?{analyzed_price_eur:roundMoney(Number(item.price_eur))}:{})},now);
 }
 
 // Mediana del precio pedido en los anuncios que esta tarea ha visto en los
@@ -11730,15 +11734,26 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       );
     }
 
-    const previousAnalyzedAnywhere=db.prepare(`
-      DELETE FROM search_session_items
-      WHERE session_id=?
-        AND listing_id IN (
-          SELECT listing_id FROM task_analyses
-          UNION
-          SELECT listing_id FROM analyses
-        )
-    `).run(result.sessionId);
+    // Ya analizados: fuera, salvo que el precio haya cambiado desde el
+    // análisis (regla de Nil, 07-11-2026). Las pujas de una subasta no cuentan.
+    const priceChangedIds=new Set();
+    {
+      const lastPrice=db.prepare(`SELECT json_extract(verification_json,'$.analyzed_price_eur') p FROM task_analyses WHERE listing_id=? AND json_extract(verification_json,'$.analyzed_price_eur') IS NOT NULL ORDER BY updated_at DESC LIMIT 1`);
+      const rows=db.prepare(`SELECT l.id,l.price_eur,l.raw_json FROM search_session_items s JOIN listings l ON l.id=s.listing_id
+        WHERE s.session_id=? AND (EXISTS(SELECT 1 FROM task_analyses ta WHERE ta.listing_id=l.id) OR EXISTS(SELECT 1 FROM analyses a WHERE a.listing_id=l.id))`).all(result.sessionId);
+      for(const r of rows){
+        if(listingAuction(r))continue;
+        const was=Number(lastPrice.get(r.id)?.p), now=Number(r.price_eur);
+        if(was>0&&now>0&&Math.abs(now-was)/was>=PRICE_CHANGE_REVALUE)priceChangedIds.add(Number(r.id));
+      }
+    }
+    const previousAnalyzedAnywhere={changes:0};
+    {
+      const del=db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?');
+      const ids=db.prepare(`SELECT s.listing_id id FROM search_session_items s WHERE s.session_id=? AND (EXISTS(SELECT 1 FROM task_analyses ta WHERE ta.listing_id=s.listing_id) OR EXISTS(SELECT 1 FROM analyses a WHERE a.listing_id=s.listing_id))`).all(result.sessionId);
+      for(const {id} of ids)if(!priceChangedIds.has(Number(id))){del.run(result.sessionId,id);previousAnalyzedAnywhere.changes++;}
+    }
+    if(priceChangedIds.size)console.log(`Task ${taskId}: ${priceChangedIds.size} anuncio(s) ya analizado(s) con el precio cambiado: se vuelven a valorar.`);
 
     if(previousAnalyzedAnywhere.changes){
       console.log(
@@ -11759,7 +11774,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
 
     // Apartar de esta ejecución los anuncios que esta misma tarea ya analizó.
     // El listing y su análisis permanecen guardados en el histórico.
-    const previousAnalyzed = db.prepare(`
+    const previousAnalyzed = priceChangedIds.size?{changes:0}:db.prepare(`
       DELETE FROM search_session_items
       WHERE session_id=?
         AND listing_id IN (
@@ -11798,7 +11813,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           'SELECT decision,verification_json FROM task_analyses WHERE task_id=? AND listing_id=?'
         ).get(taskId,item.id);
 
-        if(!existingAnalysis){
+        if(!existingAnalysis||priceChangedIds.has(Number(item.id))){
           const pre=deterministicPrescreen(item,task)||priceCeilingVeto(item,task);
           if(pre){
             storePrescreenReject(taskId,item,pre);
