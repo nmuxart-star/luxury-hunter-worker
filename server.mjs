@@ -1029,7 +1029,9 @@ function recordAiSpend(model,purpose,body){
 // un 15 % y el resto se va liberando por horas (lo no gastado se acumula).
 // Así el arranque del día no se come todo el importe. AI_PACE=off lo desactiva.
 function aiPaceShare(){
-  if(String(process.env.AI_PACE||'').toLowerCase()==='off')return 1;
+  // Sin reparto por horas salvo AI_PACE=on (regla de Nil, 07-11-2026: que no
+  // se limite lo que se enseña por hora; el tope es el del día).
+  if(!['on','1','true','yes'].includes(String(process.env.AI_PACE||'').toLowerCase()))return 1;
   const start=Math.min(1,Math.max(0,Number(process.env.AI_PACE_START_SHARE??0.15)));
   const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Madrid',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).map(x=>[x.type,x.value]));
   const hours=Number(p.hour)+Number(p.minute)/60;
@@ -2169,6 +2171,15 @@ function ebayLargeImage(url){
 }
 
 const AUCTION_MAX_HOURS=Math.max(1,Number(process.env.AUCTION_MAX_HOURS||72));
+// SUBASTAS QUE SE ENSEÑAN (regla de Nil, 07-11-2026): como mucho
+// AUCTION_SHOW_HOURS (2 h) para terminar y AUCTION_MIN_BIDS (1) puja o más.
+const AUCTION_SHOW_HOURS=Math.max(0.5,Number(process.env.AUCTION_SHOW_HOURS||2));
+const AUCTION_MIN_BIDS=Math.max(0,Number(process.env.AUCTION_MIN_BIDS??1));
+function auctionInWindow(x){
+  const a=listingAuction(x);
+  if(!a?.live)return false;
+  return a.endMs-Date.now()<=AUCTION_SHOW_HOURS*3600e3&&(Number(a.bids)||0)>=AUCTION_MIN_BIDS;
+}
 // Datos de subasta de un anuncio (de su raw_json), con live=true si aún no ha terminado.
 // ── SUBASTAS: PUJA MÁXIMA ───────────────────────────────────────────────
 // La puja máxima es el precio más alto que aún deja AUCTION_MIN_PROFIT_EUR
@@ -3243,7 +3254,7 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
       }
       const parsed=listed||parseOneMapAuctions(snap.html);
       const cards=parsed
-        .filter(c=>c.timeLeftMs>=minLeftMs&&c.timeLeftMs<=AUCTION_MAX_HOURS*3600e3)
+        .filter(c=>c.timeLeftMs>=minLeftMs&&c.timeLeftMs<=AUCTION_SHOW_HOURS*3600e3&&(Number(c.bids)||0)>=AUCTION_MIN_BIDS)
         .filter(c=>{
           const eur=toEur(c.currentBid,'JPY');
           return eur!=null&&
@@ -4136,7 +4147,7 @@ async function searchJapanRadarLive(opts){
 
   // Mercari necesita un navegador para cargar los anuncios con JavaScript.
   const activeSpecs=japanSearchSpecs();
-  if(activeSpecs.some(spec=>spec.mode==='browser'))try{
+  if(!opts.auctionLane&&activeSpecs.some(spec=>spec.mode==='browser'))try{
     const {chromium}=await import('playwright');
 
     browser=await chromium.launch({
@@ -4167,7 +4178,7 @@ async function searchJapanRadarLive(opts){
     }catch(e){
       perSource['yahoo-auctions-jp']={ok:false,kept:0,error:e.message};
     }
-    for(const spec of activeSpecs){
+    for(const spec of (opts.auctionLane?[]:activeSpecs)){
       try{
         const result=await searchJapanSource(
           spec,
@@ -9182,8 +9193,10 @@ async function globalSearch(body) {
   const product=String(body.product||body.product_query||'').trim();
   if(!product) throw new Error('Escribe el producto que quieres buscar.');
   // Carril rápido: solo Xianyu y Mercari, los anuncios más nuevos primero.
-  const fastLane=!!body.fast;
-  const sources=fastLane?['xianyu','buyee']:Array.isArray(body.sources)&&body.sources.length?body.sources:['xianyu','bunjang','buyee'];
+  // Pasada de subastas: solo Yahoo por One Map (las que acaban en ≤2 h).
+  const auctionLane=body.fast==='auction';
+  const fastLane=!!body.fast&&!auctionLane;
+  const sources=auctionLane?['buyee']:fastLane?['xianyu','buyee']:Array.isArray(body.sources)&&body.sources.length?body.sources:['xianyu','bunjang','buyee'];
   const sessionId=randomUUID();
   const startedAt=new Date().toISOString();
 
@@ -9235,7 +9248,7 @@ async function globalSearch(body) {
     pages:clampInt(body.pages??body.max_pages,1,1,5),maxItems:clampInt(body.maxItems??body.max_items,20,5,100),
     minEur:body.minEur??body.min_eur??null,maxEur:body.maxEur??body.max_eur??null,sessionId,product,
     personalOnly:!!body.personal_only,freeShipping:!!body.free_shipping,newPublishOption:body.new_publish_option||null,region:body.region||null,
-    accountStateFile:body.account_state_file||null,accountStrategy:body.account_strategy||'auto',fastLane
+    accountStateFile:body.account_state_file||null,accountStrategy:body.account_strategy||'auto',fastLane,auctionLane
   };
   // Todas las fuentes a la vez; cada una guarda cuánto ha tardado (ms).
   const jobs=[];
@@ -11213,7 +11226,7 @@ async function sendInstantAlerts(task,runId,items){
   // Interesantes sin referencias iguales: aviso sin pronóstico (subastas incluidas).
   await sendNoRefAlerts(task,runId,items).catch(e=>console.error('Avisos sin pronóstico:',e.message));
   // Las subastas en curso van por su propio aviso, con la puja máxima.
-  const auctionItems=(items||[]).filter(x=>listingAuction(x)?.live);
+  const auctionItems=(items||[]).filter(x=>auctionInWindow(x));
   if(auctionItems.length)await sendAuctionAlerts(task,runId,auctionItems).catch(e=>console.error('Avisos de subasta:',e.message));
   items=(items||[]).filter(x=>!listingAuction(x)?.live);
   const decisions=envList('INSTANT_ALERT_DECISIONS',['STRONG BUY','BUY']);
@@ -11424,7 +11437,7 @@ async function sendNoRefAlerts(task,runId,items){
     if(v.final?.no_refs_interesting!==true||Number(v.final?.resale_mean_eur)>0)return false;
     if(String(x.decision||'').toUpperCase()==='REJECT')return false;
     const auc=listingAuction(x);
-    if(auc&&!auc.live)return false;
+    if(auc&&!auctionInWindow(x))return false;
     if(noPriceVeto(x))return false;
     if(listingFeedback(x.id)==='not_interested')return false;
     return !already.get(Number(x.id));
@@ -11739,7 +11752,12 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       // Lo más barato respecto a la mediana de la tarea se analiza primero,
       // así una buena oferta no espera detrás de anuncios caros.
       const prioritized=prioritizeForAnalysis(taskId,pendingItems);
-      pendingItems=prioritized.items;
+      pendingItems=prioritized.items.filter(x=>{
+        const auc=listingAuction(x);
+        if(!auc?.live||auctionInWindow(x))return true;
+        db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,x.id);
+        return false;
+      });
 
       // Triaje barato antes del análisis completo (desactivable con AI_TRIAGE=0).
       const triageEnabled=!['0','false','off','no'].includes(String(process.env.AI_TRIAGE||'').toLowerCase());
@@ -11787,17 +11805,12 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
         if(live.length){
           const ids=new Set(live.map(x=>x.id));
           live.sort((a,b)=>(Number(listingAuction(b).bids)||0)-(Number(listingAuction(a).bids)||0)||listingAuction(a).endMs-listingAuction(b).endMs);
-          // Tope de subastas por modelo y pasada (07-11-2026: 284 subastas
-          // analizadas en un día se comieron el presupuesto). Solo las que
-          // acaban en AUCTION_ANALYZE_HOURS (36 h) y como mucho
-          // AUCTION_ANALYSIS_MAX_PER_RUN (6), las de más pujas primero; el
-          // resto vuelve en otra pasada.
-          const horizon=Date.now()+Math.max(1,Number(process.env.AUCTION_ANALYZE_HOURS||36))*3600e3;
-          const cap=Math.max(1,Number(process.env.AUCTION_ANALYSIS_MAX_PER_RUN||6));
-          const soon=live.filter(x=>listingAuction(x).endMs<=horizon);
-          const keep=soon.slice(0,cap);
+          // Solo las que interesan ya (regla de Nil): acaban en 2 h o menos y
+          // tienen al menos una puja. Las demás no gastan IA y vuelven cuando
+          // entren en esa ventana.
+          const keep=live.filter(auctionInWindow);
           for(const x of live)if(!keep.includes(x))db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,x.id);
-          if(live.length>keep.length)console.log(`Task ${taskId}: ${keep.length} subastas a analizar ahora (de ${live.length}; el resto en otra pasada).`);
+          if(live.length>keep.length)console.log(`Task ${taskId}: ${keep.length} subastas con ≤${AUCTION_SHOW_HOURS} h y alguna puja (de ${live.length}); el resto no se analiza.`);
           pendingItems=[...pendingItems.filter(x=>x._needsVerification),...keep,...pendingItems.filter(x=>!x._needsVerification&&!ids.has(x.id))];
         }
       }
@@ -12162,7 +12175,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
     db.prepare('UPDATE task_runs SET session_id=?,status=?,source_status_json=?,finished_at=? WHERE id=?').run(result.sessionId,'finished',JSON.stringify({...result.status,email:emailResult}),finished,Number(runId));
     // El carril rápido no cuenta como la revisión completa del modelo.
     if(!fast)db.prepare('UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?').run(finished,finished,taskId);
-    else{const m=getSetting('fast_lane_last',{})||{};m[taskId]=finished;saveSetting('fast_lane_last',m);}
+    else{const key=fast==='auction'?'auction_lane_last':'fast_lane_last';const m=getSetting(key,{})||{};m[taskId]=finished;saveSetting(key,m);}
     return {runId,sessionId:result.sessionId,count:finalItems.length,status:result.status,email:emailResult,fast};
   }catch(e){
     const finished=new Date().toISOString();
@@ -13881,10 +13894,11 @@ const server=http.createServer(async(req,res)=>{
       const taskId=Number(tr[1]); const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId)); if(!task)return json(res,404,{error:'Tarea no encontrada'});
       if(runningTaskIds.has(taskId))return json(res,409,{error:'La tarea ya está ejecutándose.'});
       const rbody=await readBody(req).catch(()=>({}));
-      const fast=!!rbody?.fast;
+      const fast=rbody?.fast==='auction'?'auction':!!rbody?.fast;
       if(fast){
-        const last=Date.parse((getSetting('fast_lane_last',{})||{})[taskId]||'')||0;
-        const every=Math.max(5,Number(process.env.FAST_LANE_MINUTES||20));
+        const key=fast==='auction'?'auction_lane_last':'fast_lane_last';
+        const last=Date.parse((getSetting(key,{})||{})[taskId]||'')||0;
+        const every=Math.max(5,Number(fast==='auction'?process.env.AUCTION_LANE_MINUTES||30:process.env.FAST_LANE_MINUTES||20));
         if(Date.now()-last<every*60e3)return json(res,200,{skipped:true,next_in_min:Math.ceil((last+every*60e3-Date.now())/60e3)});
       }
       const rr=db.prepare('INSERT INTO task_runs(task_id,status,started_at) VALUES(?,?,?)').run(taskId,'queued',new Date().toISOString());

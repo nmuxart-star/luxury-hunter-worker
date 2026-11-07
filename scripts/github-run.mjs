@@ -201,6 +201,23 @@ try{
         }catch(e){console.error(`FAILED rápido ${task.task_name}:`,e?.message||e);}
       });
     }
+    // Pasada de subastas (regla de Nil, 07-11-2026): en cada ciclo, todos los
+    // modelos activos buscan en One Map las subastas que acaban en ≤2 h y
+    // tienen alguna puja. Solo One Map por el Chrome del Mac, sin Mercari ni Xianyu.
+    if(!['0','off','false','no'].includes(String(process.env.AUCTION_LANE||'').toLowerCase())){
+      const full=new Set(runnable.map(t=>t.id));
+      const auctionList=tasks.filter(t=>t.enabled&&!full.has(t.id)&&(t.sources||[]).includes('buyee')&&(t.japan_queries||[]).length);
+      await runPool(auctionList,Math.min(2,TASK_CONCURRENCY),async task=>{
+        try{
+          const q=await api('POST',`/api/tasks/${task.id}/run`,{fast:'auction'});
+          if(q.skipped)return;
+          anyTaskStarted=true;
+          console.log(`\n=== SUBASTAS ${task.task_name} (One Map, ≤2 h) ===`);
+          const run=await waitRun(q.runId);
+          console.log(`DONE subastas ${task.task_name}: ${run.status}`);
+        }catch(e){console.error(`FAILED subastas ${task.task_name}:`,e?.message||e);}
+      });
+    }
     const estimate=taskMinutesEstimate();
     let started=0;
     const canStart=task=>{
