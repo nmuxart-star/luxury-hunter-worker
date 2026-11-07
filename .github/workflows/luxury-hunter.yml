@@ -89,7 +89,7 @@ jobs:
       TASK_CONCURRENCY: ${{ vars.TASK_CONCURRENCY || '4' }}
       # Carril rápido: Xianyu + Mercari, lo más nuevo, cada FAST_LANE_MINUTES.
       # Los 5 modelos que más rotan en Vestiaire (medido el 07-11-2026).
-      FAST_TASKS: ${{ vars.FAST_TASKS || 'Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Louis Vuitton Speedy 25,Louis Vuitton Pochette Accessoires' }}
+      FAST_TASKS: ${{ vars.FAST_TASKS || 'Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Lady Dior,Gucci Jackie' }}
       FAST_LANE_MINUTES: ${{ vars.FAST_LANE_MINUTES || '20' }}
       LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '0' }}
       # Cada ejecución, como mucho 38 min de tareas (+~6 min de preparación).
