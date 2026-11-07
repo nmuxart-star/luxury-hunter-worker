@@ -187,6 +187,18 @@ test('análisis: sin ninguna igual y buen anuncio → interesante sin pronóstic
   assert.equal(a.no_refs_interesting,true);
   assert.match(a.decision_reasons_es[0],/sin pronóstico/);
 });
+test('análisis: aunque la primera lectura no elija ninguna, las más parecidas de la base pasan por la foto y se usa la igual',async()=>{
+  const h=harness({screen:{base_same:[],base_similar:[],vestiaire_same:[]},photo:{same:['B2']}});
+  const a=await h.run();
+  const checks=h.prompts.filter(p=>/reference checker/.test(p.text));
+  assert.equal(checks.length,1);
+  assert.equal(checks[0].purpose,'verify');                 // siempre con el modelo bueno
+  assert.match(checks[0].text,/B2 \| Lady Dior/);
+  const v=h.stored[0][4];
+  assert.equal(JSON.stringify(v.market.photo_check.same),JSON.stringify(['B2']));
+  assert.ok(a.resale_mean_eur>0);
+  assert.equal(a.no_refs_interesting,false);
+});
 test('análisis: con posibles iguales pero sin beneficio ni contándolas todas → descartado, no "sin referencias"',async()=>{
   const h=harness({landed:3000,screen:{base_same:['B1'],base_similar:['B2','B3'],vestiaire_same:['V1']},photo:{same:['B1']}});
   const a=await h.run();

@@ -8348,13 +8348,24 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   // contando todas las posibles (o solo las seguras), podría salir rentable.
   const promising=d=>['STRONG BUY','BUY','WATCH'].includes(evaluate(d).dec.decision);
   const byCode=new Map([...base,...live].map(r=>[r._code,r]));
-  const poolAll=[...sameB,...sameV,...simB,...simV].map(c=>byCode.get(c)).filter(Boolean);
+  const picked=[...sameB,...sameV,...simB,...simV].map(c=>byCode.get(c)).filter(Boolean);
+  // PRECISIÓN (regla de Nil, 07-11-2026): que no se escape ninguna igual. La
+  // primera lectura es solo de texto con el modelo barato y puede pasar por
+  // alto referencias iguales; detrás de las que eligió se añaden las más
+  // parecidas de la base y de Vestiaire (misma talla, material y color
+  // primero) hasta 2 rondas de fotos, y el modelo bueno las mira una a una.
+  const pickedSet=new Set(picked.map(r=>r._code));
+  const fill=s1.target_match===false?[]:[...rankByIdentity(base,s1),...rankByIdentity(live,s1)]
+    .filter(r=>!pickedSet.has(r._code)).slice(0,Math.max(0,REF_PHOTO_MAX*2-picked.length));
+  const poolAll=[...picked,...fill];
   let d={...s1,base_same:[],vestiaire_same:[]};
   let confirmed=false, photoCheck=null, unprofitableAnyway=null;
-  const optimistic={...s1,base_same:[...sameB,...simB],vestiaire_same:[...sameV,...simV]};
+  const fillB=fill.filter(r=>r._code.startsWith('B')).map(r=>r._code), fillV=fill.filter(r=>r._code.startsWith('V')).map(r=>r._code);
+  const optimistic={...s1,base_same:[...sameB,...simB,...(picked.length?[]:fillB)],vestiaire_same:[...sameV,...simV,...(picked.length?[]:fillV)]};
   if(poolAll.length&&(promising(optimistic)||promising({...s1,base_same:sameB,vestiaire_same:sameV}))){
-    const strong=verifyBudgetLeftUsd()>0;
-    if(strong)verifyTierStore.enterWith('full');
+    // Siempre con el modelo bueno: la precisión del precio depende de esto.
+    const strong=true;
+    verifyTierStore.enterWith('full');
     // Hasta dos rondas de fotos: si en la primera no sale ninguna igual y
     // quedan candidatas, se miran las siguientes.
     const checked=[],same=[],notSame={};let photos=0,pd={};
