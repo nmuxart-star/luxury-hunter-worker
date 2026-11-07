@@ -876,11 +876,11 @@ const manualAiStore=new AsyncLocalStorage();
 // reparto por horas del presupuesto (puede adelantar hasta un 25 % del día).
 const auctionAiStore=new AsyncLocalStorage();
 // REPARTO BOLSOS / RELOJES (regla de Nil, 07-11-2026): el presupuesto de IA
-// del día se divide AI_WATCH_SHARE (50 %) para relojes y el resto para bolsos,
-// cada mitad con su propio reparto por horas.
+// del día se divide AI_WATCH_SHARE (25 %) para relojes y el resto (75 %) para
+// bolsos (Nil, 07-11-2026).
 const aiCategoryStore=new AsyncLocalStorage();
 function aiCategoryShare(cat){
-  const w=Math.max(0,Math.min(1,Number(process.env.AI_WATCH_SHARE??0.5)));
+  const w=Math.max(0,Math.min(1,Number(process.env.AI_WATCH_SHARE??0.25)));
   return cat==='watch'?w:1-w;
 }
 
@@ -1037,9 +1037,15 @@ function aiPaceShare(){
   const hours=Number(p.hour)+Number(p.minute)/60;
   return Math.min(1,start+(1-start)*hours/24);
 }
-function assertAiBudget(){
+function assertAiBudget(purpose=''){
   const budget=aiDailyBudgetUsd();
   const spend=getAiSpend();
+  // TRIAJE SIEMPRE (Nil, 07-11-2026): el triaje barato sigue aunque se acabe
+  // el presupuesto del día, con una reserva aparte (AI_TRIAGE_RESERVE_USD).
+  if(purpose==='triage'&&!manualAiStore.getStore()){
+    const reserve=Math.max(0,Number(process.env.AI_TRIAGE_RESERVE_USD??0.4));
+    if(spend.usd<budget+reserve&&spend.usd<aiMonthlyAllowanceTodayUsd())return;
+  }
   // Lo que Nil pide a mano no espera al reparto por horas ni al tope diario:
   // cuenta en el gasto y solo se para con el tope mensual.
   if(manualAiStore.getStore()){
@@ -1165,7 +1171,7 @@ function openaiMarketSearchDomains(){
 }
 
 async function openaiResponsesRequest({key,model,parts,webSearch=false,json=true,purpose='verify'}){
-  assertAiBudget();
+  assertAiBudget(purpose);
   const pc=openaiPurposeConfig(purpose,model);
   const payload={
     model:pc.model,
@@ -11425,6 +11431,50 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
   return {sent};
 }
 
+// ── SOLO TRIAJE (presupuesto de IA agotado) ────────────────────────────
+// Pasa el triaje barato pero ya no queda IA para compararlo con la base:
+// se enseña tal cual (compras y subastas en ventana), una vez por anuncio.
+function triageOnlyText(x){
+  const auc=listingAuction(x);
+  const eco=(()=>{try{return importEconomics(x);}catch{return null;}})();
+  const ends=auc?.live&&Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):null;
+  return [
+    auc?.live?auctionHotLine(auc.bids):'',
+    `🟡 <b>PASA EL TRIAJE · sin analizar</b> · ${htmlEsc(x._task_name||'')}`,
+    `<b>${htmlEsc(String(x.title||'').slice(0,160))}</b>`,
+    `${htmlEsc(x.purchase_via||x.source||'')} · <b>${fmtMoney(x.original_price,x.currency)}</b> (≈ ${eur0(x.price_eur)})`,
+    auc?.live?`🔨 Subasta: ${auc.bids||0} puja${auc.bids===1?'':'s'} · termina ${ends} (en ${Math.max(0,Math.round((auc.endMs-Date.now())/60e3))} min)`:'',
+    eco?.importedTotalEur?`Coste puesto en España${auc?.live?' con la puja actual':''}: ${eur0(eco.importedTotalEur)}`:'',
+    `Triaje: ${x._triageScore}/100${x._triageReason?` · ${htmlEsc(String(x._triageReason).slice(0,200))}`:''}`,
+    '⚠️ Presupuesto de IA de hoy agotado: no se ha comparado con tu base ni con fotos.',
+    x.url?`📱 <a href="${htmlEsc(listingAppLink(x))}">Abrir el anuncio</a>`:''
+  ].filter(Boolean).join('\n');
+}
+async function sendTriageOnlyAlerts(task,runId,items){
+  if(['0','false','off','no'].includes(String(process.env.TRIAGE_ONLY_ALERTS||'').toLowerCase()))return {sent:0,reason:'disabled'};
+  if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
+  const already=db.prepare('SELECT 1 FROM notifications WHERE listing_id=? LIMIT 1');
+  const picks=(items||[]).filter(x=>{
+    const auc=listingAuction(x);
+    if(auc&&!auctionInWindow(x))return false;
+    if(noPriceVeto(x))return false;
+    if(listingFeedback(x.id)==='not_interested')return false;
+    return !already.get(Number(x.id));
+  }).sort((a,b)=>(b._triageScore??0)-(a._triageScore??0)).map(x=>({...x,_task_name:task.task_name}));
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'triage','telegram',?)`);
+  let sent=0;
+  for(const x of picks){
+    try{
+      await telegramSendListing(triageOnlyText(x),x);
+      mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
+      sent++;
+      await sleep(800);
+    }catch(e){console.error('Aviso del triaje:',e.message);}
+  }
+  if(sent)console.log(`Task ${task.id}: ${sent} anuncio(s) que pasan el triaje enviados sin analizar (presupuesto de IA agotado).`);
+  return {sent};
+}
+
 // ── SIN PRONÓSTICO ─────────────────────────────────────────────────────
 // Revisada la base entera y Vestiaire sin encontrar ninguna igual: si el
 // anuncio es el producto buscado y está bien, se avisa sin precio de venta.
@@ -11771,7 +11821,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           for(const item of toTriage){
             const t=triage.scores.get(item.id);
             if(!t){unscored++;keep.add(item.id);continue;}
-            item._triageScore=t.score;
+            item._triageScore=t.score;item._triageReason=t.reason;
             if(t.score>=triage.minScore){kept++;keep.add(item.id);}
             else{
               rejected++;
@@ -12064,6 +12114,13 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           : null
       };
 
+      // Presupuesto agotado: los que pasaron el triaje y no se han podido
+      // analizar se enseñan igual, sin más proceso (regla de Nil).
+      if(capacityError?.aiBudget){
+        const has=db.prepare('SELECT 1 FROM task_analyses WHERE task_id=? AND listing_id=?');
+        const left=pendingItems.filter(x=>!x._needsVerification&&x._triageScore!=null&&!has.get(taskId,x.id));
+        if(left.length)await sendTriageOnlyAlerts(task,runId,left).catch(e=>console.error('Avisos del triaje:',e.message));
+      }
       if(capacityError?.aiPace){
         console.log(`Task ${taskId}: ${capacityError.message}`);
       }else if(capacityError?.aiBudget){
