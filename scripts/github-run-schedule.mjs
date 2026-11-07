@@ -37,7 +37,7 @@ export function nextDueTask(tasks,now=Date.now()){
 // (reloj, bolso, reloj, bolso...) para que los relojes no se queden siempre
 // a la cola. Como máximo `maxWatches` relojes por ejecución (por nivel y
 // antigüedad); el resto pasa a la siguiente.
-export const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon)|\biwc\b|jaeger|breitling|patek|audemars|panerai|tag heuer|\bheuer\b|\breloj|\bwatch/i;
+export const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon|panth)|\biwc\b|jaeger|breitling|patek|audemars|panerai|tag heuer|\bheuer\b|\breloj|\bwatch/i;
 export function isWatchTaskName(name){return WATCH_TASK_RE.test(String(name||''));}
 export function planCycle(runnable,{maxWatches=Infinity}={}){
   const priority=t=>Number(t.interval_minutes)||Infinity;

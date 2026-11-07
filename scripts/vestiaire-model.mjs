@@ -68,7 +68,7 @@ const SIZE_WORDS=/\b(mini bolso|bolso|bandolera|boston|cabas|nano|mini|micro|sma
 const modelName=t=>modelNorm(t).replace(/[-_\/]/g,' ').replace(SIZE_WORDS,' ').replace(/^de (cuero|lona)$/,'').replace(/[^a-z0-9 .\-]/g,' ').replace(/\s+/g,' ').trim();
 // Para comparar nombres: singular y plural iguales ("Accessoire" = "Accessoires").
 const sing=t=>String(t||'').replace(/\b([a-z]{4,})s\b/g,'$1');
-const isWatchTab=tab=>/omega|cartier|tudor|seiko|tag heuer|rolex|reloj|watch|speedmaster|seamaster/i.test(tab||'');
+const isWatchTab=tab=>/omega|cartier|tudor|seiko|tag heuer|rolex|reloj|watch|speedmaster|seamaster|breitling|iwc|panerai/i.test(tab||'');
 
 function singleKey(spec,text,{vintage=false,requireBase=false,formatText=null}={}){
   const [,base,baseRe,variants]=spec;

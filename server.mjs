@@ -396,7 +396,7 @@ function saveEconomics(value){
 function roundMoney(n){ return Math.round((Number(n)+Number.EPSILON)*100)/100; }
 // Relojes (arancel propio): palabras genéricas de reloj en cada idioma y las
 // marcas/modelos que se buscan. Los bolsos de estas marcas no las llevan.
-const WATCH_ITEM_RE=/腕時計|ウォッチ|手表|腕表|機械表|机械表|시계|\bwristwatch|\bwatch\b|クロノグラフ|chronograph|speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|rolex|ロレックス|劳力士|롤렉스|tudor|チューダー|チュードル|帝舵|튜더|grand seiko|グランドセイコー|冠蓝狮|그랜드세이코|santos de cartier|cartier (santos|tank|ballon)|tag heuer|タグホイヤー|泰格豪雅|태그호이어|サントス|タンク(フランセーズ|マスト|ソロ)|山度士|坦克|蓝气球|오메가|オメガ|欧米茄/i;
+const WATCH_ITEM_RE=/腕時計|ウォッチ|手表|腕表|機械表|机械表|시계|\bwristwatch|\bwatch\b|クロノグラフ|chronograph|speedmaster|seamaster|スピードマスター|シーマスター|超霸|海马表|스피드마스터|rolex|ロレックス|劳力士|롤렉스|tudor|チューダー|チュードル|帝舵|튜더|grand seiko|グランドセイコー|冠蓝狮|그랜드세이코|santos de cartier|cartier (santos|tank|ballon|panth)|tag heuer|タグホイヤー|泰格豪雅|태그호이어|サントス|タンク(フランセーズ|マスト|ソロ)|山度士|坦克|蓝气球|오메가|オメガ|欧米茄/i;
 function importEconomics(item, settings=getEconomics()){
   const product=finiteOr(item?.price_eur,0);
   const rawSource=String(item?.source||'').toLowerCase();
@@ -872,6 +872,9 @@ const OPENAI_IMAGE_TYPES=new Set(['image/jpeg','image/png','image/webp','image/g
 const verifyTierStore=new AsyncLocalStorage();
 // Análisis que Nil pide a mano por Telegram (enlace + precio negociado).
 const manualAiStore=new AsyncLocalStorage();
+// Subastas en curso: acaban a una hora fija, así que su análisis no espera al
+// reparto por horas del presupuesto (puede adelantar hasta un 25 % del día).
+const auctionAiStore=new AsyncLocalStorage();
 
 function openaiPurposeConfig(purpose,requestedModel){
   const cheap=process.env.OPENAI_TRIAGE_MODEL||'gpt-6-luna';
@@ -1031,7 +1034,8 @@ function assertAiBudget(){
     }
     return;
   }
-  const paced=budget*aiPaceShare();
+  const advance=auctionAiStore.getStore()?budget*Math.max(0,Math.min(1,Number(process.env.AUCTION_AI_ADVANCE_SHARE??0.25))):0;
+  const paced=budget*aiPaceShare()+advance;
   if(spend.usd<budget&&spend.usd>=paced){
     const err=new Error(`Ritmo de gasto de IA: ${spend.usd.toFixed(2)} $ usados de ${paced.toFixed(2)} $ disponibles a esta hora (${budget.toFixed(2)} $ en todo el día). Los anuncios pendientes se analizan más tarde.`);
     err.geminiCapacity=true;
@@ -3213,7 +3217,9 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
             (minEur==null||eur>=Number(minEur))&&
             (maxEur==null||eur<=Number(maxEur));
         })
-        .sort((a,b)=>a.timeLeftMs-b.timeLeftMs);
+        // Primero las que tienen más pujas (más interesados) y, a igualdad,
+        // las que acaban antes: son las que se abren con ficha completa.
+        .sort((a,b)=>(Number(b.bids)||0)-(Number(a.bids)||0)||a.timeLeftMs-b.timeLeftMs);
       if(!parsed.length&&!listed&&/Search Results:\s*([1-9][\d,]*)\s*Items?/i.test(snap.body)){
         throw new Error('One Map muestra anuncios pero no se pudieron leer las tarjetas');
       }
@@ -3925,6 +3931,7 @@ async function searchJapanSource(
 
   let kept=0;
   let withPublicationDate=0;
+  let knownSkipped=0;
   let detailErrors=0;
   let successfulQueries=0;
   let noPrice=0;
@@ -3987,80 +3994,66 @@ async function searchJapanSource(
       }
 
       let local=0;
-
+      // Ya visto hace poco y con el mismo precio: no se vuelve a abrir la
+      // ficha (Mercari tardaba 11-19 min por modelo abriéndolas todas); solo
+      // se marca como visto. Las nuevas se abren de JAPAN_DETAIL_CONCURRENCY en
+      // JAPAN_DETAIL_CONCURRENCY (3) a la vez.
+      const knownStmt=db.prepare('SELECT id,original_price,price_eur,status,description,last_seen FROM listings WHERE source=? AND source_id=?');
+      const knownHours=Number(process.env.JAPAN_KNOWN_HOURS||48);
+      const inRange=pe=>{
+        if(!Number.isFinite(pe))return true;
+        if(minEur!==null&&minEur!==undefined&&minEur!==''&&Number.isFinite(Number(minEur))&&pe<Number(minEur))return false;
+        if(maxEur!==null&&maxEur!==undefined&&maxEur!==''&&Number.isFinite(Number(maxEur))&&pe>Number(maxEur))return false;
+        return true;
+      };
+      const toDetail=[];
       for(const candidate of candidates){
-        if(kept>=sourceLimit)break;
-
-        const sourceId=japanSourceId(
-          spec.id,
-          candidate.href
-        );
-
+        if(kept+toDetail.length>=sourceLimit)break;
+        const sourceId=japanSourceId(spec.id,candidate.href);
         const dedupeKey=`${spec.id}:${sourceId}`;
-
         if(seen.has(dedupeKey))continue;
         seen.add(dedupeKey);
-
-        let item=null;
-
-        try{
-          item=await japanEnrichCandidate(
-            spec,
-            candidate,
-            {query:q,searchUrl},
-            browserContext
-          );
-        }catch{
-          detailErrors++;
+        const known=spec.mode==='browser'?knownStmt.get(spec.id,String(sourceId)):null;
+        const recent=known&&Date.now()-Date.parse(known.last_seen||0)<=knownHours*3600e3;
+        const samePrice=!candidate.apiPrice||Number(known?.original_price)===Number(candidate.apiPrice);
+        if(recent&&samePrice&&known.status!=='sold'&&String(known.description||'').trim()&&Number(known.original_price)>0){
+          if(!inRange(Number(known.price_eur)))continue;
+          db.prepare('UPDATE listings SET last_seen=? WHERE id=?').run(new Date().toISOString(),known.id);
+          if(sessionId)db.prepare(`INSERT INTO search_session_items(session_id,listing_id,source_query) VALUES(?,?,?)
+            ON CONFLICT(session_id,listing_id) DO UPDATE SET source_query=excluded.source_query`).run(sessionId,known.id,q);
+          local++;kept++;knownSkipped++;
           continue;
         }
-
-        if(item.status==='sold')continue;
-
-        // Sin precio fiable no se guarda: un anuncio a 0 € daría un
-        // beneficio falso y avisos que no lo son.
-        if(!(Number(item.original_price)>0)){
-          noPrice++;
-          continue;
-        }
-
-        const pe=item.price_eur==null?null:Number(item.price_eur);
-        const hasMinEur=
-          minEur!==null&&
-          minEur!==undefined&&
-          minEur!==''&&
-          Number.isFinite(Number(minEur));
-        const hasMaxEur=
-          maxEur!==null&&
-          maxEur!==undefined&&
-          maxEur!==''&&
-          Number.isFinite(Number(maxEur));
-
-        if(
-          hasMinEur&&
-          Number.isFinite(pe)&&
-          pe<Number(minEur)
-        ){
-          continue;
-        }
-
-        if(
-          hasMaxEur&&
-          Number.isFinite(pe)&&
-          pe>Number(maxEur)
-        ){
-          continue;
-        }
-
-        upsertListing(item,sessionId,q);
-
-        local++;
-        kept++;
-
-        if(item.publishedAt){
-          withPublicationDate++;
-        }
+        toDetail.push(candidate);
       }
+      const conc=spec.mode==='browser'?clampInt(process.env.JAPAN_DETAIL_CONCURRENCY||3,3,1,6):1;
+      let next=0;
+      const worker=async()=>{
+        while(next<toDetail.length){
+          const candidate=toDetail[next++];
+          let item=null;
+          try{
+            item=await japanEnrichCandidate(spec,candidate,{query:q,searchUrl},browserContext);
+          }catch{
+            detailErrors++;
+            continue;
+          }
+          if(item.status==='sold')continue;
+          // Sin precio fiable no se guarda: un anuncio a 0 € daría un
+          // beneficio falso y avisos que no lo son.
+          if(!(Number(item.original_price)>0)){
+            noPrice++;
+            continue;
+          }
+          const pe=item.price_eur==null?null:Number(item.price_eur);
+          if(!inRange(pe))continue;
+          upsertListing(item,sessionId,q);
+          local++;
+          kept++;
+          if(item.publishedAt)withPublicationDate++;
+        }
+      };
+      await Promise.all(Array.from({length:Math.min(conc,toDetail.length)},worker));
 
       perQuery.push({
         query:q,
@@ -4092,6 +4085,7 @@ async function searchJapanSource(
     purchaseVia:spec.purchaseVia,
     mode:spec.mode,
     kept,
+    knownSkipped,
     withPublicationDate,
     detailErrors,
     noPrice,
@@ -10753,7 +10747,7 @@ function importCostLines(x){
 // Relojes: se venden en Chrono24 como particular (CHRONO24_COMMISSION_PCT,
 // 6,5 % por defecto); los bolsos en Vestiaire (VESTIAIRE_COMMISSION_PCT, 20 %).
 // Igual que scripts/github-run-schedule.mjs (WATCH_TASK_RE).
-const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon)|\biwc\b|jaeger|breitling|patek|audemars|panerai|tag heuer|\bheuer\b|\breloj|\bwatch/i;
+const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon|panth)|\biwc\b|jaeger|breitling|patek|audemars|panerai|tag heuer|\bheuer\b|\breloj|\bwatch/i;
 function isWatchTask(name){return WATCH_TASK_RE.test(String(name||''));}
 function resalePlatform(taskName){
   return isWatchTask(taskName)
@@ -10961,6 +10955,7 @@ function instantAlertText(x,{soft=false}={}){
   if(known(exact.condition?.grade))seller.push(`Estado: ${htmlEsc(exact.condition.grade)}`);
   const links=[x.url?`📱 <a href="${htmlEsc(listingAppLink(x))}">Abrir en la app</a>`:'',x.url&&listingAppLink(x)!==x.url?`🌐 <a href="${htmlEsc(x.url)}">Ver en la web</a>`:''].filter(Boolean).join('  ·  ');
   const header=[
+    listingAuction(x)?.live?auctionHotLine(listingAuction(x).bids):'',
     `${head} · ${htmlEsc(x._task_name||'')}`,
     `<b>${htmlEsc(x.model||title)}</b>${identified?` · ${htmlEsc(identified)}`:''}`,
     title&&title!==x.model?`<i>${htmlEsc(title.slice(0,140))}</i>`:'',
@@ -11160,6 +11155,7 @@ function auctionAlertText(x,plan){
   const ends=Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
   const maxLocal=plan.max_bid_local!=null?fmtMoney(plan.max_bid_local,plan.currency):eur0(plan.max_bid_eur);
   return [
+    auctionHotLine(plan.bids),
     `🔨 <b>Subasta · puja como máximo ${maxLocal}</b> · ${htmlEsc(x._task_name||'')}`,
     `<b>${htmlEsc(x.model||x.title||'')}</b>`,
     `${htmlEsc(x.purchase_via||x.source||'')} · puja actual ${fmtMoney(plan.current_bid,plan.currency)} (≈ ${eur0(x.price_eur)}) · ${plan.bids||0} puja${plan.bids===1?'':'s'}`,
@@ -11170,6 +11166,13 @@ function auctionAlertText(x,plan){
     ...vestiaireDbLines(x._task_name,x),
     x.url?`<a href="${htmlEsc(listingAppLink(x))}">📱 Abrir la subasta</a>`:''
   ].filter(Boolean).join('\n');
+}
+// Subasta con varios interesados (regla de Nil, 07-11-2026): se destaca
+// arriba del aviso. AUCTION_HOT_BIDS (5) pujas o más.
+const AUCTION_HOT_BIDS=Math.max(2,Number(process.env.AUCTION_HOT_BIDS||5));
+function auctionHotLine(bids){
+  const n=Number(bids)||0;
+  return n>=AUCTION_HOT_BIDS?`🔥🔥 <b>MUCHOS INTERESADOS · ${n} pujas</b>`:'';
 }
 async function sendAuctionAlerts(task,runId,items){
   if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
@@ -11183,7 +11186,8 @@ async function sendAuctionAlerts(task,runId,items){
     if(listingFeedback(x.id)==='not_interested')return false;
     x._auction=plan;x._task_name=task.task_name;
     return !already.get(Number(x.id));
-  }).sort((a,b)=>(b._auction.max_bid_eur-Number(b.price_eur))-(a._auction.max_bid_eur-Number(a.price_eur)));
+  }).sort((a,b)=>(Number(b._auction.bids)>=AUCTION_HOT_BIDS)-(Number(a._auction.bids)>=AUCTION_HOT_BIDS)||
+    (b._auction.max_bid_eur-Number(b.price_eur))-(a._auction.max_bid_eur-Number(a.price_eur)));
   const limited=limitTaskAlerts(task,picks,{kinds:['auction']});
   const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'auction','telegram',?)`);
   let sent=0;
@@ -11572,7 +11576,7 @@ async function executeTask(taskId, runId=null, {fast=false}={}) {
       if(triageEnabled&&toTriage.length){
         setTaskRunProgress(runId,32,'Triaje IA',`${toTriage.length} anuncios nuevos · ${aiTriageModel()}`);
         try{
-          const triage=await triageWithAi(task,toTriage);
+          const triage=await auctionAiStore.run(toTriage.some(x=>listingAuction(x)?.live),()=>triageWithAi(task,toTriage));
           let kept=0,rejected=0,unscored=0;
           const keep=new Set();
           for(const item of toTriage){
@@ -11601,6 +11605,18 @@ async function executeTask(taskId, runId=null, {fast=false}={}) {
           }
           result.status.triage={ok:false,error:e.message};
           console.error(`Task ${taskId}: triaje falló, se usa solo la prioridad por precio:`,e.message);
+        }
+      }
+
+      // Subastas en curso primero (no esperan): antes las que tienen más
+      // pujas (más interesados, donde más se puede rascar) y, a igualdad, las
+      // que acaban antes. El resto mantiene su orden.
+      {
+        const live=pendingItems.filter(x=>!x._needsVerification&&listingAuction(x)?.live);
+        if(live.length){
+          const ids=new Set(live.map(x=>x.id));
+          live.sort((a,b)=>(Number(listingAuction(b).bids)||0)-(Number(listingAuction(a).bids)||0)||listingAuction(a).endMs-listingAuction(b).endMs);
+          pendingItems=[...pendingItems.filter(x=>x._needsVerification),...live,...pendingItems.filter(x=>!x._needsVerification&&!ids.has(x.id))];
         }
       }
 
@@ -11743,12 +11759,12 @@ async function executeTask(taskId, runId=null, {fast=false}={}) {
           };
 
           try{
-            await analyzeWithGemini(
+            await auctionAiStore.run(!!listingAuction(item)?.live,()=>analyzeWithGemini(
               item.id,
               taskId,
               task.analyze_images,
               itemProgress
-            );
+            ));
 
             succeeded++;
             await sleep(250);
