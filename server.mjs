@@ -10162,6 +10162,47 @@ function deterministicPrescreen(item,task=null){
 
 // Limpieza al arrancar: análisis positivos de Xianyu sin 验货宝 pasan a REJECT
 // para que no salgan en avisos, resúmenes ni se vuelvan a verificar.
+// LIMPIEZA DE LA MEMORIA DEL BOT (regla de Nil, 07-11-2026): solo la base
+// interna (SQLite), nunca la hoja de Google. Fuera los anuncios que no se ven
+// desde hace PRUNE_DAYS (7) días con sus análisis, y las búsquedas y registros
+// de más de 7 días. Se quedan los anuncios que llegaron a avisarse o que Nil
+// marcó (✅/❌), para no repetir avisos. Una vez al día, con VACUUM.
+function pruneOldData(){
+  const days=Number(process.env.PRUNE_DAYS??7);
+  if(!(days>0))return;
+  const last=Date.parse(getSetting('prune_last',null)||'');
+  if(Number.isFinite(last)&&Date.now()-last<20*3600e3)return;
+  const cut=new Date(Date.now()-days*864e5).toISOString();
+  const sizeBefore=(()=>{try{return fs.statSync(DB_PATH).size;}catch{return 0;}})();
+  const n={};
+  db.exec('BEGIN');
+  try{
+    db.exec('CREATE TEMP TABLE IF NOT EXISTS prune_ids(id INTEGER PRIMARY KEY)');
+    db.exec('DELETE FROM prune_ids');
+    db.prepare(`INSERT INTO prune_ids(id) SELECT l.id FROM listings l
+      WHERE COALESCE(l.last_seen,l.first_seen,'')<?
+        AND NOT EXISTS(SELECT 1 FROM notifications x WHERE x.listing_id=l.id AND x.kind<>'global-digest')
+        AND NOT EXISTS(SELECT 1 FROM listing_feedback f WHERE f.listing_id=l.id)`).run(cut);
+    for(const t of ['task_analyses','analyses','search_session_items'])
+      n[t]=db.prepare(`DELETE FROM ${t} WHERE listing_id IN (SELECT id FROM prune_ids)`).run().changes;
+    n.digest=db.prepare(`DELETE FROM notifications WHERE kind='global-digest' AND sent_at<?`).run(cut).changes;
+    n.listings=db.prepare('DELETE FROM listings WHERE id IN (SELECT id FROM prune_ids)').run().changes;
+    n.sessions=db.prepare('DELETE FROM search_sessions WHERE started_at<?').run(cut).changes;
+    n.orphans=db.prepare('DELETE FROM search_session_items WHERE session_id NOT IN (SELECT id FROM search_sessions)').run().changes;
+    n.task_runs=db.prepare('DELETE FROM task_runs WHERE started_at<?').run(cut).changes;
+    n.runs=db.prepare('DELETE FROM runs WHERE created_at<?').run(cut).changes;
+    db.exec('COMMIT');
+  }catch(e){
+    try{db.exec('ROLLBACK');}catch{}
+    console.error('Limpieza de la memoria del bot:',e.message);
+    return;
+  }
+  try{db.exec('VACUUM');}catch(e){console.warn('VACUUM:',e.message);}
+  saveSetting('prune_last',new Date().toISOString());
+  const sizeAfter=(()=>{try{return fs.statSync(DB_PATH).size;}catch{return 0;}})();
+  console.log(`Memoria del bot limpiada (> ${days} días): ${n.listings} anuncios, ${n.task_analyses} análisis, ${n.sessions} búsquedas, ${n.task_runs+n.runs} registros. ${Math.round(sizeBefore/1e6)} MB → ${Math.round(sizeAfter/1e6)} MB.`);
+}
+
 function vetoUnverifiableXianyuAnalyses(){
   const rows=db.prepare(`SELECT ta.task_id,l.* FROM task_analyses ta JOIN listings l ON l.id=ta.listing_id
     WHERE (l.source='xianyu' OR l.source LIKE 'ebay-%') AND UPPER(COALESCE(ta.decision,''))<>'REJECT'`).all();
@@ -14229,6 +14270,7 @@ server.listen(PORT,'127.0.0.1',async()=>{
   console.log(`Luxury Hunter v1.7 -> http://127.0.0.1:${PORT}`);
   try{applyAiSpendReset();}catch(e){console.error('AI spend reset:',e.message);}
   try{applyAiMonthSpendReset();}catch(e){console.error('AI month reset:',e.message);}
+  try{pruneOldData();}catch(e){console.error('Limpieza de la memoria del bot:',e.message);}
   try{vetoUnverifiableXianyuAnalyses();}catch(e){console.error('Xianyu veto:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
   if(vestiaireSheetConfigured())await refreshVestiaireSheet({force:true}).catch(()=>{});
