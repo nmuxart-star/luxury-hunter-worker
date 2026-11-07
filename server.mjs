@@ -875,6 +875,14 @@ const manualAiStore=new AsyncLocalStorage();
 // Subastas en curso: acaban a una hora fija, así que su análisis no espera al
 // reparto por horas del presupuesto (puede adelantar hasta un 25 % del día).
 const auctionAiStore=new AsyncLocalStorage();
+// REPARTO BOLSOS / RELOJES (regla de Nil, 07-11-2026): el presupuesto de IA
+// del día se divide AI_WATCH_SHARE (50 %) para relojes y el resto para bolsos,
+// cada mitad con su propio reparto por horas.
+const aiCategoryStore=new AsyncLocalStorage();
+function aiCategoryShare(cat){
+  const w=Math.max(0,Math.min(1,Number(process.env.AI_WATCH_SHARE??0.5)));
+  return cat==='watch'?w:1-w;
+}
 
 function openaiPurposeConfig(purpose,requestedModel){
   const cheap=process.env.OPENAI_TRIAGE_MODEL||'gpt-6-luna';
@@ -1004,6 +1012,13 @@ function recordAiSpend(model,purpose,body){
   bp.usd=Number((bp.usd+usd).toFixed(6));
   bp.calls++;
   state.byPurpose[purpose]=bp;
+  const cat=aiCategoryStore.getStore();
+  if(cat){
+    state.byCategory=state.byCategory||{};
+    const bc=state.byCategory[cat]||{usd:0,calls:0};
+    bc.usd=Number((bc.usd+usd).toFixed(6));bc.calls++;
+    state.byCategory[cat]=bc;
+  }
   addAiMonthSpend(usd);
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('ai_spend',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`)
@@ -1034,7 +1049,25 @@ function assertAiBudget(){
     }
     return;
   }
-  const advance=auctionAiStore.getStore()?budget*Math.max(0,Math.min(1,Number(process.env.AUCTION_AI_ADVANCE_SHARE??0.25))):0;
+  const advanceShare=auctionAiStore.getStore()?Math.max(0,Math.min(1,Number(process.env.AUCTION_AI_ADVANCE_SHARE??0.25))):0;
+  const cat=aiCategoryStore.getStore();
+  if(cat){
+    const label=cat==='watch'?'relojes':'bolsos';
+    const catBudget=budget*aiCategoryShare(cat);
+    const catSpent=Number(spend.byCategory?.[cat]?.usd||0);
+    if(catSpent>=catBudget){
+      const err=new Error(`Presupuesto de IA de ${label} de hoy alcanzado (${catSpent.toFixed(2)} $ de ${catBudget.toFixed(2)} $). Se reanuda mañana.`);
+      err.geminiCapacity=true;err.aiBudget=true;err.aiPace=true;
+      throw err;
+    }
+    const catPaced=catBudget*aiPaceShare()+catBudget*advanceShare;
+    if(catSpent>=catPaced){
+      const err=new Error(`Ritmo de gasto de IA de ${label}: ${catSpent.toFixed(2)} $ usados de ${catPaced.toFixed(2)} $ disponibles a esta hora (${catBudget.toFixed(2)} $ en todo el día). Los anuncios pendientes se analizan más tarde.`);
+      err.geminiCapacity=true;err.aiBudget=true;err.aiPace=true;
+      throw err;
+    }
+  }
+  const advance=budget*advanceShare;
   const paced=budget*aiPaceShare()+advance;
   if(spend.usd<budget&&spend.usd>=paced){
     const err=new Error(`Ritmo de gasto de IA: ${spend.usd.toFixed(2)} $ usados de ${paced.toFixed(2)} $ disponibles a esta hora (${budget.toFixed(2)} $ en todo el día). Los anuncios pendientes se analizan más tarde.`);
@@ -11366,7 +11399,12 @@ async function reportRunHealth(status){
   }
 }
 
-async function executeTask(taskId, runId=null, {fast=false}={}) {
+// Cada tarea gasta de su mitad del presupuesto de IA (bolsos o relojes).
+async function executeTask(taskId, runId=null, opts={}) {
+  const t=db.prepare('SELECT task_name FROM tasks WHERE id=?').get(Number(taskId));
+  return aiCategoryStore.run(isWatchTask(t?.task_name)?'watch':'bag',()=>executeTaskInner(taskId,runId,opts));
+}
+async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
   // Base de datos de Vestiaire de Nil al día antes de analizar (máx. 25 s).
   await Promise.race([refreshVestiaireSheet().catch(()=>{}),sleep(25000)]);
   if(runId && runIsAborted(runId)){
