@@ -8299,7 +8299,9 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
       confirmed=strong;
       photoCheck={checked:pool.map(r=>r._code),same:pc.same,not_same:pd.not_same&&typeof pd.not_same==='object'?pd.not_same:{},photos:pc.photos,model:strong?'verify':'screen'};
     }catch(e){
-      if(isAiPolicyFlag(e))throw e;
+      // Sin presupuesto de IA a esta hora: el anuncio se deja para más tarde
+      // (no se guarda como "sin precio").
+      if(isAiPolicyFlag(e)||e?.aiBudget||e?.geminiCapacity)throw e;
       console.warn('Comprobación de referencias con fotos:',e.message);
       photoCheck={error:String(e.message||e).slice(0,160)};
     }
