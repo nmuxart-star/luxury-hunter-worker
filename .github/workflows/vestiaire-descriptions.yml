@@ -1,0 +1,49 @@
+name: Descripciones visuales Vestiaire
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'backfill = histórico; incremental = filas nuevas o foto cambiada'
+        type: choice
+        options: [backfill, incremental]
+        default: backfill
+      max_rows:
+        description: '20 para prueba; 0 para todas las pendientes'
+        type: number
+        default: 20
+      max_spend_usd:
+        description: 'Límite de coste medido para esta ejecución, en USD'
+        type: number
+        default: 0.10
+      sample_per_tab:
+        description: '1 para probar una foto por pestaña; 0 para procesar todas'
+        type: number
+        default: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vestiaire-visual-descriptions
+  cancel-in-progress: false
+
+jobs:
+  describe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GOOGLE_SHEETS_SA_JSON: ${{ secrets.GOOGLE_SHEETS_SA_JSON }}
+      VESTIAIRE_SHEET_ID: ${{ secrets.VESTIAIRE_SHEET_ID }}
+      VESTIAIRE_VISION_MODE: ${{ inputs.mode }}
+      VESTIAIRE_VISION_MAX_ROWS: ${{ inputs.max_rows }}
+      VESTIAIRE_VISION_MAX_SPEND_USD: ${{ inputs.max_spend_usd }}
+      VESTIAIRE_VISION_SAMPLE_PER_TAB: ${{ inputs.sample_per_tab }}
+      VESTIAIRE_VISION_MONTHLY_CAP_USD: '0.50'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/describe-vestiaire-bags.mjs
