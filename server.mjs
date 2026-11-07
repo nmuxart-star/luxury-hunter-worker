@@ -341,21 +341,22 @@ const DEFAULT_ECONOMICS = {
   vatPercent: 21,
   lowValueThresholdEur: 150,
   lowValueDutyFlatEur: 3,
+  // Gestión aduanera: 25 € fijos en cada importación (lo que cobran a Nil, 07-11-2026).
   sources: {
-    xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0, paymentFeePercent:3, verificationFeeCny:80 },
-    bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
-    buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
+    xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0, paymentFeePercent:3, verificationFeeCny:80 },
+    bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0 },
+    buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0 },
     // One Map: ¥500 de servicio, envío nacional/internacional estimado,
     // autenticación opcional y tasa UE de 2 € por código HS desde 2026-11-01.
-    onemap: { label:'One Map / Yahoo Auctions', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:4, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:10, authenticationFeeEur:15, otherEur:2 },
-    rakuten: { label:'Rakuten / Japón', domesticShippingEur:6, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:8, authenticationFeeEur:0, otherEur:0 },
+    onemap: { label:'One Map / Yahoo Auctions', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:4, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:15, otherEur:2 },
+    rakuten: { label:'Rakuten / Japón', domesticShippingEur:6, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:35, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0 },
     // Dentro de la UE no hay aduana ni IVA de importación; sí conviene autenticar.
     ebay_eu: { label:'eBay / UE', euInternal:true, domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:15, customsDutyPercent:0, clearanceFeeEur:0, authenticationFeeEur:30, otherEur:0 },
     // Vestiaire (dentro de la UE): gastos de servicio del comprador (%) y envío
     // con autenticación. Estimación prudente: ajústala con un pago real.
     vestiaire: { label:'Vestiaire Collective', euInternal:true, domesticShippingEur:0, agentFeePercent:15, agentFeeFixedEur:0, internationalShippingEur:25, customsDutyPercent:0, clearanceFeeEur:0, authenticationFeeEur:0, otherEur:0 },
-    ebay_gb: { label:'eBay / Reino Unido', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:25, customsDutyPercent:3, clearanceFeeEur:15, authenticationFeeEur:30, otherEur:0 },
-    ebay_us: { label:'eBay / EE. UU. y resto', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:45, customsDutyPercent:3, clearanceFeeEur:15, authenticationFeeEur:30, otherEur:0 }
+    ebay_gb: { label:'eBay / Reino Unido', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:25, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:30, otherEur:0 },
+    ebay_us: { label:'eBay / EE. UU. y resto', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:45, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:30, otherEur:0 }
   },
   // Arancel UE partida 4202: piel 3 %; exterior textil/plástico (lona, nailon) 3,7 %.
   textileDutyPercent: 3.7,
@@ -876,11 +877,11 @@ const manualAiStore=new AsyncLocalStorage();
 // reparto por horas del presupuesto (puede adelantar hasta un 25 % del día).
 const auctionAiStore=new AsyncLocalStorage();
 // REPARTO BOLSOS / RELOJES (regla de Nil, 07-11-2026): el presupuesto de IA
-// del día se divide AI_WATCH_SHARE (25 %) para relojes y el resto (75 %) para
+// del día se divide AI_WATCH_SHARE (35 %) para relojes y el resto (65 %) para
 // bolsos (Nil, 07-11-2026).
 const aiCategoryStore=new AsyncLocalStorage();
 function aiCategoryShare(cat){
-  const w=Math.max(0,Math.min(1,Number(process.env.AI_WATCH_SHARE??0.25)));
+  const w=Math.max(0,Math.min(1,Number(process.env.AI_WATCH_SHARE??0.35)));
   return cat==='watch'?w:1-w;
 }
 

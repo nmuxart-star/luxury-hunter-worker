@@ -91,7 +91,7 @@ function singleKey(spec,text,{vintage=false,requireBase=false,formatText=null}={
 // Modelo de una fila de la hoja de esa pestaña (null si no se sabe).
 export function rowModelKey(tab,f){
   if(isWatchTab(tab)){
-    const m=modelName(f?.model);
+    const m=modelName(f?.model)||modelName(String(f?.desc||'').split(/[·,]/)[0]);
     return m||null;
   }
   const single=SINGLE.find(([re])=>re.test(tab));
@@ -100,10 +100,11 @@ export function rowModelKey(tab,f){
     // turn a Bobby in a Lady Dior tab into a Lady Dior.
     const explicit=String(f?.model||'').trim();
     if(explicit&&!singleKey(single,explicit,{requireBase:true}))return modelName(explicit)||null;
-    return singleKey(single,`${explicit} ${f?.size||''} ${f?.notes||''}`,{vintage:!!f?.vintage}).key;
+    // La «Descripción» de la ficha (si Nil la rellena) dice el modelo exacto.
+    return singleKey(single,`${explicit} ${f?.size||''} ${f?.notes||''} ${f?.desc||''}`,{vintage:!!f?.vintage}).key;
   }
   const fixed=MULTI_FIXED.find(([re])=>re.test(tab));
-  if(fixed){const hit=fixed[1].find(([,re])=>re.test(`${f?.model||''} ${f?.size||''} ${f?.notes||''}`));return hit?hit[0]:null;}
+  if(fixed){const hit=fixed[1].find(([,re])=>re.test(`${f?.model||''} ${f?.size||''} ${f?.notes||''} ${f?.desc||''}`));return hit?hit[0]:null;}
   const m=modelName(f?.model||f?.size);
   if(!m||m.length<3)return null;
   const brand=/radar/i.test(tab)?(brandOf(f?.brand)||brandOf(f?.notes)):null;
