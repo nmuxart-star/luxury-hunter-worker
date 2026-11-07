@@ -1,6 +1,11 @@
 name: Descripciones visuales Vestiaire
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/vestiaire-descriptions.yml
+      - scripts/describe-vestiaire-bags.mjs
   workflow_dispatch:
     inputs:
       mode:
@@ -36,10 +41,11 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GOOGLE_SHEETS_SA_JSON: ${{ secrets.GOOGLE_SHEETS_SA_JSON }}
       VESTIAIRE_SHEET_ID: ${{ secrets.VESTIAIRE_SHEET_ID }}
-      VESTIAIRE_VISION_MODE: ${{ inputs.mode }}
-      VESTIAIRE_VISION_MAX_ROWS: ${{ inputs.max_rows }}
-      VESTIAIRE_VISION_MAX_SPEND_USD: ${{ inputs.max_spend_usd }}
-      VESTIAIRE_VISION_SAMPLE_PER_TAB: ${{ inputs.sample_per_tab }}
+      # Push to main performs a bounded pilot; manual dispatch uses its inputs.
+      VESTIAIRE_VISION_MODE: ${{ github.event_name == 'push' && 'backfill' || inputs.mode }}
+      VESTIAIRE_VISION_MAX_ROWS: ${{ github.event_name == 'push' && '0' || inputs.max_rows }}
+      VESTIAIRE_VISION_MAX_SPEND_USD: ${{ github.event_name == 'push' && '0.10' || inputs.max_spend_usd }}
+      VESTIAIRE_VISION_SAMPLE_PER_TAB: ${{ github.event_name == 'push' && '1' || inputs.sample_per_tab }}
       VESTIAIRE_VISION_MONTHLY_CAP_USD: '0.50'
     steps:
       - uses: actions/checkout@v4
