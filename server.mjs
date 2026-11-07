@@ -4674,7 +4674,7 @@ const sheetFormulaUrl=v=>String(v||'').match(/^=\s*(?:IMAGE|HYPERLINK)\(\s*"(htt
 function vestiaireSheetTab(values,today,formulas=null){
   const head=(values[0]||[]).map(h=>String(h||'').trim().toLowerCase());
   const col=name=>head.indexOf(name);
-  const c={photo:col('foto'),link:col('enlace'),brand:col('marca'),model:col('modelo'),likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),desc:col('descripción')>=0?col('descripción'):col('descripcion'),status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
+  const c={photo:col('foto'),link:col('enlace'),brand:col('marca'),model:col('modelo'),likes:col('likes'),ref:col('referencia'),size:col('talla / tipo'),dims:col('medidas (cm)'),material:col('material'),color:col('color'),condition:col('estado'),price:col('precio €'),before:col('precio antes €'),country:col('país'),vintage:col('vintage'),welove:col('we love'),published:col('publicado'),notes:col('notas'),desc:[col('descripción ia'),col('descripcion ia'),col('descripción'),col('descripcion')].find(i=>i>=0)??-1,status:col('estado anuncio'),checked:col('comprobado el'),sold:col('precio venta €'),url:col('url')};
   if(c.ref<0||c.price<0)return null;
   const get=(row,i)=>i>=0?row[i]:'';
   const yes=v=>/^s[ií]|^yes|^true/i.test(String(v||'').trim());
