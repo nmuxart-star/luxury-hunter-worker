@@ -148,3 +148,19 @@ test('precio realista: la media o la mediana, la más baja; el beneficio sale de
   const d=decideFromNumbers({price:p,landed:500,feePct:20,quality:80});
   assert.equal(d.clean,Math.round(p.mid*0.8-500));
 });
+test('oferta al vendedor de Xianyu: abre por debajo y nunca pasa del máximo rentable',()=>{
+  const ctx=vm.createContext({Number,String,Math,process:{env:{}},resalePlatform:()=>({fee:20}),
+    importEconomics:it=>({importedTotalEur:1.3*it.price_eur+65}),eur0:n=>`${Math.round(n)} €`,htmlEsc:s=>String(s)});
+  vm.runInContext(extract('function sellerOfferPlan(','function instantAlertText('),ctx);
+  const x={source:'xianyu',price_eur:800,original_price:6400,model:'Lady Dior'};
+  const v={final:{resale_mean_eur:2000,flaws_zh:'四角轻微磨损'}};
+  const o=ctx.sellerOfferPlan(x,v);
+  assert.equal(o.maxCny,6400);                       // rentable incluso a lo que pide
+  assert.equal(o.openCny,5400);                      // 15 % menos, redondeado a 50
+  assert.match(o.msg,/5400元可以吗/);
+  assert.match(o.msg,/四角轻微磨损/);
+  const tight=ctx.sellerOfferPlan({...x,price_eur:1100,original_price:8800},v);
+  assert.ok(tight.maxCny<8800&&tight.profitMax>=200,JSON.stringify(tight));
+  assert.ok(tight.openCny<tight.maxCny);
+  assert.equal(ctx.sellerOfferPlan({...x,source:'mercari-jp'},v),null);
+});

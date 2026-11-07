@@ -8238,7 +8238,7 @@ For EACH reference decide if it is the SAME PRODUCT as the listing:
 If the reference photo shows another bag or another product, or you cannot tell the size/version apart from the listing (for example mini and regular look alike and nothing confirms it), it is NOT the same. A reference without photo can only be confirmed if its text gives the same size or measurements and version.
 Also re-judge the LISTING with all its photos (no prices): condition, completeness, quality and authenticity risk, as before.
 Return ONLY JSON:
-{"same":["B3","V2"],"not_same":{"B4":"motivo breve en español"},"target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
+{"same":["B3","V2"],"not_same":{"B4":"motivo breve en español"},"flaws_zh":"desgaste visible del ANUNCIO en chino, máx. 15 caracteres (p. ej. 四角轻微磨损); vacío si no se ve ninguno","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
 async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,first}){
   const listing=analyzeImages?await fetchGeminiImageParts(item,4):[];
   const photos=await Promise.all(refs.map(r=>refPhotoPart(r)));
@@ -8303,7 +8303,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     try{
       const pc=await checkReferencePhotos({key,item,task,refs:pool,purpose:strong?'verify':'screen',analyzeImages,first:s1});
       const pd=pc.data;
-      d={...s1,...Object.fromEntries(['target_match','condition_grade','completeness_es','quality_score','authenticity_risk','exotic_skin','decision_reasons_es'].filter(k=>pd[k]!=null&&pd[k]!=='').map(k=>[k,pd[k]])),
+      d={...s1,...Object.fromEntries(['target_match','condition_grade','completeness_es','quality_score','authenticity_risk','exotic_skin','decision_reasons_es','flaws_zh'].filter(k=>pd[k]!=null&&pd[k]!=='').map(k=>[k,pd[k]])),
         base_same:pc.same.filter(c=>c.startsWith('B')),vestiaire_same:pc.same.filter(c=>c.startsWith('V'))};
       confirmed=strong;
       photoCheck={checked:pool.map(r=>r._code),same:pc.same,not_same:pd.not_same&&typeof pd.not_same==='object'?pd.not_same:{},photos:pc.photos,model:strong?'verify':'screen'};
@@ -8327,6 +8327,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     net_profit_low_eur:combined&&landed?roundMoney(combined.low-landed):null,
     net_profit_high_eur:combined&&landed?roundMoney(combined.high-landed):null,
     net_profit_clean_eur:dec.clean,clean_margin_pct:dec.margin,quality_score:Number(d.quality_score)||null,
+    flaws_zh:String(d.flaws_zh||'').replace(/[<>]/g,'').slice(0,20),
     resale_estimate_source:combined?(orientative?'REFERENCIAS_PARECIDAS':combined.source==='base'?'VESTIAIRE_DB':combined.source==='vestiaire'?'VESTIAIRE_LIVE':'VESTIAIRE_DB+LIVE'):'UNAVAILABLE',
     resale_estimate_market_verified:!!combined&&!orientative,
     notes:[d.completeness_es,d.condition_grade].filter(Boolean).join(' · ')
@@ -10800,6 +10801,41 @@ function alertResaleSource(x,v){
   if(src==='MARKET_ANALYSIS')return 'según anuncios de otras webs de reventa';
   return '🔮 estimación sin verificar';
 }
+// OFERTA AL VENDEDOR DE XIANYU (regla de Nil, 07-11-2026): el aviso trae el
+// mensaje en chino listo para copiar. Precio máximo = el que todavía deja el
+// beneficio mínimo de la tarea y el margen mínimo con el precio de venta
+// realista; se abre por debajo (≈15 % menos que lo pedido, como es habitual
+// en Xianyu) y Nil sigue la negociación. No se envía nada solo.
+function sellerOfferPlan(x,v){
+  if(String(x?.source||'')!=='xianyu')return null;
+  const sale=Number(v?.final?.resale_mean_eur);
+  const ask=Number(x.price_eur), askCny=Number(x.original_price);
+  if(!(sale>0)||!(ask>0)||!(askCny>0))return null;
+  const rate=askCny/ask;
+  const fee=resalePlatform(x._task_name).fee/100;
+  const minProfit=Number(x.notify_min_profit_eur)||200, minMargin=Number(process.env.MIN_CLEAN_MARGIN_PCT||20);
+  const at=p=>{const landed=Number(importEconomics({...x,price_eur:p}).importedTotalEur)||0;const clean=sale*(1-fee)-landed;return {clean,landed,ok:clean>=minProfit&&clean>=landed*minMargin/100};};
+  let lo=0,hi=ask;
+  if(!at(lo+1).ok)return null;
+  if(at(hi).ok)lo=hi;else for(let i=0;i<30;i++){const mid=(lo+hi)/2;if(at(mid).ok)lo=mid;else hi=mid;}
+  const down50=c=>Math.max(50,Math.floor(c/50)*50);
+  const maxCny=down50(Math.min(askCny,lo*rate));
+  const openCny=down50(Math.min(askCny*0.85,maxCny*0.92));
+  const model=String(x.model||x._task_name||'').replace(/[<>]/g,'').slice(0,40);
+  const flaws=String(v?.final?.flaws_zh||'').trim();
+  const msg=`您好，诚心想要这只${model}。${flaws?`看图片${flaws}，`:''}${openCny}元可以吗？走验货宝，同意的话我马上拍下付款，不来回砍价。谢谢！`;
+  return {openCny,openEur:Math.round(openCny/rate),maxCny,maxEur:Math.round(maxCny/rate),profitOpen:Math.round(at(openCny/rate).clean),profitMax:Math.round(at(maxCny/rate).clean),msg,minProfit};
+}
+function sellerOfferLines(x,v){
+  const o=sellerOfferPlan(x,v);
+  if(!o)return [];
+  return [
+    `Ofrece <b>¥${o.openCny}</b> (≈ ${eur0(o.openEur)}) → beneficio limpio ${eur0(o.profitOpen)}`,
+    `Tu máximo: <b>¥${o.maxCny}</b> (≈ ${eur0(o.maxEur)}) → beneficio limpio ${eur0(o.profitMax)} (mínimo ${eur0(o.minProfit)})`,
+    'Mensaje para el vendedor (toca para copiar):',
+    `<code>${htmlEsc(o.msg)}</code>`
+  ];
+}
 function instantAlertText(x,{soft=false}={}){
   const cmp=vestiaireCompareSections(x._task_name,x);
   let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
@@ -10858,6 +10894,7 @@ function instantAlertText(x,{soft=false}={}){
       ]),
       pct===null?'':pct>0?`📉 ${pct} % por debajo del precio mediano de este modelo`:`📈 ${Math.abs(pct)} % por encima del precio mediano de este modelo`
     ]),
+    ...alertSection('💬 OFERTA AL VENDEDOR',sellerOfferLines(x,v)),
     ...alertSection('🧾 DESGLOSE DEL COSTE',importCostLines(x)),
     ...alertSection('📚 TU BASE DE DATOS',cmp.base),
     ...alertSection('🌐 VESTIAIRE EN DIRECTO',cmp.live),
