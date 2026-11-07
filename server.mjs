@@ -13,7 +13,7 @@ import {searchJustOneXianyu} from './scripts/justone-xianyu.mjs';
 import {nextXianyuSearchUsage,xianyuBudgetMonth,xianyuBudgetDay,xianyuPaidSearchIntervalMs,
   XIANYU_MONTHLY_SEARCH_LIMIT,XIANYU_DAILY_SEARCH_LIMIT} from './scripts/xianyu-search-budget.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
-import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail} from './scripts/onemap-auctions.mjs';
+import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {strictBagComparables,applyBagSheetPolicy,BAG_SHEET_RULE_VERSION,compWeight,compStats,refAgeDays,weightedQuantile} from './scripts/vestiaire-bag-match.mjs';
 import {MATCH_VERSION,refCandidates,refTable,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
@@ -3183,21 +3183,30 @@ function japanSearchSpecs(){
 async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null,sessionId},browserContext){
   if(!browserContext)return {ok:false,kept:0,error:'Playwright browser unavailable'};
   const selected=normalizeLines(queries||[]).slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4));
-  const detailLimit=clampInt(process.env.ONEMAP_DETAIL_LIMIT||8,8,1,20);
+  const detailLimit=clampInt(process.env.ONEMAP_DETAIL_LIMIT||12,12,1,30);
+  // Lista de One Map: hasta 2 páginas de 100 (las que acaban antes) y se
+  // guardan todas las que dejan tiempo para pujar (≥30 min), no solo 8.
+  const listPages=clampInt(process.env.ONEMAP_LIST_PAGES||2,2,1,3);
+  const listMax=clampInt(process.env.ONEMAP_LIST_MAX||80,80,10,200);
+  const minLeftMs=Math.max(5,Number(process.env.ONEMAP_MIN_LEFT_MIN||30))*60e3;
   const perQueryLimit=Math.max(1,Math.ceil(detailLimit/Math.max(1,selected.length)));
   const perQuery=[];
   const seen=new Set();
-  let kept=0,detailErrors=0;
+  let kept=0,listedOnly=0,detailErrors=0;
   const spec={id:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',detailWaitMs:1000};
   for(const q of selected){
     const searchUrl=oneMapSearchUrl(q);
     try{
-      const snap=await japanBrowserSnapshot(browserContext,searchUrl,4000);
-      if(snap.status>=400||!/JDirectItems Auction/i.test(snap.title)||!/Search Results:/i.test(snap.body)){
-        throw new Error(`One Map no devolvió resultados accesibles (HTTP ${snap.status})`);
+      const snap=await japanBrowserSnapshot(browserContext,`${searchUrl}#lh-json-pages=${listPages}`,4000);
+      let listed=null;
+      try{const j=JSON.parse(snap.body);if(Array.isArray(j?.items))listed=oneMapJsonCards(j.items);}catch{}
+      // Extensión antigua: devuelve la pantalla con las tarjetas de siempre.
+      if(!listed&&(snap.status>=400||!/JDirectItems Auction/i.test(snap.title)||!/Search Results:/i.test(snap.body))){
+        throw new Error(`One Map no devolvió resultados accesibles (HTTP ${snap.status}${snap.body&&snap.status>=400?`: ${String(snap.body).slice(0,80)}`:''})`);
       }
-      const cards=parseOneMapAuctions(snap.html)
-        .filter(c=>c.timeLeftMs>=5*60e3&&c.timeLeftMs<=AUCTION_MAX_HOURS*3600e3)
+      const parsed=listed||parseOneMapAuctions(snap.html);
+      const cards=parsed
+        .filter(c=>c.timeLeftMs>=minLeftMs&&c.timeLeftMs<=AUCTION_MAX_HOURS*3600e3)
         .filter(c=>{
           const eur=toEur(c.currentBid,'JPY');
           return eur!=null&&
@@ -3205,15 +3214,29 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
             (maxEur==null||eur<=Number(maxEur));
         })
         .sort((a,b)=>a.timeLeftMs-b.timeLeftMs);
-      if(!cards.length&&/Search Results:\s*([1-9][\d,]*)\s*Items?/i.test(snap.body)){
+      if(!parsed.length&&!listed&&/Search Results:\s*([1-9][\d,]*)\s*Items?/i.test(snap.body)){
         throw new Error('One Map muestra anuncios pero no se pudieron leer las tarjetas');
       }
+      console.log(`One Map "${q}": ${parsed.length} leídas${listed?' (lista)':' (pantalla)'}, ${cards.length} con tiempo para pujar y en tu rango de precio.`);
       let local=0;
       let queryDetailErrors=0;
+      let detailed=0;
       for(const card of cards){
-        if(kept>=detailLimit||local>=perQueryLimit||kept>=Number(maxItems))break;
+        if(local>=listMax)break;
         if(seen.has(card.id))continue;
         seen.add(card.id);
+        // Más allá del tope de fichas: se guarda con lo que da la lista
+        // (título, foto, puja, fin) y el análisis lo valora igual.
+        if(detailed>=perQueryLimit||kept>=detailLimit){
+          const bid=card.currentBid;
+          upsertListing({source:spec.id,source_id:card.id,url:card.url,title:card.title,description:'',original_price:bid,currency:'JPY',
+            price_eur:toEur(bid,'JPY'),seller_name:'',image_url:card.image||'',status:'',purchase_via:'One Map / FROM JAPAN',
+            raw:{query:q,searchUrl,searchMode:'list',sourceLabel:spec.label,purchaseVia:'One Map / FROM JAPAN',
+              auction:{endsAt:card.endsAt,bids:card.bids,currentBid:bid,currency:'JPY',buyNow:card.buyNow,provider:'One Map',requiresDatabase:true}}},sessionId,q);
+          local++;listedOnly++;
+          continue;
+        }
+        detailed++;
         try{
           const item=await japanEnrichCandidate(spec,{
             href:card.url,title:card.title,blob:card.title,price:card.currentBid,img:card.image||''
@@ -3230,14 +3253,14 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
           kept++;local++;
         }catch(e){detailErrors++;queryDetailErrors++;console.warn(`One Map ${card.id}: ${e.message}`);}
       }
-      perQuery.push({query:q,count:local,candidates:cards.length,searchUrl,
+      perQuery.push({query:q,count:local,detailed,read:parsed.length,candidates:cards.length,searchUrl,
         ...(local===0&&queryDetailErrors>0?{error:`Fallaron ${queryDetailErrors} fichas de One Map`}:{})});
     }catch(e){perQuery.push({query:q,count:0,error:e.message,searchUrl});}
   }
   const ok=perQuery.length>0&&perQuery.some(x=>!x.error);
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)')
-    .run('onemap','live-search',`Queries ${perQuery.length}; kept ${kept}; detail errors ${detailErrors}`,new Date().toISOString());
-  return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',kept,detailErrors,perQuery,...(!ok?{error:perQuery[0]?.error||'No se pudo leer One Map'}:{})};
+    .run('onemap','live-search',`Queries ${perQuery.length}; kept ${kept+listedOnly} (${kept} con ficha); detail errors ${detailErrors}`,new Date().toISOString());
+  return {ok,source:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',kept:kept+listedOnly,detailed:kept,detailErrors,perQuery,...(!ok?{error:perQuery[0]?.error||'No se pudo leer One Map'}:{})};
 }
 
 
@@ -8135,8 +8158,22 @@ function storeStandaloneAnalysis(item,a,now){
 //    más likes pesan más), por separado la base y Vestiaire, y decide con el
 //    beneficio limpio y el margen; la calidad de la IA cuenta en la nota.
 // 4) Si sale rentable, se confirma con el modelo fuerte y más fotos.
+// Primera pasada: las 80 que más pesan (con fotos del anuncio). Después se
+// revisa el resto de la base del modelo, ordenado por parecido con lo que la
+// IA ha identificado (talla, material, color), en tandas de 80 y sin fotos:
+// así no se escapan fichas iguales en pestañas grandes (Chanel tiene 750).
 const REF_MAX_BASE=Number(process.env.REF_MAX_BASE||80);
-const REF_MAX_LIVE=Number(process.env.REF_MAX_LIVE||60);
+const REF_EXTRA_BASE=Number(process.env.REF_EXTRA_BASE||320);
+const REF_MAX_LIVE=Number(process.env.REF_MAX_LIVE||96);
+const REF_MAT_CLASS=[['exotica',/croco|alligat|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|stingray|exotic/i],['ante',/suede|ante\b|daim|nubuck|绒/i],['tela',/canvas|lona|toile|nylon|nail[oó]n|tela|fabric|denim|tweed|jacquard|cotton|algod[oó]n|raffia|paja|帆布|尼龙/i],['piel',/leather|cuero|piel|calf|lamb|caviar|cordero|becerro|charol|patent|皮/i]];
+const refMatClass=t=>(REF_MAT_CLASS.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
+const refColour=t=>(typeof VESTIAIRE_COLOR_RE!=='undefined'?VESTIAIRE_COLOR_RE.find(([,re])=>re.test(String(t||''))):null)?.[0]||null;
+const refSize=t=>typeof vestiaireSizeLabel==='function'?vestiaireSizeLabel(String(t||'')):null;
+function rankByIdentity(rows,ident){
+  const size=refSize(`${ident?.size||''} ${ident?.variant||''}`), mat=refMatClass(ident?.material), col=refColour(ident?.colour);
+  const score=r=>(size&&refSize(`${r.size||''} ${r.model||''} ${r.notes||''}`)===size?3:0)+(mat&&refMatClass(`${r.material||''} ${r.notes||''}`)===mat?2:0)+(col&&refColour(r.color)===col?1:0);
+  return rows.map((r,i)=>({r,i,s:score(r)})).sort((a,b)=>b.s-a.s||a.i-b.i).map(x=>x.r);
+}
 function baseReferenceRows(task,item){
   const tabs=vestiaireRefs().tasks||{};
   const watch=isWatchTask(task?.task_name);
@@ -8264,13 +8301,29 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const baseInfo=baseReferenceRows(task,item);
   const liveInfo=await liveReferenceRows(task,item,baseInfo.model,baseInfo.rows?.[0]?.brand||'');
   const excludeId=String(item.source)==='vestiaire'?item.source_id:null;
-  const base=refCandidates(baseInfo.rows,{prefix:'B',limit:REF_MAX_BASE,excludeId});
+  // Todas las fichas del modelo con su código (B1… por peso); la primera
+  // pasada ve las 80 primeras y el resto se revisa después por parecido.
+  const base=refCandidates(baseInfo.rows,{prefix:'B',limit:REF_MAX_BASE+REF_EXTRA_BASE,excludeId});
+  const base0=base.slice(0,REF_MAX_BASE);
   const live=refCandidates(liveInfo.rows,{prefix:'V',limit:REF_MAX_LIVE,excludeId});
-  const prompt=referencePrompt(task,item,base,live,economics);
+  const prompt=referencePrompt(task,item,base0,live,economics);
   const inspect=async(purpose,images)=>{
     const parts=analyzeImages?await fetchGeminiImageParts(item,images):[];
     const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:prompt},...parts],googleSearch:false,purpose});
     return {data:r.data||{},images:parts.length};
+  };
+  // Tandas extra de la base, solo texto, con lo que ya se ha identificado.
+  const inspectMoreBase=async(first)=>{
+    const rest=rankByIdentity(base.slice(REF_MAX_BASE),first);
+    const chunks=[];for(let i=0;i<rest.length;i+=REF_MAX_BASE)chunks.push(rest.slice(i,i+REF_MAX_BASE));
+    const ident=`LISTING ALREADY IDENTIFIED AS: ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour,condition_grade:first.condition_grade})}\nOnly fill base_same and base_similar for the references below (the rest of the JSON can repeat the identification).`;
+    const out=await Promise.all(chunks.map(async ch=>{
+      try{
+        const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:`${referencePrompt(task,item,ch,[],economics)}\n\n${ident}`}],googleSearch:false,purpose:'screen'});
+        return r.data||{};
+      }catch(e){if(isAiPolicyFlag(e)||e?.aiBudget||e?.geminiCapacity)throw e;console.warn('Tanda extra de referencias:',e.message);return {};}
+    }));
+    return {same:out.flatMap(d=>Array.isArray(d.base_same)?d.base_same:[]),similar:out.flatMap(d=>Array.isArray(d.base_similar)?d.base_similar:[]),chunks:chunks.length,rows:rest.length};
   };
   const evaluate=data=>{
     const basePrice=priceFromRefs(base,data.base_same,{ratio:realization});
@@ -8286,27 +8339,45 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   reportProgress(25,'Revisando el anuncio','La IA identifica el producto, su estado y las referencias posibles');
   const shot=await inspect('screen',2);
   const codes=(list,cands)=>{const ok=new Set(cands.map(r=>r._code));return [...new Set((Array.isArray(list)?list:[]).map(c=>String(c).trim().toUpperCase()))].filter(c=>ok.has(c));};
-  const s1=shot.data;
+  const s1={...shot.data};
+  // El resto de la base del modelo, para que no se escape ninguna igual.
+  let extra={chunks:0,rows:0};
+  if(base.length>REF_MAX_BASE&&s1.target_match!==false){
+    reportProgress(40,'Revisando el resto de tu base',`${base.length-REF_MAX_BASE} fichas más del modelo`);
+    extra=await inspectMoreBase(s1);
+    s1.base_same=[...(Array.isArray(s1.base_same)?s1.base_same:[]),...extra.same];
+    s1.base_similar=[...(Array.isArray(s1.base_similar)?s1.base_similar:[]),...extra.similar];
+  }
   const sameB=codes(s1.base_same,base), simB=codes(s1.base_similar,base).filter(c=>!sameB.includes(c));
   const sameV=codes(s1.vestiaire_same,live), simV=codes(s1.vestiaire_similar,live).filter(c=>!sameV.includes(c));
   // Ninguna referencia cuenta sin pasar por las fotos. Solo se comprueban si,
   // contando todas las posibles (o solo las seguras), podría salir rentable.
   const promising=d=>['STRONG BUY','BUY','WATCH'].includes(evaluate(d).dec.decision);
   const byCode=new Map([...base,...live].map(r=>[r._code,r]));
-  const pool=[...sameB,...sameV,...simB,...simV].map(c=>byCode.get(c)).filter(Boolean).slice(0,REF_PHOTO_MAX);
+  const poolAll=[...sameB,...sameV,...simB,...simV].map(c=>byCode.get(c)).filter(Boolean);
   let d={...s1,base_same:[],vestiaire_same:[]};
-  let confirmed=false, photoCheck=null;
-  if(pool.length&&(promising({...s1,base_same:[...sameB,...simB],vestiaire_same:[...sameV,...simV]})||promising({...s1,base_same:sameB,vestiaire_same:sameV}))){
+  let confirmed=false, photoCheck=null, unprofitableAnyway=null;
+  const optimistic={...s1,base_same:[...sameB,...simB],vestiaire_same:[...sameV,...simV]};
+  if(poolAll.length&&(promising(optimistic)||promising({...s1,base_same:sameB,vestiaire_same:sameV}))){
     const strong=verifyBudgetLeftUsd()>0;
-    reportProgress(55,'Comprobando referencias con fotos',`${pool.length} referencias, una a una`);
     if(strong)verifyTierStore.enterWith('full');
+    // Hasta dos rondas de fotos: si en la primera no sale ninguna igual y
+    // quedan candidatas, se miran las siguientes.
+    const checked=[],same=[],notSame={};let photos=0,pd={};
     try{
-      const pc=await checkReferencePhotos({key,item,task,refs:pool,purpose:strong?'verify':'screen',analyzeImages,first:s1});
-      const pd=pc.data;
+      for(let round=0;round<2&&checked.length<poolAll.length;round++){
+        const refs=poolAll.slice(checked.length,checked.length+REF_PHOTO_MAX);
+        reportProgress(55+round*10,'Comprobando referencias con fotos',`${refs.length} referencias, una a una`);
+        const pc=await checkReferencePhotos({key,item,task,refs,purpose:strong?'verify':'screen',analyzeImages,first:s1});
+        checked.push(...refs.map(r=>r._code));same.push(...pc.same);photos+=pc.photos;
+        if(pc.data?.not_same&&typeof pc.data.not_same==='object')Object.assign(notSame,pc.data.not_same);
+        if(round===0)pd=pc.data||{};
+        if(same.length)break;
+      }
       d={...s1,...Object.fromEntries(['target_match','condition_grade','completeness_es','quality_score','authenticity_risk','exotic_skin','decision_reasons_es','flaws_zh'].filter(k=>pd[k]!=null&&pd[k]!=='').map(k=>[k,pd[k]])),
-        base_same:pc.same.filter(c=>c.startsWith('B')),vestiaire_same:pc.same.filter(c=>c.startsWith('V'))};
+        base_same:same.filter(c=>c.startsWith('B')),vestiaire_same:same.filter(c=>c.startsWith('V'))};
       confirmed=strong;
-      photoCheck={checked:pool.map(r=>r._code),same:pc.same,not_same:pd.not_same&&typeof pd.not_same==='object'?pd.not_same:{},photos:pc.photos,model:strong?'verify':'screen'};
+      photoCheck={checked,same,not_same:notSame,photos,model:strong?'verify':'screen'};
     }catch(e){
       // Sin presupuesto de IA a esta hora: el anuncio se deja para más tarde
       // (no se guarda como "sin precio").
@@ -8314,8 +8385,12 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
       console.warn('Comprobación de referencias con fotos:',e.message);
       photoCheck={error:String(e.message||e).slice(0,160)};
     }
+  }else if(poolAll.length){
+    // Hay referencias posibles, pero ni contándolas todas sale rentable: es
+    // un descarte por precio, no un "sin referencias".
+    unprofitableAnyway=evaluate(optimistic);
   }
-  const ev=evaluate(d);
+  const ev=unprofitableAnyway||evaluate(d);
   const {basePrice,livePrice,combined,orientative,dec,failed}=ev;
   const fee=platform.fee/100;
   const a={
@@ -8329,14 +8404,22 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     net_profit_clean_eur:dec.clean,clean_margin_pct:dec.margin,quality_score:Number(d.quality_score)||null,
     flaws_zh:String(d.flaws_zh||'').replace(/[<>]/g,'').slice(0,20),
     resale_estimate_source:combined?(orientative?'REFERENCIAS_PARECIDAS':combined.source==='base'?'VESTIAIRE_DB':combined.source==='vestiaire'?'VESTIAIRE_LIVE':'VESTIAIRE_DB+LIVE'):'UNAVAILABLE',
-    resale_estimate_market_verified:!!combined&&!orientative,
+    resale_estimate_market_verified:!!combined&&!orientative&&!unprofitableAnyway,
     notes:[d.completeness_es,d.condition_grade].filter(Boolean).join(' · ')
   };
-  const priceNote=combined
+  const priceNote=unprofitableAnyway
+    ?`Ni contando como iguales todas las referencias posibles sale rentable: precio de venta realista ${combined?.realistic??combined?.mean} €, beneficio limpio en ${platform.name} ${dec.clean} € (margen ${dec.margin} %).`
+    :combined
     ?`Precio de venta realista ${combined.realistic??combined.mean} € con ${combined.n} referencias iguales comprobadas con foto (media ${combined.mean} €, franja ${combined.low}-${combined.high}); beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
     :photoCheck?.error?'No se pudieron comprobar las referencias con fotos: sin precio.'
-    :'Sin referencias iguales (mismo modelo, talla y material) en tu base ni en Vestiaire: no se calcula el precio.';
+    :`Sin referencias iguales en tu base (${base.length} fichas del modelo revisadas) ni en Vestiaire (${live.length}${liveInfo.status!=='ok'&&liveInfo.status!=='watch'?`; Vestiaire no respondió: ${liveInfo.status}`:''}): sin pronóstico de precio.`;
   a.decision_reasons_es=[priceNote,...(Array.isArray(d.decision_reasons_es)?d.decision_reasons_es:[]).map(String)].slice(0,5);
+  // SIN REFERENCIAS PERO INTERESANTE (regla de Nil, 07-11-2026): revisada la
+  // base entera y Vestiaire, si no hay ninguna igual se avisa igualmente,
+  // sin pronóstico, cuando el anuncio es el producto buscado, sin riesgo alto
+  // y en buen estado.
+  a.no_refs_interesting=!combined&&!unprofitableAnyway&&!photoCheck?.error&&!failed&&d.target_match!==false&&d.exotic_skin!==true
+    &&String(d.authenticity_risk||'MEDIUM').toUpperCase()!=='HIGH'&&(Number(d.quality_score)||0)>=Number(process.env.NO_REF_MIN_QUALITY||55);
   if(failed)a.decision_reasons_es.unshift(`La verificación de ${marketplaceVerification.service||'la plataforma'} figura como no superada.`);
   if(d.exotic_skin===true)a.decision_reasons_es.unshift('Piel exótica (CITES): descartado por política.');
   const exact={brand:d.brand,family:d.model,exact_variant_label:d.variant,size:d.size,material:d.material,main_color:d.colour,hardware:d.hardware,
@@ -8344,11 +8427,12 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   let verification={status:confirmed?'verified':'screen_only',match_version:MATCH_VERSION,preliminary_decision:dec.decision,exact,
     marketplace_verification:marketplaceVerification,
     market:{match_version:MATCH_VERSION,
-      sheet_comps:referenceCompsForAlert(basePrice,{tab:baseInfo.tab,model:baseInfo.model,source:'base'}),
-      vestiaire_live:livePrice?{status:'ok',tier:'misma_talla',...referenceCompsForAlert(livePrice,{model:liveInfo.model,source:'vestiaire'}),
-        active_n:livePrice.n-livePrice.sold_n,material:'',basis:'iguales, comprobados con foto'}:(liveInfo.status==='ok'?{status:'no_match',query:liveInfo.query}:{status:liveInfo.status,query:liveInfo.query}),
+      sheet_comps:unprofitableAnyway?null:referenceCompsForAlert(basePrice,{tab:baseInfo.tab,model:baseInfo.model,source:'base'}),
+      vestiaire_live:livePrice&&!unprofitableAnyway?{status:'ok',tier:'misma_talla',...referenceCompsForAlert(livePrice,{model:liveInfo.model,source:'vestiaire'}),
+        active_n:livePrice.n-livePrice.sold_n,material:'',basis:'iguales, comprobados con foto'}:(liveInfo.status==='ok'?{status:'no_match',query:liveInfo.query}:{status:liveInfo.status,query:liveInfo.query,error:liveInfo.error||null}),
       vestiaire_blend:basePrice&&livePrice?combined:null,orientative,
-      candidates:{base:base.length,vestiaire:live.length},photo_check:photoCheck,sheet_fresh:vestiaireSheetFresh()}};
+      candidates:{base:base.length,vestiaire:live.length,extra_chunks:extra.chunks},photo_check:photoCheck,no_refs_interesting:a.no_refs_interesting,
+      vestiaire_live_error:liveInfo.error||null,sheet_fresh:vestiaireSheetFresh()}};
   // Subastas: puja máxima con la parte baja de las referencias iguales.
   const auc=listingAuction(item);
   if(auc){
@@ -10751,7 +10835,7 @@ function vestiaireCompareSections(taskName,item){
     liveLines.push(...refSummaryLines(live,live.active_n?Math.round(VESTIAIRE_LIVE_REALIZATION*100):null),...(live.picks||[]).slice(0,4).map(f=>refPickLine(f,{material:false})));
     if(live.tier!=='misma_talla')liveLines.push('De otras tallas: solo orientativo.');
   }else if(live?.status==='no_match'&&v.market?.match_version)liveLines.push('Ninguno de los anuncios de Vestiaire es el mismo bolso (comprobado con fotos): no se usa.');
-  else if(live)liveLines.push(`Sin datos: ${htmlEsc(VESTIAIRE_LIVE_WHY[live.status]||live.status)}.`);
+  else if(live)liveLines.push(`Sin datos: ${htmlEsc(VESTIAIRE_LIVE_WHY[live.status]||live.status)}${live.error?` (${htmlEsc(String(live.error).slice(0,120))})`:''}.`);
   else liveLines.push('No se consultó para este anuncio.');
   let used='';
   if(v.market?.match_version){
@@ -10848,7 +10932,8 @@ function instantAlertText(x,{soft=false}={}){
   const price=Number.isFinite(orig)&&orig>0&&x.currency&&x.currency!=='EUR'?`${fmtMoney(orig,x.currency)} (≈ ${eur0(x.price_eur)})`:eur0(x.price_eur);
   const ago=alertAgo(listingPublishedAtMs(x));
   const decision=String(x.decision||'').toUpperCase();
-  const head=soft?'👀 <b>POSIBLE OPORTUNIDAD · revísala</b>':`🔥 <b>${ALERT_DECISION_ES[decision]||htmlEsc(decision)}</b>`;
+  const norefs=v.final?.no_refs_interesting===true&&!(Number(v.final?.resale_mean_eur)>0);
+  const head=norefs?'🔎 <b>INTERESANTE · SIN PRONÓSTICO</b>':soft?'👀 <b>POSIBLE OPORTUNIDAD · revísala</b>':`🔥 <b>${ALERT_DECISION_ES[decision]||htmlEsc(decision)}</b>`;
   const modelText=String(x.model||'').toLowerCase();
   const identified=[known(exact.size)&&!modelText.includes(String(exact.size).toLowerCase())&&exact.size,known(exact.material)&&alertEs(exact.material),known(exact.main_color)&&alertEs(exact.main_color)].filter(Boolean).join(' · ');
   const title=String(x.title||'').trim();
@@ -10875,13 +10960,16 @@ function instantAlertText(x,{soft=false}={}){
     `<b>${htmlEsc(x.model||title)}</b>${identified?` · ${htmlEsc(identified)}`:''}`,
     title&&title!==x.model?`<i>${htmlEsc(title.slice(0,140))}</i>`:'',
     `${htmlEsc(platform)} · <b>${price}</b>${ago?` · publicado ${ago}`:''}`,
-    `Puntuación ${x.opportunity_score??'—'}/100`
+    norefs?`Calidad del anuncio ${Number(v.final?.quality_score)||'—'}/100`:`Puntuación ${x.opportunity_score??'—'}/100`
   ].filter(Boolean);
+  const auc=listingAuction(x);
   const lines=[
     ...header,
     ...alertSection('💰 NÚMEROS',[
-      `Coste puesto en España: <b>${eur0(x.landed_cost_eur)}</b>`,
-      ...(v.match_version&&Number(v.final?.resale_mean_eur)>0?[
+      `Coste puesto en España: <b>${eur0(x.landed_cost_eur)}</b>${auc?.live?' (con la puja actual)':''}`,
+      ...(auc?.live?[`🔨 Subasta: ${auc.bids||0} puja${auc.bids===1?'':'s'} · termina ${Number.isFinite(auc.endMs)?new Date(auc.endMs).toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—'}`]:[]),
+      ...(norefs?['<b>Sin pronóstico:</b> no hay ninguna referencia igual en tu base ni en Vestiaire, así que no te doy precio de venta. Te lo envío porque el anuncio es el modelo buscado y está en buen estado: valóralo tú.']
+      :v.match_version&&Number(v.final?.resale_mean_eur)>0?[
         // Análisis nuevo: un precio de venta realista (media o mediana de las
         // iguales, la más baja) y el beneficio con ese precio, no con la franja alta.
         `Precio de venta realista: <b>${eur0(v.final.resale_mean_eur)}</b> · ${alertResaleSource(x,v)}`,
@@ -10956,6 +11044,8 @@ async function sendInstantAlerts(task,runId,items){
   if(['0','false','off','no'].includes(String(process.env.INSTANT_ALERTS||'').toLowerCase())){
     return {sent:0,reason:'disabled'};
   }
+  // Interesantes sin referencias iguales: aviso sin pronóstico (subastas incluidas).
+  await sendNoRefAlerts(task,runId,items).catch(e=>console.error('Avisos sin pronóstico:',e.message));
   // Las subastas en curso van por su propio aviso, con la puja máxima.
   const auctionItems=(items||[]).filter(x=>listingAuction(x)?.live);
   if(auctionItems.length)await sendAuctionAlerts(task,runId,auctionItems).catch(e=>console.error('Avisos de subasta:',e.message));
@@ -11144,6 +11234,37 @@ async function sendSoftAlerts(task,runId,items,strictIds=new Set()){
     }
   }
   if(sent)console.log(`Task ${task.id}: ${sent} posible(s) oportunidad(es) enviada(s) por Telegram.`);
+  return {sent};
+}
+
+// ── SIN PRONÓSTICO ─────────────────────────────────────────────────────
+// Revisada la base entera y Vestiaire sin encontrar ninguna igual: si el
+// anuncio es el producto buscado y está bien, se avisa sin precio de venta.
+async function sendNoRefAlerts(task,runId,items){
+  if(['0','false','off','no'].includes(String(process.env.NO_REF_ALERTS||'').toLowerCase()))return {sent:0,reason:'disabled'};
+  if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
+  const already=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind IN ('instant','soft','auction','norefs') LIMIT 1`);
+  const picks=(items||[]).filter(x=>{
+    let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
+    if(v.final?.no_refs_interesting!==true||Number(v.final?.resale_mean_eur)>0)return false;
+    if(String(x.decision||'').toUpperCase()==='REJECT')return false;
+    const auc=listingAuction(x);
+    if(auc&&!auc.live)return false;
+    if(noPriceVeto(x))return false;
+    if(listingFeedback(x.id)==='not_interested')return false;
+    return !already.get(Number(x.id));
+  }).map(x=>({...x,_task_name:task.task_name}));
+  const limited=limitTaskAlerts(task,picks,{kinds:['norefs']});
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'norefs','telegram',?)`);
+  let sent=0;
+  for(const x of limited){
+    try{
+      await telegramSendListing(instantAlertText(x),x);
+      mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
+      sent++;
+    }catch(e){console.error('Aviso sin pronóstico:',e.message);}
+  }
+  if(sent)console.log(`Task ${task.id}: ${sent} anuncio(s) interesante(s) sin pronóstico enviado(s) por Telegram.`);
   return {sent};
 }
 

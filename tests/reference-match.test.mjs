@@ -58,8 +58,8 @@ test('decisión con los números; la calidad de la IA cuenta en la nota',()=>{
 // El análisis real del bot (analyzeByReferences), con la IA simulada.
 const source=fs.readFileSync(new URL('../server.mjs',import.meta.url),'utf8');
 const extract=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
-function harness({screen,photo}){
-  const sheetRows=[ref(71,2000,{sold:true,likes:40}),ref(72,2100),ref(73,1900),ref(74,800,{size:'Mini'})];
+function harness({screen,photo,extraRows=[],extra={},landed=1000}){
+  const sheetRows=[ref(71,2000,{sold:true,likes:40}),ref(72,2100),ref(73,1900),ref(74,800,{size:'Mini'}),...extraRows];
   const liveRows=[{...ref(81,2200),sold:false},{...ref(82,2300),sold:true}];
   const stored=[],prompts=[];
   const ctx=vm.createContext({console,Number,String,JSON,Math,Date,Array,Object,Set,Map,Promise,Buffer,AbortSignal,process:{env:{}},
@@ -69,7 +69,7 @@ function harness({screen,photo}){
     sameModelRows:(tab,rows)=>({key:'lady dior',rows}),isWatchTask:()=>false,
     vestiaireTaskQuery:()=>'lady dior',vestiaireLiveQuery:()=>null,
     vestiaireLiveSearchRows:async()=>({status:'ok',model:'Lady Dior',rows:liveRows}),
-    importEconomics:()=>({importedTotalEur:1000}),detectMarketplaceVerification:()=>({status:'AVAILABLE'}),
+    importEconomics:()=>({importedTotalEur:landed}),detectMarketplaceVerification:()=>({status:'AVAILABLE'}),
     resalePlatform:()=>({name:'Vestiaire',fee:20}),VESTIAIRE_DEFAULT_REALIZATION:0.92,VESTIAIRE_LIVE_REALIZATION:0.92,
     listingAuction:()=>null,fetchGeminiImageParts:async()=>[],aiModel:()=>'m',verifyBudgetLeftUsd:()=>1,
     verifyTierStore:{enterWith(){}},isAiPolicyFlag:()=>false,vestiaireSheetFresh:()=>true,roundMoney:n=>Math.round(n*100)/100,
@@ -77,7 +77,9 @@ function harness({screen,photo}){
       const text=parts.filter(p=>typeof p.text==='string').map(p=>p.text).join('\n');
       prompts.push({purpose,text});
       const base={brand:'Dior',model:'Lady Dior',size:'Medium',target_match:true,condition_grade:'Muy buen estado',quality_score:80,authenticity_risk:'LOW',decision_reasons_es:['Medium negro con tarjeta.']};
-      return {data:prompts.length===1?{...base,...screen}:{...base,...photo}};
+      if(/LISTING ALREADY IDENTIFIED/.test(text))return {data:{...base,base_same:[],base_similar:[],...extra}};
+      if(/reference checker/.test(text))return {data:{...base,...photo}};
+      return {data:{...base,...screen}};
     },
     storeTaskAnalysis:(...args)=>stored.push(args)});
   vm.runInContext(extract('const REF_MAX_BASE=','async function analyzeWithGemini('),ctx);
@@ -100,7 +102,7 @@ test('análisis: la IA preselecciona por texto y solo cuentan las comprobadas co
   assert.equal(v.market.match_version,MATCH_VERSION);
   assert.equal(v.market.sheet_comps.n,3);                 // B4 (Mini) fuera por la foto
   assert.equal(v.market.vestiaire_live.n,2);
-  assert.deepEqual(v.market.photo_check.not_same,{B4:'Es un Mini'});
+  assert.equal(JSON.stringify(v.market.photo_check.not_same),JSON.stringify({B4:'Es un Mini'}));
   assert.equal(a.resale_estimate_market_verified,true);
 });
 test('análisis: si la foto no confirma ninguna, no hay precio ni referencias (nada orientativo)',async()=>{
@@ -163,4 +165,41 @@ test('oferta al vendedor de Xianyu: abre por debajo y nunca pasa del máximo ren
   assert.ok(tight.maxCny<8800&&tight.profitMax>=200,JSON.stringify(tight));
   assert.ok(tight.openCny<tight.maxCny);
   assert.equal(ctx.sellerOfferPlan({...x,source:'mercari-jp'},v),null);
+});
+
+test('análisis: revisa el resto de la base (más allá de las 80 primeras) y usa la igual que encuentre',async()=>{
+  const many=Array.from({length:100},(_,i)=>ref(200+i,3000,{likes:0,size:i===95?'Medium':'Large'}));
+  const h=harness({extraRows:many,screen:{base_same:[],base_similar:[]},extra:{base_same:['B100']},photo:{same:['B100']}});
+  const a=await h.run();
+  assert.ok(h.prompts.some(p=>/LISTING ALREADY IDENTIFIED/.test(p.text)),'hay tanda extra');
+  const v=h.stored[0][4];
+  assert.equal(v.market.candidates.base,104);
+  assert.ok(v.market.candidates.extra_chunks>=1);
+  assert.equal(v.market.photo_check.same[0],'B100');
+  assert.ok(a.resale_mean_eur>0);
+  assert.equal(v.market.no_refs_interesting,false);
+});
+test('análisis: sin ninguna igual y buen anuncio → interesante sin pronóstico',async()=>{
+  const h=harness({screen:{base_same:[],base_similar:[],vestiaire_same:[]},photo:{}});
+  const a=await h.run();
+  assert.equal(a.decision,'REVIEW');
+  assert.equal(a.resale_mean_eur,null);
+  assert.equal(a.no_refs_interesting,true);
+  assert.match(a.decision_reasons_es[0],/sin pronóstico/);
+});
+test('análisis: con posibles iguales pero sin beneficio ni contándolas todas → descartado, no "sin referencias"',async()=>{
+  const h=harness({landed:3000,screen:{base_same:['B1'],base_similar:['B2','B3'],vestiaire_same:['V1']},photo:{same:['B1']}});
+  const a=await h.run();
+  assert.equal(a.decision,'REJECT');
+  assert.equal(a.no_refs_interesting,false);
+  assert.match(a.decision_reasons_es[0],/Ni contando/);
+  assert.equal(h.prompts.filter(p=>/reference checker/.test(p.text)).length,0);
+});
+test('One Map: la lista interna da id, puja, pujas y fin (hora de Japón)',async()=>{
+  const {oneMapJsonCards}=await import('../scripts/onemap-auctions.mjs');
+  const c=oneMapJsonCards([{id:'h1230300848',title:'CHANEL bag',price:79700,bids:2,endTime:'2026/11/07 21:28:40',buyItNowPrice:0,imageUrl:'x'},{id:'bad',title:'',price:0,endTime:'x'}],Date.parse('2026-11-07T11:00:00Z'));
+  assert.equal(c.length,1);
+  assert.equal(c[0].endsAt,'2026-11-07T12:28:40.000Z');
+  assert.equal(c[0].timeLeftMs,88*60e3+40e3);
+  assert.equal(c[0].url,'https://www.fromjapan.co.jp/japan/en/auction/yahoo/input/h1230300848');
 });

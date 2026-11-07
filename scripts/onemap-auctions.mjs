@@ -75,3 +75,20 @@ export function parseOneMapDetail(html){
     negativeRatings:Number.isFinite(ratings[1])?ratings[1]:null
   };
 }
+
+// Lista JSON de One Map (sort=end): fecha de fin en hora de Japón.
+export function oneMapJsonCards(items,now=Date.now()){
+  const out=[];const seen=new Set();
+  for(const x of items||[]){
+    const id=String(x?.id||'').trim();
+    if(!/^[a-z0-9]+$/i.test(id)||seen.has(id))continue;
+    const m=String(x.endTime||'').match(/^(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+    const endMs=m?Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+09:00`):NaN;
+    const price=Number(x.price);
+    if(!x.title||!(price>0)||!Number.isFinite(endMs))continue;
+    seen.add(id);
+    out.push({id,url:`${BASE}/japan/en/auction/yahoo/input/${id}`,title:String(x.title),currentBid:price,bids:Number(x.bids)||0,
+      timeLeftMs:endMs-now,endsAt:new Date(endMs).toISOString(),buyNow:Number(x.buyItNowPrice)>0?Number(x.buyItNowPrice):null,image:String(x.imageUrl||'')});
+  }
+  return out;
+}

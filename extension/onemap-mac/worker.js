@@ -165,8 +165,43 @@ async function handleVestiaire(job,token){
   }
 }
 
+// Lista de One Map (su propio buscador interno, 100 subastas por página) en
+// vez de las 20 tarjetas de la pantalla. Se pide desde la página de búsqueda
+// abierta, como haría la web. La URL lleva #lh-json-pages=N.
+async function oneMapListInPage(keyword,pages){
+  const items=[];let count=null;
+  for(let p=1;p<=pages;p++){
+    const r=await fetch(`/japan/sites/yahooauction/search?keyword=${encodeURIComponent(keyword).replace(/%20/g,'+')}&category=-&sort=end&hits=100&page=${p}`,{credentials:'include'});
+    if(!r.ok)return {status:r.status,body:`One Map HTTP ${r.status}`};
+    const j=await r.json();
+    count=j.count??count;
+    items.push(...(j.items||[]).map(x=>({id:x.id,title:x.title,price:x.price,bids:x.bids,endTime:x.endTime,buyItNowPrice:x.buyItNowPrice,imageUrl:x.imageUrl})));
+    if(!(j.items||[]).length)break;
+    await new Promise(r=>setTimeout(r,800));
+  }
+  return {status:200,body:JSON.stringify({count,items})};
+}
+async function handleOneMapList(job,token){
+  const pages=Math.min(3,Math.max(1,Number((job.url.match(/#lh-json-pages=(\d)/)||[])[1])||2));
+  const pageUrl=job.url.split('#')[0];
+  const keyword=decodeURIComponent((new URL(pageUrl).pathname.match(/\/yahoo-auctions\/search\/([^/]+)\//)||[])[1]||'').replace(/\+/g,' ');
+  let opened;
+  try{
+    opened=await openHidden(pageUrl);
+    const tab=await waitLoaded(opened.tabId);
+    await sleep(1200);
+    const [injection]=await chrome.scripting.executeScript({target:{tabId:opened.tabId},world:'MAIN',func:oneMapListInPage,args:[keyword,pages]});
+    await bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:pageUrl,title:tab?.title||'',html:'',...injection.result});
+  }catch(error){
+    await bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:pageUrl,title:'',html:'',status:502,body:String(error)}).catch(()=>{});
+  }finally{
+    await closeHidden(opened);
+  }
+}
+
 async function handle(job,token){
   if(job.kind==='vestiaire')return handleVestiaire(job,token);
+  if(/#lh-json-pages=/.test(job.url))return handleOneMapList(job,token);
   const search=job.url.includes('/yahoo-auctions/search/');
   let opened;
   try{
