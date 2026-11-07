@@ -10472,7 +10472,7 @@ async function identifyListingFromScreenshot(fileId){
     LEFT JOIN task_analyses ta ON ta.listing_id=l.id AND ta.task_id=n.task_id
     WHERE n.sent_at>=? ORDER BY n.sent_at DESC LIMIT 40`).all(new Date(Date.now()-21*86400e3).toISOString());
   const data=await telegramFileBase64(fileId);
-  const prompt=`You receive a screenshot shared by a luxury handbag reseller. It shows either a marketplace listing (Xianyu/Goofish, Bunjang, Mercari, Buyee...) or a chat with the seller where a lower price was agreed.
+  const prompt=`You receive a screenshot shared by a luxury handbag reseller. It shows either a marketplace listing (Xianyu/Goofish, Bunjang, Mercari, Yahoo! Auctions via One Map...) or a chat with the seller where a lower price was agreed.
 Candidate listings previously sent to the reseller (JSON): ${JSON.stringify(cands)}
 Return ONLY JSON: {"listing_id": <id of the candidate that is clearly the same listing, or null>, "agreed_price": <the negotiated/agreed price if visible, otherwise the listing price shown, number or null>, "currency": "CNY"|"JPY"|"KRW"|"EUR"|"USD"|null, "seen_title": "<short title read from the image>"}
 Match only when title, product and price context clearly point to the same listing; otherwise listing_id null.`;
@@ -10496,7 +10496,7 @@ function fmtMoney(n,cur){
 // precio de compra que ha pactado con el vendedor. Si el bot ya tiene una
 // reventa estimada de ese anuncio, solo recalcula; si no, lee el anuncio,
 // elige la tarea del modelo y hace el análisis completo con ese precio.
-const MANUAL_SOURCES_TEXT='Xianyu, Bunjang, Mercari, Rakuma, Yahoo! Auctions (o Buyee), Yahoo! Flea Market, 2nd STREET y KOMEHYO';
+const MANUAL_SOURCES_TEXT='Xianyu, Bunjang, Mercari, Rakuma, Yahoo! Flea Market, 2nd STREET y KOMEHYO';
 
 function telegramMessageUrls(m){
   if(!m)return [];
@@ -10530,10 +10530,8 @@ function manualListingRef(href){
     const id=u.pathname.match(/\/products\/(\d+)/)?.[1];
     return id?{source:'bunjang',sourceId:id}:null;
   }
-  // Yahoo! Auctions y Mercari por Buyee: se abre la misma ficha que lee el radar.
-  const auction=/(^|\.)auctions\.yahoo\.co\.jp$/.test(host)?u.pathname.match(/\/auction\/([a-z]?\d+)/i)?.[1]:null;
-  if(auction)u=new URL(`https://buyee.jp/item/jdirectitems/auction/${auction}?lang=en`);
-  const mercari=['buyee.jp','mercari.com'].includes(host)?u.pathname.match(/\/(?:mercari\/item|jp\/items)\/(m\d+)/i)?.[1]:null;
+  // Mercari: se abre la ficha de jp.mercari.com (Buyee ya no se usa).
+  const mercari=['mercari.com','jp.mercari.com'].includes(host)?u.pathname.match(/\/(?:item|jp\/items)\/(m\d+)/i)?.[1]:null;
   if(mercari)u=new URL(`https://jp.mercari.com/item/${mercari}`);
   const h=u.hostname.toLowerCase().replace(/^www\./,'');
   const spec=JAPAN_RADAR_SPECS.find(s=>{
