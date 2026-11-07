@@ -8206,12 +8206,14 @@ function referenceCompsForAlert(price,{tab,model,source}){
 const REF_PHOTO_MAX=Number(process.env.REF_PHOTO_MAX||30);
 const refPhotoCache=new Map();
 async function refPhotoPart(r){
-  if(String(r?._code||'').startsWith('V')){
-    const t=db.prepare('SELECT jpeg FROM ref_thumbs WHERE id=?').get(String(r.id));
+  const thumb=()=>{
+    const t=db.prepare('SELECT jpeg FROM ref_thumbs WHERE id=?').get(String(r?.id||''));
     return t?{inline_data:{mime_type:'image/jpeg',data:Buffer.from(t.jpeg).toString('base64')}}:null;
-  }
+  };
+  if(String(r?._code||'').startsWith('V'))return thumb();
   const url=String(r?.photo||'');
-  if(!/^https:\/\//.test(url))return null;
+  // Fila de la hoja sin foto: la miniatura de Vestiaire del mismo anuncio, si la trajo el Mac.
+  if(!/^https:\/\//.test(url))return thumb();
   if(refPhotoCache.has(url))return refPhotoCache.get(url);
   let part=null;
   try{
@@ -8224,7 +8226,7 @@ async function refPhotoPart(r){
   }catch{}
   if(refPhotoCache.size>3000)refPhotoCache.clear();
   refPhotoCache.set(url,part);
-  return part;
+  return part||thumb();
 }
 const REF_PHOTO_INSTRUCTION=`You are the reference checker of Luxury Hunter. Luxury Hunter computes the resale price ONLY from the references you confirm here: one wrong reference means a wrong price. Be strict.
 The first images are the LISTING. After them come the REFERENCE photos, each one preceded by its code and its text.
