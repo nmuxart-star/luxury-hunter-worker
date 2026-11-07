@@ -3169,7 +3169,11 @@ const JAPAN_RADAR_SPECS=[
     purchaseVia:'Direct',
     mode:'browser',
     base:'https://jp.mercari.com',
-    scrollSteps:10,
+    // Sin bajar la página: el buscador de Mercari ya devuelve 120 anuncios
+    // (id, título, precio, foto, estado y fecha) al cargar. Solo si no
+    // responde se baja la página como antes (scrollFallback).
+    scrollSteps:0,
+    scrollFallback:10,
     cap:100,
     searchWaitMs:3500,
     detailWaitMs:4000,
@@ -3823,6 +3827,24 @@ function mercariSearchApiPrices(apiResponses){
   return prices;
 }
 
+// Candidatos directamente del buscador de Mercari (sin leer la página).
+function mercariApiCandidates(apiResponses){
+  const out=[];const seen=new Set();
+  for(const json of apiResponses||[]){
+    for(const it of Array.isArray(json?.items)?json.items:[]){
+      const id=String(it?.id||'').trim();
+      if(!id||seen.has(id))continue;
+      seen.add(id);
+      const href=/^m\d+$/i.test(id)?`https://jp.mercari.com/item/${id}`:`https://jp.mercari.com/shops/product/${id}`;
+      const title=String(it?.name||it?.title||'').replace(/\s+/g,' ').trim();
+      if(!title)continue;
+      const price=Number(it?.price);
+      out.push({href,title,blob:title,price:price>0?price:null,img:String((it?.thumbnails||[])[0]||'')});
+    }
+  }
+  return out;
+}
+
 // Estado y fecha de publicación de cada anuncio según el buscador de Mercari.
 function mercariSearchApiInfo(apiResponses){
   const out=new Map();
@@ -4040,7 +4062,12 @@ async function searchJapanSource(
 
       successfulQueries++;
 
-      candidates=japanCollectCandidates(
+      candidates=spec.searchApi?mercariApiCandidates(snap.api):[];
+      if(spec.searchApi&&!candidates.length&&spec.scrollFallback&&spec.mode==='browser'){
+        snap=await japanBrowserSnapshot(browserContext,searchUrl,spec.searchWaitMs||2500,spec.scrollFallback,spec.searchApi);
+        candidates=mercariApiCandidates(snap.api);
+      }
+      if(!candidates.length)candidates=japanCollectCandidates(
         spec,
         snap.html
       );
