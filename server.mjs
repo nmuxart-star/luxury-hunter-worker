@@ -9878,7 +9878,17 @@ function xianyuVerificationVeto(item){
     };
   }
   if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
-  if(xianyuListingHasVerificationTag(item))return null;
+  if(xianyuListingHasVerificationTag(item)){
+    // VENDEDOR DE XIANYU (regla de Nil, 07-11-2026): solo con el nivel más
+    // alto de crédito de Xianyu («卖家信用极好»); «优秀» o sin etiqueta, fuera.
+    if(['0','false','off','no'].includes(String(process.env.XIANYU_REQUIRE_TOP_CREDIT||'').toLowerCase()))return null;
+    let raw={};try{raw=JSON.parse(item?.raw_json||'{}')}catch{}
+    const tags=[...(raw?.['商品信息']?.['商品标签']||[]),...(raw?.['卖家信息']?.['卖家标签']||[]),...(Array.isArray(raw?.tags)?raw.tags:[])].map(String);
+    if(tags.some(t=>/信用极好/.test(t)))return null;
+    const level=tags.find(t=>/信用/.test(t));
+    return {code:'xianyu_seller_credit',term:level||'sin crédito',
+      reasons:[`Xianyu: el vendedor no tiene el crédito más alto de Xianyu (${level?`«${level}»`:'sin etiqueta de crédito'}; se exige «卖家信用极好»). Descartado por política.`]};
+  }
   return {
     code:'no_xianyu_verification',
     term:'etiqueta ausente',
@@ -11167,7 +11177,7 @@ function alertIdentity(x,v){
 function alertQuality(x,v){
   const q=Number(v.final?.quality_score)||null;
   const risk=RISK_ES[String(x.authenticity_risk||'').toUpperCase()]||'—';
-  const tag=String(x.source||'')==='xianyu'&&xianyuListingHasVerificationTag(x)?' · ✅ 验货宝':'';
+  const tag=String(x.source||'')==='xianyu'&&xianyuListingHasVerificationTag(x)?' · ✅ 验货宝 · vendedor 信用极好':'';
   return `⭐ Calidad ${q??'—'}/100 · riesgo ${risk}${tag}`;
 }
 function alertRefs(v){
