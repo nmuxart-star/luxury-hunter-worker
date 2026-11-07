@@ -74,6 +74,11 @@ const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
 const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
 // 0 = sin máximo de relojes por ejecución (solo manda el tiempo).
 const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',0,0,30);
+// CARRIL RÁPIDO (regla de Nil, 07-11-2026): los modelos que más rotan se
+// buscan solo en Xianyu y Mercari (lo más nuevo primero) en cada ejecución,
+// como mucho cada FAST_LANE_MINUTES (lo decide el servidor), para llegar en
+// minutos a los anuncios recién subidos. No mueve su revisión completa.
+const FAST_TASKS=String(process.env.FAST_TASKS||'').split(',').map(x=>x.trim()).filter(Boolean);
 const workerStartedAt=Date.now();
 // El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
 let budgetStartedAt=workerStartedAt;
@@ -181,6 +186,21 @@ try{
     const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN||Infinity});
     runnable=plan.tasks;
     if(plan.deferred.length)console.log(`Relojes aplazados a la siguiente ejecución: ${plan.deferred.map(t=>t.task_name).join(', ')}.`);
+    // Carril rápido primero (salvo los modelos a los que ya les toca la revisión completa).
+    if(FAST_TASKS.length){
+      const full=new Set(runnable.map(t=>t.id));
+      const fastList=tasks.filter(t=>FAST_TASKS.includes(t.task_name)&&!full.has(t.id));
+      await runPool(fastList,TASK_CONCURRENCY,async task=>{
+        try{
+          const q=await api('POST',`/api/tasks/${task.id}/run`,{fast:true});
+          if(q.skipped)return;
+          anyTaskStarted=true;
+          console.log(`\n=== RÁPIDO ${task.task_name} (Xianyu + Mercari) ===`);
+          const run=await waitRun(q.runId);
+          console.log(`DONE rápido ${task.task_name}: ${run.status}`);
+        }catch(e){console.error(`FAILED rápido ${task.task_name}:`,e?.message||e);}
+      });
+    }
     const estimate=taskMinutesEstimate();
     let started=0;
     const canStart=task=>{

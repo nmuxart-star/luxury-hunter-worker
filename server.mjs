@@ -4124,7 +4124,7 @@ async function searchJapanRadarLive(opts){
   }
 
   try{
-    try{
+    if(!opts.fastLane)try{
       // Yahoo Subastas solo por One Map (FROM JAPAN) desde el Chrome del Mac.
       // Sin el Mac no se busca: ni ReefAPI ni One Map desde la nube (vacía).
       const bridgeToken=String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
@@ -9039,7 +9039,9 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
 async function globalSearch(body) {
   const product=String(body.product||body.product_query||'').trim();
   if(!product) throw new Error('Escribe el producto que quieres buscar.');
-  const sources=Array.isArray(body.sources)&&body.sources.length?body.sources:['xianyu','bunjang','buyee'];
+  // Carril rápido: solo Xianyu y Mercari, los anuncios más nuevos primero.
+  const fastLane=!!body.fast;
+  const sources=fastLane?['xianyu','buyee']:Array.isArray(body.sources)&&body.sources.length?body.sources:['xianyu','bunjang','buyee'];
   const sessionId=randomUUID();
   const startedAt=new Date().toISOString();
 
@@ -9091,7 +9093,7 @@ async function globalSearch(body) {
     pages:clampInt(body.pages??body.max_pages,1,1,5),maxItems:clampInt(body.maxItems??body.max_items,20,5,100),
     minEur:body.minEur??body.min_eur??null,maxEur:body.maxEur??body.max_eur??null,sessionId,product,
     personalOnly:!!body.personal_only,freeShipping:!!body.free_shipping,newPublishOption:body.new_publish_option||null,region:body.region||null,
-    accountStateFile:body.account_state_file||null,accountStrategy:body.account_strategy||'auto'
+    accountStateFile:body.account_state_file||null,accountStrategy:body.account_strategy||'auto',fastLane
   };
   // Todas las fuentes a la vez; cada una guarda cuánto ha tardado (ms).
   const jobs=[];
@@ -9104,18 +9106,21 @@ async function globalSearch(body) {
       finally{status[name]={...(status[name]||{}),ms:Date.now()-t0};persistStatus();}
     })());
   };
-  // Bunjang y Rakuten ya no se buscan salvo que se pidan expresamente
-  // (BUNJANG_ENABLED=1 / RAKUTEN_ENABLED=1): casi no daban oportunidades.
+  // Canales de compra (regla de Nil, 07-11-2026): Xianyu, Mercari y Yahoo
+  // Subastas por One Map. Corea (Bunjang), eBay, Rakuten y Vestiaire como
+  // fuente quedan fuera salvo que se activen a mano (BUNJANG_ENABLED=1,
+  // EBAY_ENABLED=1, RAKUTEN_ENABLED=1, VESTIAIRE_SOURCE=1). Vestiaire se
+  // sigue usando para comparar precios.
   const on=k=>['1','on','true','yes'].includes(String(process.env[k]||'').toLowerCase());
-  if(sources.includes('bunjang')&&on('BUNJANG_ENABLED'))run('bunjang',()=>searchBunjangLive({...opts,queries:plan.bunjang}));
+  if(!fastLane&&sources.includes('bunjang')&&on('BUNJANG_ENABLED'))run('bunjang',()=>searchBunjangLive({...opts,queries:plan.bunjang}));
   if(sources.includes('buyee'))run('buyee',()=>searchJapanRadarLive({...opts,queries:plan.japan}));
   const extraOff=['0','off','false','no'].includes(String(process.env.EXTRA_SOURCES||'').toLowerCase());
-  if(!extraOff&&on('RAKUTEN_ENABLED')&&rakutenConfigured())run('rakuten',()=>searchRakutenLive({...opts,queries:plan.japan}));
-  if(!extraOff&&(sources.includes('ebay')||ebayConfigured()))run('ebay',()=>searchEbayLive({...opts,product}));
+  if(!fastLane&&!extraOff&&on('RAKUTEN_ENABLED')&&rakutenConfigured())run('rakuten',()=>searchRakutenLive({...opts,queries:plan.japan}));
+  if(!fastLane&&!extraOff&&on('EBAY_ENABLED')&&(sources.includes('ebay')||ebayConfigured()))run('ebay',()=>searchEbayLive({...opts,product}));
   if(sources.includes('xianyu'))run('xianyu',()=>searchXianyuLive({...opts,queries:plan.xianyu}));
-  // Vestiaire: en las tareas de bolsos (VESTIAIRE_SOURCE=0 lo apaga).
+  // Vestiaire como fuente de compra: apagado (VESTIAIRE_SOURCE=1 lo vuelve a encender).
   const taskName=taskId?db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId)?.task_name:null;
-  if(taskName&&!isWatchTask(taskName)&&!['0','off','false','no'].includes(String(process.env.VESTIAIRE_SOURCE||'').toLowerCase()))
+  if(!fastLane&&taskName&&!isWatchTask(taskName)&&on('VESTIAIRE_SOURCE'))
     run('vestiaire',()=>searchVestiaireSource(opts,taskName));
   await Promise.all(jobs);
   const finishedAt=new Date().toISOString();
@@ -11346,7 +11351,7 @@ async function reportRunHealth(status){
   }
 }
 
-async function executeTask(taskId, runId=null) {
+async function executeTask(taskId, runId=null, {fast=false}={}) {
   // Base de datos de Vestiaire de Nil al día antes de analizar (máx. 25 s).
   await Promise.race([refreshVestiaireSheet().catch(()=>{}),sleep(25000)]);
   if(runId && runIsAborted(runId)){
@@ -11354,7 +11359,8 @@ async function executeTask(taskId, runId=null) {
   }
   taskId=Number(taskId); if(runningTaskIds.has(taskId)) throw new Error('La tarea ya está ejecutándose.');
   const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId)); if(!task) throw new Error('Tarea no encontrada.');
-  if(!task.enabled) throw new Error('La tarea está desactivada.');
+  // El carril rápido también busca modelos desactivados (solo Xianyu y Mercari).
+  if(!task.enabled&&!fast) throw new Error('La tarea está desactivada.');
   runningTaskIds.add(taskId);
   const started=new Date().toISOString();
   if(!runId){const rr=db.prepare('INSERT INTO task_runs(task_id,status,started_at) VALUES(?,?,?)').run(taskId,'running',started);runId=Number(rr.lastInsertRowid);}
@@ -11377,7 +11383,7 @@ async function executeTask(taskId, runId=null) {
     );
 
     const result=await globalSearch({
-      taskId,runId:Number(runId),product:task.product_query,sources:task.sources,pages:task.max_pages,maxItems:task.max_items,minEur:task.min_eur,maxEur:task.max_eur,
+      taskId,runId:Number(runId),product:task.product_query,sources:task.sources,pages:task.max_pages,maxItems:task.max_items,minEur:task.min_eur,maxEur:task.max_eur,fast,
       personal_only:task.personal_only,free_shipping:task.free_shipping,new_publish_option:task.new_publish_option,region:task.region,
       account_state_file:task.account_state_file,account_strategy:task.account_strategy,
       xianyuQueries:task.xianyu_queries,bunjangQueries:task.bunjang_queries,japanQueries:task.japan_queries
@@ -11956,8 +11962,10 @@ async function executeTask(taskId, runId=null) {
     );
 
     db.prepare('UPDATE task_runs SET session_id=?,status=?,source_status_json=?,finished_at=? WHERE id=?').run(result.sessionId,'finished',JSON.stringify({...result.status,email:emailResult}),finished,Number(runId));
-    db.prepare('UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?').run(finished,finished,taskId);
-    return {runId,sessionId:result.sessionId,count:finalItems.length,status:result.status,email:emailResult};
+    // El carril rápido no cuenta como la revisión completa del modelo.
+    if(!fast)db.prepare('UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?').run(finished,finished,taskId);
+    else{const m=getSetting('fast_lane_last',{})||{};m[taskId]=finished;saveSetting('fast_lane_last',m);}
+    return {runId,sessionId:result.sessionId,count:finalItems.length,status:result.status,email:emailResult,fast};
   }catch(e){
     const finished=new Date().toISOString();
 
@@ -13674,9 +13682,16 @@ const server=http.createServer(async(req,res)=>{
     if(tr&&req.method==='POST'){
       const taskId=Number(tr[1]); const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId)); if(!task)return json(res,404,{error:'Tarea no encontrada'});
       if(runningTaskIds.has(taskId))return json(res,409,{error:'La tarea ya está ejecutándose.'});
+      const rbody=await readBody(req).catch(()=>({}));
+      const fast=!!rbody?.fast;
+      if(fast){
+        const last=Date.parse((getSetting('fast_lane_last',{})||{})[taskId]||'')||0;
+        const every=Math.max(5,Number(process.env.FAST_LANE_MINUTES||20));
+        if(Date.now()-last<every*60e3)return json(res,200,{skipped:true,next_in_min:Math.ceil((last+every*60e3-Date.now())/60e3)});
+      }
       const rr=db.prepare('INSERT INTO task_runs(task_id,status,started_at) VALUES(?,?,?)').run(taskId,'queued',new Date().toISOString());
-      const runId=Number(rr.lastInsertRowid); setImmediate(()=>executeTask(taskId,runId).catch(e=>console.error('Task run failed',taskId,e.message)));
-      return json(res,202,{runId,status:'queued'});
+      const runId=Number(rr.lastInsertRowid); setImmediate(()=>executeTask(taskId,runId,{fast}).catch(e=>console.error('Task run failed',taskId,e.message)));
+      return json(res,202,{runId,status:'queued',fast});
     }
     const ti=u.pathname.match(/^\/api\/tasks\/(\d+)\/inspect$/);
     if(ti&&req.method==='GET'){
