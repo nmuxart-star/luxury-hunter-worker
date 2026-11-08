@@ -47,35 +47,35 @@ async function waitForPage(tabId,search){
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
-// Las consultas van en una ventana propia que se crea YA minimizada (nunca
-// en las ventanas de Nil y sin ponerse al frente): una por tanda, y se cierra
-// al terminar la tanda. Cada consulta abre su pestaña dentro de esa ventana.
+// UNA sola ventana minimizada con UNA sola pestaña, para siempre: todas las
+// consultas reutilizan esa pestaña (se navega a la URL nueva) y nunca se cierra
+// ni se crean más. El id se guarda para reencontrarla si Chrome reinicia el
+// service worker. Si Nil la cierra, se crea una nueva y vuelve a ser la única.
 let jobWindow=null;
 async function openHidden(url){
+  if(!jobWindow){
+    const {lhJobWindow}=await chrome.storage.local.get('lhJobWindow');
+    if(lhJobWindow)jobWindow=lhJobWindow;
+  }
   if(jobWindow){
     try{
-      const tab=await chrome.tabs.create({windowId:jobWindow.id,url,active:false});
-      return {windowId:jobWindow.id,tabId:tab.id};
+      await chrome.windows.get(jobWindow.id);
+      await chrome.tabs.update(jobWindow.firstTab,{url,active:false});
+      await sleep(400);
+      return {windowId:jobWindow.id,tabId:jobWindow.firstTab};
     }catch{jobWindow=null;}
   }
   const win=await chrome.windows.create({url,focused:false,state:'minimized'});
   jobWindow={id:win.id,firstTab:win.tabs[0].id};
+  await chrome.storage.local.set({lhJobWindow:jobWindow});
   return {windowId:win.id,tabId:win.tabs[0].id};
 }
-// Cierra la pestaña de la consulta (la primera de la ventana se queda hasta
-// el final de la tanda para que la ventana no se cierre y se vuelva a crear).
+// La pestaña se queda abierta (en blanco) hasta la siguiente consulta.
 async function closeHidden(opened){
   if(!opened?.tabId)return;
-  if(jobWindow&&opened.tabId===jobWindow.firstTab){
-    await chrome.tabs.update(opened.tabId,{url:'about:blank'}).catch(()=>{});
-    return;
-  }
-  await chrome.tabs.remove(opened.tabId).catch(()=>{});
+  await chrome.tabs.update(opened.tabId,{url:'about:blank'}).catch(()=>{});
 }
-async function closeJobWindow(){
-  if(jobWindow)await chrome.windows.remove(jobWindow.id).catch(()=>{});
-  jobWindow=null;
-}
+async function closeJobWindow(){}
 
 async function waitLoaded(tabId,ms=30_000){
   const until=Date.now()+ms;
