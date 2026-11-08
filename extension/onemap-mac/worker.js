@@ -165,66 +165,8 @@ async function handleVestiaire(job,token){
   }
 }
 
-// Lista de One Map (su propio buscador interno, 100 subastas por página) en
-// vez de las 20 tarjetas de la pantalla. Se pide desde la página de búsqueda
-// abierta, como haría la web. La URL lleva #lh-json-pages=N.
-// 07-11-2026: One Map respondía 405 a ráfagas de peticiones seguidas. Ahora
-// se espera a que la página de búsqueda esté cargada, se reintenta con pausa
-// si responde 405/429/503 y el error dice en qué página y en qué intento falló.
-async function oneMapListInPage(keyword,pages){
-  const sleepIn=ms=>new Promise(r=>setTimeout(r,ms));
-  const onSearch=()=>/\/yahoo-auctions\/search\//.test(location.pathname);
-  const until=Date.now()+15000;
-  while(!onSearch()&&Date.now()<until)await sleepIn(500);
-  if(!onSearch())return {status:502,body:`One Map: la página no es la de búsqueda (${location.pathname})`};
-  const items=[];let count=null;
-  const wait=[0,4000,12000];
-  for(let p=1;p<=pages;p++){
-    let r=null,attempt=0;
-    for(attempt=0;attempt<wait.length;attempt++){
-      if(wait[attempt])await sleepIn(wait[attempt]);
-      r=await fetch(`/japan/sites/yahooauction/search?keyword=${encodeURIComponent(keyword).replace(/%20/g,'+')}&category=-&sort=end&hits=100&page=${p}`,{credentials:'include'});
-      if(r.ok||![405,429,503].includes(r.status))break;
-    }
-    if(!r.ok){
-      const snippet=(await r.text().catch(()=>'')).replace(/\s+/g,' ').replace(/<[^>]+>/g,' ').trim().slice(0,100);
-      return {status:r.status,body:`One Map HTTP ${r.status} en ${location.pathname} (página ${p}, ${attempt} reintento(s))${snippet?`: ${snippet}`:''}`};
-    }
-    const j=await r.json();
-    count=j.count??count;
-    items.push(...(j.items||[]).map(x=>({id:x.id,title:x.title,price:x.price,bids:x.bids,endTime:x.endTime,buyItNowPrice:x.buyItNowPrice,imageUrl:x.imageUrl})));
-    if(!(j.items||[]).length)break;
-    await sleepIn(1500);
-  }
-  return {status:200,body:JSON.stringify({count,items})};
-}
-// Entre dos búsquedas de lista pasan al menos LIST_GAP_MS (One Map cierra el paso a las ráfagas).
-let lastListAt=0;
-const LIST_GAP_MS=8000;
-async function handleOneMapList(job,token){
-  const gap=lastListAt+LIST_GAP_MS-Date.now();
-  if(gap>0)await sleep(gap);
-  lastListAt=Date.now();
-  const pages=Math.min(3,Math.max(1,Number((job.url.match(/#lh-json-pages=(\d)/)||[])[1])||2));
-  const pageUrl=job.url.split('#')[0];
-  const keyword=decodeURIComponent((new URL(pageUrl).pathname.match(/\/yahoo-auctions\/search\/([^/]+)\//)||[])[1]||'').replace(/\+/g,' ');
-  let opened;
-  try{
-    opened=await openHidden(pageUrl);
-    const tab=await waitLoaded(opened.tabId);
-    await sleep(1200);
-    const [injection]=await chrome.scripting.executeScript({target:{tabId:opened.tabId},world:'MAIN',func:oneMapListInPage,args:[keyword,pages]});
-    await bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:pageUrl,title:tab?.title||'',html:'',...injection.result});
-  }catch(error){
-    await bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:pageUrl,title:'',html:'',status:502,body:String(error)}).catch(()=>{});
-  }finally{
-    await closeHidden(opened);
-  }
-}
-
 async function handle(job,token){
   if(job.kind==='vestiaire')return handleVestiaire(job,token);
-  if(/#lh-json-pages=/.test(job.url))return handleOneMapList(job,token);
   const search=job.url.includes('/yahoo-auctions/search/');
   let opened;
   try{
