@@ -11,6 +11,8 @@ import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {sellerFromXianyuCard,sellerWatchEligible,sellerRank} from './scripts/xianyu-sellers.mjs';
+import {collectXianyuProfile,collectXianyuDetail,parseProfilePrice} from './scripts/xianyu-profile-watch.mjs';
+import {addXianyuMarketQueries,XIANYU_MARKET_QUERIES} from './scripts/xianyu-market-queries.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
@@ -255,6 +257,18 @@ CREATE TABLE IF NOT EXISTS xianyu_seller_alerts (
   seller_id TEXT NOT NULL,
   sent_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS xianyu_seller_profile_scans (
+  seller_id TEXT PRIMARY KEY,baseline_complete INTEGER NOT NULL DEFAULT 0,
+  last_scan_at TEXT,last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS xianyu_seller_profile_items (
+  seller_id TEXT NOT NULL,source_id TEXT NOT NULL,title TEXT NOT NULL,price_text TEXT,image_url TEXT,
+  tags_json TEXT NOT NULL DEFAULT '[]',published_at TEXT,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,
+  pending INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(seller_id,source_id)
+);
+CREATE TABLE IF NOT EXISTS xianyu_seller_identity_checks (
+  source_id TEXT PRIMARY KEY,checked_at TEXT NOT NULL,result TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS listing_feedback (
   listing_id INTEGER PRIMARY KEY,
   action TEXT NOT NULL,
@@ -280,6 +294,9 @@ function ensureColumn(table, name, definition) {
   if (!cols.includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 ensureColumn('listings', 'purchase_via', 'TEXT');
+ensureColumn('xianyu_seller_profile_items','published_at','TEXT');
+ensureColumn('xianyu_sellers','profile_items_total','INTEGER');
+ensureColumn('xianyu_sellers','profile_ratings_total','INTEGER');
 const updateYahooImage=db.prepare('UPDATE listings SET image_url=? WHERE id=?');
 for(const row of db.prepare("SELECT id,image_url FROM listings WHERE source='yahoo-auctions-jp' AND image_url<>''").all()){
   const image=yahooAuctionImageUrl(row.image_url);
@@ -1806,6 +1823,8 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
     '卖家信息':sellerInfo,
     publishedAt,
     searchOnly:!detail,
+    ...(it.sellerProfileDiscovery?{sellerProfileDiscovery:true}:{}),
+    ...(XIANYU_MARKET_QUERIES.includes(sourceQuery)?{marketDiscovery:true}:{}),
     ...(it.provider?{dataProvider:it.provider}:prevRaw.dataProvider?{dataProvider:prevRaw.dataProvider}:{})
   };
   upsertListing({
@@ -1938,6 +1957,146 @@ function searchXianyuLive(opts){
   const run=xianyuQueue.then(()=>searchXianyuAlternate(opts));
   xianyuQueue=run.catch(()=>{});
   return run;
+}
+
+// Una sola cola para búsquedas, perfiles y fichas: ante una verificación se
+// detienen todos los accesos de Xianyu de esta ejecución.
+function searchXianyuSellerProfiles(opts){
+  const run=xianyuQueue.then(()=>scanXianyuSellerProfiles(opts));
+  xianyuQueue=run.catch(()=>{});
+  return run;
+}
+
+async function scanXianyuSellerProfiles({sessionId}){
+  if(xianyuPausedReason||xianyuAccountBlocked()||xianyuDirectSessionBlock())return {ok:true,state:'paused'};
+  const laneMin=clampInt(process.env.XIANYU_SELLER_LANE_MIN??20,20,10,1440);
+  const last=Number(getSetting('xianyu_seller_lane_last',0))||0;
+  if(Date.now()-last<laneMin*60000)return {ok:true,state:'throttled'};
+  const now=new Date().toISOString();
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_seller_lane_last',?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),now);
+  let context;
+  const withPage=async fn=>{const page=await context.newPage();try{return await fn(page);}finally{await page.close().catch(()=>{});}};
+  const gap=async()=>sleep(Math.max(5,Number(process.env.XIANYU_SELLER_GAP_SEC)||15)*1000);
+  let identified=0,scanned=0,queued=0,kept=0,incomplete=0;
+  try{
+    ({context}=await getXianyuDirect());
+    // La búsqueda suele traer solo el apodo. Una ficha reciente con la etiqueta
+    // permite recuperar el ID sin confundir cuentas que se llaman igual.
+    const unchecked=db.prepare(`SELECT l.* FROM listings l
+      LEFT JOIN xianyu_seller_identity_checks c ON c.source_id=l.source_id
+      WHERE l.source='xianyu' AND (c.source_id IS NULL OR (c.result<>'identified' AND c.checked_at<?)) AND l.first_seen>=?
+      AND json_valid(l.raw_json) AND COALESCE(json_extract(l.raw_json,'$."卖家信息"."卖家ID"'),'')=''
+      ORDER BY l.first_seen DESC LIMIT 30`).all(new Date(Date.now()-2*3600e3).toISOString(),new Date(Date.now()-24*3600e3).toISOString());
+    for(const listing of unchecked){
+      let raw={};try{raw=JSON.parse(listing.raw_json||'{}');}catch{}
+      if(raw?.['卖家信息']?.['卖家ID'])continue;
+      let info;
+      try{info=await withPage(page=>collectXianyuDetail(page,listing.source_id));}
+      catch(e){
+        if(e?.kind==='risk'||e?.kind==='login')throw e;
+        db.prepare('INSERT OR REPLACE INTO xianyu_seller_identity_checks(source_id,checked_at,result) VALUES(?,?,?)')
+          .run(String(listing.source_id),new Date().toISOString(),'unavailable');
+        break;
+      }
+      db.prepare('INSERT OR REPLACE INTO xianyu_seller_identity_checks(source_id,checked_at,result) VALUES(?,?,?)')
+        .run(String(listing.source_id),new Date().toISOString(),info.sellerId?'identified':'missing-id');
+      if(info.sellerId){
+        const seller=raw['卖家信息']||{};
+        raw['卖家信息']={...seller,'卖家ID':info.sellerId,'芝麻信用':info.sellerCredit||seller['芝麻信用']||null};
+        db.prepare('UPDATE listings SET raw_json=? WHERE id=?').run(JSON.stringify(raw),listing.id);
+        recordXianyuSeller({id:listing.source_id,sellerId:info.sellerId,seller:listing.seller_name||info.sellerName,
+          sellerCredit:info.sellerCredit,tags:raw?.['商品信息']?.['商品标签']||[]});
+        identified++;
+      }
+      await gap();
+      break;
+    }
+    const dueBefore=new Date(Date.now()-2*3600e3).toISOString();
+    const seller=db.prepare(`SELECT s.*,p.baseline_complete,p.last_scan_at FROM xianyu_sellers s
+      LEFT JOIN xianyu_seller_profile_scans p ON p.seller_id=s.seller_id
+      WHERE s.watch_status IN ('candidate','following') AND (p.last_scan_at IS NULL OR p.last_scan_at<=?)
+      ORDER BY COALESCE(p.last_scan_at,''),s.last_seen DESC LIMIT 1`).get(dueBefore);
+    if(!seller)return {ok:true,state:'no-due-seller',identified,scanned,queued,kept};
+    const snapshot=await withPage(page=>collectXianyuProfile(page,seller.seller_id,
+      {maxPages:clampInt(process.env.XIANYU_SELLER_PROFILE_PAGES??10,10,1,25)}));
+    scanned++;
+    if(snapshot.head){
+      const totalItems=Number(snapshot.head.totalItems),totalRatings=Number(snapshot.head.totalRatings);
+      db.prepare(`UPDATE xianyu_sellers SET name=CASE WHEN ?<>'' THEN ? ELSE name END,
+        credit=CASE WHEN ?<>'' THEN ? ELSE credit END,profile_items_total=COALESCE(?,profile_items_total),
+        profile_ratings_total=COALESCE(?,profile_ratings_total),last_seen=? WHERE seller_id=?`)
+        .run(snapshot.head.name,snapshot.head.name,snapshot.head.credit,snapshot.head.credit,
+          snapshot.head.totalItems!=null&&Number.isFinite(totalItems)?totalItems:null,
+          snapshot.head.totalRatings!=null&&Number.isFinite(totalRatings)?totalRatings:null,now,seller.seller_id);
+    }
+    if(!snapshot.complete){
+      incomplete++;
+      db.prepare(`INSERT INTO xianyu_seller_profile_scans(seller_id,baseline_complete,last_scan_at,last_error) VALUES(?,0,?,?)
+        ON CONFLICT(seller_id) DO UPDATE SET last_scan_at=excluded.last_scan_at,last_error=excluded.last_error`)
+        .run(seller.seller_id,now,'Perfil incompleto; no se estableció una base para detectar novedades.');
+      return {ok:false,state:'incomplete-profile',identified,scanned,queued,kept,incomplete};
+    }
+    const known=db.prepare('SELECT 1 FROM xianyu_seller_profile_items WHERE seller_id=? AND source_id=?');
+    const put=db.prepare(`INSERT INTO xianyu_seller_profile_items(seller_id,source_id,title,price_text,image_url,tags_json,published_at,first_seen,last_seen,pending)
+      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(seller_id,source_id) DO UPDATE SET
+      title=excluded.title,price_text=excluded.price_text,image_url=excluded.image_url,tags_json=excluded.tags_json,
+      published_at=COALESCE(excluded.published_at,published_at),last_seen=excluded.last_seen`);
+    for(const item of snapshot.items){
+      const published=item.publishedAt?Date.parse(item.publishedAt):NaN;
+      const recent=Number.isFinite(published)&&Date.now()-published<=24*3600e3&&published<=Date.now()+600000;
+      const isNew=!known.get(seller.seller_id,item.id)&&(!!seller.baseline_complete||recent);
+      put.run(seller.seller_id,item.id,item.title,String(item.price??''),item.image,JSON.stringify(item.tags),item.publishedAt,now,now,isNew?1:0);
+      if(isNew)queued++;
+    }
+    db.prepare(`INSERT INTO xianyu_seller_profile_scans(seller_id,baseline_complete,last_scan_at,last_error) VALUES(?,1,?,NULL)
+      ON CONFLICT(seller_id) DO UPDATE SET baseline_complete=1,last_scan_at=excluded.last_scan_at,last_error=NULL`).run(seller.seller_id,now);
+    const profile=db.prepare('SELECT * FROM xianyu_sellers WHERE seller_id=?').get(seller.seller_id);
+    const counts=db.prepare('SELECT COUNT(*) observed,SUM(verified_tag) verified FROM xianyu_seller_seen WHERE seller_id=?').get(seller.seller_id);
+    if(profile.watch_status==='candidate'&&sellerWatchEligible({observed:counts.observed,verified:counts.verified||0,
+      credit:profile.credit,sold:profile.sold_count,reviews:profile.review_count,positiveRate:profile.positive_rate})){
+      db.prepare("UPDATE xianyu_sellers SET watch_status='following',followed_at=? WHERE seller_id=?").run(now,seller.seller_id);
+    }
+    if(profile.watch_status!=='following')return {ok:true,state:'profile-candidate',identified,scanned,queued,kept};
+    const pending=db.prepare('SELECT * FROM xianyu_seller_profile_items WHERE seller_id=? AND pending=1 ORDER BY first_seen LIMIT 2').all(seller.seller_id);
+    for(const item of pending){
+      await gap();
+      const detail=await withPage(page=>collectXianyuDetail(page,item.source_id));
+      if(detail.sellerId!==seller.seller_id){
+        db.prepare('UPDATE xianyu_seller_profile_items SET pending=2 WHERE seller_id=? AND source_id=?').run(seller.seller_id,item.source_id);
+        continue;
+      }
+      let tags=[];try{tags=JSON.parse(item.tags_json||'[]');}catch{}
+      tags=[...new Set([...tags,...detail.tags])];
+      const publishTime=detail.publishedAt||item.published_at;
+      const published=publishTime?Date.parse(publishTime):NaN;
+      const price=parseProfilePrice(item.price_text);
+      if(!hasXianyuVerificationTag(tags)||!Number.isFinite(published)||Date.now()-published>24*3600e3||published>Date.now()+600000||!(price>0)){
+        db.prepare('UPDATE xianyu_seller_profile_items SET pending=2 WHERE seller_id=? AND source_id=?').run(seller.seller_id,item.source_id);
+        continue;
+      }
+      const saved=saveXianyuCandidate({id:item.source_id,title:detail.title||item.title,price,url:`https://www.goofish.com/item?id=${encodeURIComponent(item.source_id)}`,
+        image:detail.images[0]||item.image_url,images:detail.images,publishedAt:publishTime,
+        seller:profile.name,sellerId:profile.seller_id,sellerCredit:profile.credit,tags,description:detail.description,
+        sellerProfileDiscovery:true,provider:'seller-profile'},{sessionId,sourceQuery:'Perfil de vendedor'});
+      db.prepare('UPDATE xianyu_seller_profile_items SET pending=? WHERE seller_id=? AND source_id=?')
+        .run(saved.kept?0:2,seller.seller_id,item.source_id);
+      if(saved.kept)kept++;
+    }
+    return {ok:true,state:'finished',identified,scanned,queued,kept,incomplete};
+  }catch(error){
+    if(error?.kind==='risk'){
+      xianyuPausedAt=Date.now();xianyuPauseCode='risk';xianyuPauseLen=XIANYU_RISK_PAUSE_MS;
+      xianyuPausedReason='Xianyu pidió una verificación durante la revisión de vendedores; la fuente queda pausada.';
+      xianyuBlockAccount('verificación de seguridad al revisar vendedores');
+      await reportHealthIssue('xianyu-risk',xianyuPausedReason).catch(()=>{});
+    }else if(error?.kind==='login'){
+      xianyuPausedAt=Date.now();xianyuPauseCode='login';xianyuPauseLen=XIANYU_PAUSE_MS;
+      xianyuPausedReason='La sesión de Xianyu caducó durante la revisión de vendedores.';
+      await reportHealthIssue('xianyu-login',xianyuPausedReason).catch(()=>{});
+    }
+    return {ok:false,state:error?.kind||'error',warning:String(error?.message||error).slice(0,240),identified,scanned,queued,kept};
+  }
 }
 function xianyuDirectSessionBlock(){
   const ss=String(process.env.XIANYU_SESSION_STATUS||'').trim();
@@ -4734,6 +4893,7 @@ async function analyzeWithGemini(listingId,taskId=null,analyzeImages=true,onProg
     if(tid){taskId=tid;task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(Number(tid)));}
   }
   if(!task)throw new Error('Este anuncio no corresponde a ningún modelo del bot: no hay referencias de tu base con las que compararlo.');
+  task=sellerDiscoveryTask(task,item);
   return analyzeByReferences({key,item,task,taskId,analyzeImages,reportProgress,negotiated});
 }
 
@@ -4783,15 +4943,18 @@ function effectivePlan(basePlan, taskOrBody={}) {
 // Tareas "Radar ...": recorren por turnos una lista larga de modelos. Cada
 // ejecución empieza la lista por los siguientes modelos de cada web, porque
 // solo se usan las primeras búsquedas (1 en Xianyu, 2 en Japón, 2 en Corea).
-const RADAR_STEP={xianyu:2,japan:2,bunjang:2};
+// Xianyu hace una consulta por pasada: avanzar una evita omitir la mitad de
+// las consultas cuando la lista tiene un número par de modelos.
+const RADAR_STEP={xianyu:1,japan:2,bunjang:2};
 function radarRotatePlan(plan,taskId){
   if(!taskId)return plan;
   const task=db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId);
   if(!/^radar\b/i.test(String(task?.task_name||'')))return plan;
   const turn=db.prepare('SELECT COUNT(*) AS n FROM task_runs WHERE task_id=?').get(taskId).n;
   const out={...plan};
+  out.xianyu=addXianyuMarketQueries(out.xianyu||[]);
   for(const [key,step] of Object.entries(RADAR_STEP)){
-    const list=Array.isArray(plan[key])?plan[key]:[];
+    const list=Array.isArray(out[key])?out[key]:[];
     if(list.length<2)continue;
     const off=(turn*step)%list.length;
     out[key]=[...list.slice(off),...list.slice(0,off)];
@@ -4912,6 +5075,13 @@ async function globalSearch(body) {
   if(sources.includes('buyee'))run('buyee',()=>searchJapanRadarLive({...opts,queries:plan.japan}));
   if(sources.includes('xianyu'))run('xianyu',()=>searchXianyuLive({...opts,queries:plan.xianyu}));
   await Promise.all(jobs);
+  const sellerTask=taskId?db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId):null;
+  // Desactivado hasta validar el acceso a fichas con la cuenta: una prueba
+  // real de Xianyu solicitó una verificación de seguridad.
+  const sellerProfilesEnabled=['1','true','yes','on'].includes(String(process.env.XIANYU_SELLER_PROFILES_ENABLED||'').toLowerCase());
+  if(sellerProfilesEnabled&&sources.includes('xianyu')&&/^radar\b/i.test(String(sellerTask?.task_name||''))&&status.xianyu?.ok&&status.xianyu?.state!=='paused'){
+    status.xianyuSellers=await searchXianyuSellerProfiles({sessionId});
+  }
   const finishedAt=new Date().toISOString();
   db.prepare('UPDATE search_sessions SET source_status_json=?,status=?,finished_at=? WHERE id=?').run(JSON.stringify(status),'finished',finishedAt,sessionId);
   const items=sessionListings(sessionId);
@@ -5930,6 +6100,27 @@ Return ONLY JSON: {"items":[{"i":0,"score":0,"reason_es":"motivo breve en españ
   return {scores,minScore,calls,model,usage,flagged};
 }
 
+async function triageWithSellerContexts(task,items){
+  const groups=new Map();
+  for(const item of items){
+    const context=sellerDiscoveryTask(task,item);
+    const key=context.task_name;
+    if(!groups.has(key))groups.set(key,{context,items:[]});
+    groups.get(key).items.push(item);
+  }
+  let combined=null;
+  for(const group of groups.values()){
+    const result=await triageWithAi(group.context,group.items);
+    if(!combined)combined={...result,scores:new Map(result.scores)};
+    else{
+      for(const [id,value] of result.scores)combined.scores.set(id,value);
+      combined.calls+=result.calls||0;
+      combined.flagged+=result.flagged||0;
+    }
+  }
+  return combined;
+}
+
 function storeTriageReject(taskId,item,t){
   const now=new Date().toISOString();
   const economics=importEconomics(item);
@@ -6002,12 +6193,34 @@ function xianyuSellerList(){
       id:s.seller_id,url:`https://www.goofish.com/personal?userId=${encodeURIComponent(s.seller_id)}`,
       name:s.name,type:s.seller_type,credit:s.credit,sold:s.sold_count,
       active:s.active_count,reviews:s.review_count,positiveRate:s.positive_rate,
+      profileItemsTotal:s.profile_items_total,profileRatingsTotal:s.profile_ratings_total,
       observed:s.observed,verified:s.verified||0,verifiedShare:s.observed?(s.verified||0)/s.observed:0,
       score:sellerRank({observed:s.observed,verified:s.verified||0,credit:s.credit,
         sold:s.sold_count,reviews:s.review_count,positiveRate:s.positive_rate}),
       status:s.watch_status,followedAt:s.followed_at,lastSeen:s.last_seen,
       badges:JSON.parse(s.badges_json||'[]')
     })).sort((a,b)=>(b.status==='following')-(a.status==='following')||b.score-a.score||b.observed-a.observed);
+}
+
+async function sendXianyuSellerSummary(){
+  if(!telegramConfigured())return {sent:false,reason:'telegram-not-configured'};
+  const last=Date.parse(getSetting('xianyu_seller_summary_at',null)||'');
+  if(Number.isFinite(last)&&Date.now()-last<24*3600e3)return {sent:false,reason:'not-due'};
+  const sellers=xianyuSellerList().filter(s=>s.status==='following');
+  if(!sellers.length)return {sent:false,reason:'no-followed-sellers'};
+  const lines=sellers.slice(0,10).map((s,i)=>{
+    const facts=[s.credit,s.sold!=null?`${s.sold} vendidos`:null,s.active!=null?`${s.active} en venta`:null,
+      s.profileItemsTotal!=null?`${s.profileItemsTotal} anuncios totales en el perfil`:null,
+      s.reviews!=null?`${s.reviews} valoraciones de vendedor`:s.profileRatingsTotal!=null?`${s.profileRatingsTotal} valoraciones totales de cuenta`:null,
+      s.positiveRate!=null?`${s.positiveRate}% positivas`:null].filter(Boolean).join(' · ');
+    return `${i+1}. <a href="${htmlEsc(s.url)}">${htmlEsc(s.name||s.id)}</a>\n${htmlEsc(facts||'Reputación: datos incompletos')}\n验货宝: ${s.verified}/${s.observed} anuncios observados`;
+  });
+  const text=['👥 <b>VENDEDORES XIANYU SEGUIDOS</b>',
+    'Orden orientativo según los datos que ha podido observar el bot.',...lines,
+    sellers.length>10?`Otros vendedores seguidos: ${sellers.length-10}`:''].filter(Boolean).join('\n\n');
+  await telegramSend(text,null,{noPreview:true});
+  saveSetting('xianyu_seller_summary_at',new Date().toISOString());
+  return {sent:true,count:sellers.length};
 }
 
 async function sendXianyuSellerAlerts(items){
@@ -6021,7 +6234,7 @@ async function sendXianyuSellerAlerts(items){
     const seller=db.prepare(`SELECT s.*,v.first_seen AS item_first_seen FROM xianyu_sellers s
       JOIN xianyu_seller_seen v ON v.seller_id=s.seller_id AND v.source_id=?
       WHERE s.seller_id=? AND s.watch_status='following' AND v.verified_tag=1
-        AND v.first_seen>s.followed_at`).get(String(x.source_id),sellerId);
+        AND v.first_seen>=s.followed_at`).get(String(x.source_id),sellerId);
     if(!seller)continue;
     const reserved=db.prepare('INSERT OR IGNORE INTO xianyu_seller_alerts(source_id,seller_id,sent_at) VALUES(?,?,?)')
       .run(String(x.source_id),sellerId,new Date().toISOString());
@@ -6670,6 +6883,14 @@ function importCostLines(x){
 // Igual que scripts/github-run-schedule.mjs (WATCH_TASK_RE).
 const WATCH_TASK_RE=/speedmaster|seamaster|rolex|tudor|grand seiko|\bseiko\b|cartier (santos|tank|ballon|panth)|\biwc\b|jaeger|breitling|patek|audemars|panerai|tag heuer|\bheuer\b|\breloj|\bwatch/i;
 function isWatchTask(name){return WATCH_TASK_RE.test(String(name||''));}
+function sellerDiscoveryTask(task,item){
+  let raw={};try{raw=JSON.parse(item?.raw_json||'{}');}catch{}
+  if(!raw.sellerProfileDiscovery&&!raw.marketDiscovery)return task;
+  const watch=WATCH_ITEM_RE.test(`${item.title||''} ${item.description||''}`);
+  return {...task,task_name:watch?'Radar relojes de vendedores':'Radar bolsos de vendedores',
+    product_query:watch?'Cualquier reloj de lujo de segunda mano':'Cualquier bolso de lujo de segunda mano',
+    description:'Evalúa cualquier modelo de lujo, incluidos los que ya tengan tarea propia. Exige la etiqueta 验货宝, estado y autenticidad revisables y referencias idénticas de la base para calcular la rentabilidad. Si faltan comparables fiables, avisa para revisar y no marques BUY.'};
+}
 function resalePlatform(taskName){
   return isWatchTask(taskName)
     ?{name:'Chrono24',fee:Number(process.env.CHRONO24_COMMISSION_PCT??6.5)}
@@ -7336,6 +7557,15 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       xianyuQueries:task.xianyu_queries,bunjangQueries:task.bunjang_queries,japanQueries:task.japan_queries
     });
 
+    // El aviso de vendedor se envía aunque el triaje posterior descarte el
+    // producto; las oportunidades se comunican por el canal habitual.
+    try{result.status.sellerAlerts=await sendXianyuSellerAlerts(result.items);}
+    catch(e){result.status.sellerAlerts={sent:0,error:e.message};}
+    if(/^radar\b/i.test(String(task.task_name||''))){
+      try{result.status.sellerSummary=await sendXianyuSellerSummary();}
+      catch(e){result.status.sellerSummary={sent:false,error:e.message};}
+    }
+
     if(runIsAborted(runId)){
       return abortedResult(runId,result.sessionId);
     }
@@ -7460,7 +7690,8 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
         ).get(taskId,item.id);
 
         if(!existingAnalysis||priceChangedIds.has(Number(item.id))){
-          const pre=deterministicPrescreen(item,task)||priceCeilingVeto(item,task);
+          const itemTask=sellerDiscoveryTask(task,item);
+          const pre=deterministicPrescreen(item,itemTask)||priceCeilingVeto(item,itemTask);
           if(pre){
             storePrescreenReject(taskId,item,pre);
             prescreenStats.rejected++;
@@ -7523,7 +7754,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       if(triageEnabled&&toTriage.length){
         setTaskRunProgress(runId,32,'Triaje IA',`${toTriage.length} anuncios nuevos · ${aiTriageModel()}`);
         try{
-          const triage=await auctionAiStore.run(toTriage.some(x=>listingAuction(x)?.live),()=>triageWithAi(task,toTriage));
+          const triage=await auctionAiStore.run(toTriage.some(x=>listingAuction(x)?.live),()=>triageWithSellerContexts(task,toTriage));
           let kept=0,rejected=0,unscored=0;
           const keep=new Set();
           for(const item of toTriage){
@@ -7877,12 +8108,6 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       `${finalItems.length} anuncios en la ejecución`
     );
 
-    try{
-      result.status.sellerAlerts=await sendXianyuSellerAlerts(finalItems);
-    }catch(e){
-      result.status.sellerAlerts={sent:0,error:e.message};
-      console.error(`Seller alerts task ${taskId}:`,e.message);
-    }
     try{
       const median=taskMedianAskingEur(taskId);
       const withRatio=finalItems.map(x=>({
@@ -9588,7 +9813,7 @@ const server=http.createServer(async(req,res)=>{
     }
     if(req.method==='GET'&&u.pathname==='/api/xianyu/sellers'){
       const sellers=xianyuSellerList();
-      return json(res,200,{sellers,coverage:'Anuncios observados en las búsquedas del bot; no catálogo completo del vendedor.'});
+      return json(res,200,{sellers,coverage:'Datos de búsquedas y, si está activada y funciona, de perfiles; no se garantiza el catálogo completo.'});
     }
     const sellerRoute=u.pathname.match(/^\/api\/xianyu\/sellers\/([^/]+)$/);
     if(req.method==='PATCH'&&sellerRoute){
