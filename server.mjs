@@ -13,6 +13,7 @@ import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationT
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
+import {descTokens,descIndex,descScore,refSheetDoubt} from './scripts/ref-retrieval.mjs';
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
@@ -4124,7 +4125,7 @@ function storeTaskAnalysis(taskId,item,a,preliminaryDecision,verification,now){
 const REF_MAX_BASE=Number(process.env.REF_MAX_BASE||80);
 const REF_EXTRA_BASE=Number(process.env.REF_EXTRA_BASE||320);
 const REF_MAX_LIVE=Number(process.env.REF_MAX_LIVE||96);
-const REF_MAT_CLASS=[['exotica',/croco|alligat|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|stingray|exotic/i],['ante',/suede|ante\b|daim|nubuck|绒/i],['tela',/canvas|lona|toile|nylon|nail[oó]n|tela|fabric|denim|tweed|jacquard|cotton|algod[oó]n|raffia|paja|帆布|尼龙/i],['sintetica',/vegana|vegan|sint[eé]tic|faux|imitaci|ecopiel|合成皮革|フェイクレザー/i],['charol',/charol|patent|vernis|エナメル|漆皮/i],['piel',/leather|cuero|piel|calf|lamb|caviar|cordero|becerro|charol|patent|皮/i]];
+const REF_MAT_CLASS=[['exotica',/croco|alligat|python|pit[oó]n|ostrich|avestruz|lizard|lagarto|stingray|serpiente|exotic/i],['ante',/suede|\bante\b|daim|nubuck|绒/i],['tela',/canvas|lona|toile|nylon|nail[oó]n|tela|fabric|denim|tweed|jacquard|cotton|algod[oó]n|raffia|paja|帆布|尼龙/i],['sintetica',/vegana|vegan|sint[eé]tic|faux|imitaci|ecopiel|合成皮革|フェイクレザー/i],['charol',/charol|patent|vernis|エナメル|漆皮/i],['piel',/leather|cuero|piel|calf|lamb|caviar|cordero|becerro|charol|patent|皮/i]];
 const refMatClass=t=>(REF_MAT_CLASS.find(([,re])=>re.test(String(t||'')))||[])[0]||null;
 const refColour=t=>(typeof VESTIAIRE_COLOR_RE!=='undefined'?VESTIAIRE_COLOR_RE.find(([,re])=>re.test(String(t||''))):null)?.[0]||null;
 function baseReferenceRows(task,item){
@@ -4165,6 +4166,19 @@ EXOTIC SKIN POLICY: genuine crocodile, alligator, python/snake, ostrich, lizard 
 
 Return ONLY JSON:
 {"brand":"","model":"","variant":"","size":"","material":"","colour":"","hardware":"","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"confidence":0.0,"base_same":["B1"],"base_similar":[],"vestiaire_same":["V3"],"vestiaire_similar":[],"decision_reasons_es":["1 a 4 motivos breves en español sobre identificación, estado, calidad y autenticidad; nada de precios"]}`;
+// Bolsos: la primera lectura no ve referencias. Solo identifica el anuncio y lo
+// describe igual que la columna «Descripción IA» de la hoja, para buscar con
+// esa descripción las fichas parecidas.
+const LISTING_IDENTIFY_INSTRUCTION=`You are the listing inspector of Luxury Hunter (second-hand luxury bags bought in Asia and resold in Europe). Never estimate prices.
+1. IDENTIFY the bag from title, description and photos: brand, exact model line, exact variant, size (name and/or measurements), material, colour, hardware. target_match false for accessories only, wallets/pouches when the target is a bag, other model lines, replicas. Never turn a look-alike into the target line (Lady Dior ≠ Lady D-Lite/D-Joy, Classic Flap ≠ Boy/19/Coco Handle/WOC, Saddle ≠ Bobby, City ≠ First/Work/Neo Classic).
+2. JUDGE THE LISTING: condition grade, visible wear, completeness, photo quality, authenticity risk. quality_score 0-100 (100 like new and complete with many clear photos; 50 normal used; below 30 damaged, incomplete or impossible to check). authenticity_risk HIGH only with concrete evidence; suspicion alone is MEDIUM.
+3. DESCRIBE IT in description_es, in Spanish, with exactly this form and only what you can see or read: "Marca Modelo Talla · medidas cm · material · color · rasgos visibles". Rasgos: acolchado o textura (Cannage, rombos, liso, granulado, monograma), tipo de cierre (solapa, cremallera, pistón, cierre CC, cierre F), asas (asa superior, dos asas, asas trenzadas, asa curva de hombro), correa o cadena, herrajes dorados o plateados, charms, bolsillo frontal, costuras y formas. Omit what you do not know; never guess measurements.
+EXOTIC SKIN POLICY: genuine crocodile, alligator, python/snake, ostrich, lizard or stingray → exotic_skin true.
+Return ONLY JSON:
+{"brand":"","model":"","variant":"","size":"","material":"","colour":"","hardware":"","description_es":"","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"confidence":0.0,"decision_reasons_es":["1 a 4 motivos breves en español sobre identificación, estado, calidad y autenticidad; nada de precios"]}`;
+function identifyPrompt(task,item){
+  return `${LISTING_IDENTIFY_INSTRUCTION}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nTASK CRITERIA:\n${String(task.description||'').slice(0,1500)}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nMARKETPLACE VERIFICATION: ${JSON.stringify(detectMarketplaceVerification(item))}`;
+}
 function referencePrompt(task,item,base,live,economics){
   const ctx=`TASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\nTASK CRITERIA:\n${String(task.description||'').slice(0,1500)}`;
   return `${LISTING_AI_INSTRUCTION}\n\n${ctx}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nMARKETPLACE VERIFICATION: ${JSON.stringify(detectMarketplaceVerification(item))}\n\n`+
@@ -4181,6 +4195,15 @@ function referenceCompsForAlert(price,{tab,model,source}){
 // misma talla/versión, mismo material). Si no hay ninguna, no hay precio ni
 // referencias en el aviso.
 const REF_PHOTO_MAX=Number(process.env.REF_PHOTO_MAX||12);
+// Bolsos (regla de Nil, 08-11-2026): 100 fichas parecidas por descripción → check
+// con imagen de las 100 → las mejores, una a una con el modelo bueno → segunda
+// comprobación que intenta desmentirlas. Solo cuenta lo que supera todo.
+const REF_RETRIEVE_MAX=Number(process.env.REF_RETRIEVE_MAX||100);
+const REF_VISUAL_BATCH=Number(process.env.REF_VISUAL_BATCH||25);
+const REF_VISUAL_MIN_SCORE=Number(process.env.REF_VISUAL_MIN_SCORE||60);
+const REF_BAG_PHOTO_MAX=Number(process.env.REF_BAG_PHOTO_MAX||20);
+const REF_MIN_CONFIDENCE=Number(process.env.REF_MIN_CONFIDENCE||95);
+const REF_DESC_WEIGHT=Number(process.env.REF_DESC_WEIGHT||8);
 // SELECCIÓN DE REFERENCIAS (regla de Nil, 07-11-2026): siempre del mismo
 // modelo; las elige el bot, no la IA. Mismo material obligatorio; si el
 // anuncio dice su talla o medidas, solo esa talla (±15 %); delante las de
@@ -4204,8 +4227,10 @@ function listingSizeLabel(text){
   const v=vestiaireSizeLabel(text);
   return (v&&v!=='Bandolera'?v:null)||(REF_SIZE_JP.find(([,re])=>re.test(String(text||'')))||[])[0]||null;
 }
-function pickPhotoRefs(rows,{ident={},item={},boost={},max=REF_PHOTO_MAX}={}){
+function pickPhotoRefs(rows,{ident={},item={},boost={},max=REF_PHOTO_MAX,descQuery=''}={}){
   const text=`${item.title||''} ${item.description||''}`;
+  const queryWords=descQuery?descTokens(descQuery):null;
+  const queryIndex=queryWords?descIndex(rows):null;
   const unsure=/no (indicad|especificad|confirm)|parece|probabl|desconoc|unknown|not (stated|given)/i.test(String(ident.size||''));
   // Talla dicha en el anuncio (texto): filtro duro. Talla deducida por la IA: solo puntúa.
   const hardW=listingWidthCm(text), hardS=listingSizeLabel(item.title||'');
@@ -4216,6 +4241,7 @@ function pickPhotoRefs(rows,{ident={},item={},boost={},max=REF_PHOTO_MAX}={}){
     .map(m=>flat(m[0])).filter(x=>x.length>=5&&/\d{3}/.test(x));
   const out=[];
   for(const r of rows||[]){
+    if(refSheetDoubt(r))continue;
     const rMat=refMatClass(`${r.material||''} ${r.notes||''}`)||refMatClass(r.desc);
     if(lMat&&rMat&&rMat!==lMat)continue;
     const rW=caseMm(r.dims)?caseMm(r.dims)/10:(vestiaireWidthCm(r.dims)||listingWidthCm(`${r.size||''} ${r.notes||''}`)||listingWidthCm(r.desc));
@@ -4231,13 +4257,15 @@ function pickPhotoRefs(rows,{ident={},item={},boost={},max=REF_PHOTO_MAX}={}){
     // Relojes: la misma referencia pesa más que nada; después, la misma familia.
     if(idRefs.length&&rr.length>=5)s+=idRefs.some(x=>x.includes(rr)||rr.includes(x))?10:idRefs.some(x=>x.slice(0,5)===rr.slice(0,5))?5:idRefs.some(x=>x.slice(0,4)===rr.slice(0,4))?2:0;
     s+=boost[r._code]||0;
+    if(queryWords)s+=descScore(queryIndex,queryWords,r)*REF_DESC_WEIGHT;
     if(!(/^https:\/\//.test(String(r.photo||''))||String(r._code||'').startsWith('V')))s-=4;
     if(r.sold)s+=0.5;
     out.push({r,s,size:rS||(rW?`${Math.round(rW)}cm`:'?')});
   }
   out.sort((a,b)=>b.s-a.s||compWeight(b.r)-compWeight(a.r));
   // Sin ninguna pista de talla: unas pocas de cada talla, para que la foto decida.
-  if(!guessW&&!guessS){
+  // (con descripción no hace falta: manda el parecido y la foto decide la talla).
+  if(!guessW&&!guessS&&!queryWords){
     const by=new Map();for(const x of out){if(!by.has(x.size))by.set(x.size,[]);by.get(x.size).push(x);}
     const lists=[...by.values()];const pick=[];
     for(let i=0;pick.length<max&&lists.some(l=>l[i]);i++)for(const l of lists){if(l[i]&&pick.length<max)pick.push(l[i]);}
@@ -4284,10 +4312,75 @@ Also re-judge the LISTING with all its photos: condition, completeness, quality 
 PRICE (orientative): using ONLY the references you put in "same" and their prices (SOLD prices are real sales and weigh more than asking prices; same measurements and same colour weigh more), give price_eur = the realistic price at which THIS listing would sell second-hand in Europe in its condition and completeness. Go down for worse condition, wear, missing box/card/strap/papers; go up only if it is clearly better than those references. Never go above the highest or far below the lowest of the confirmed references. If "same" is empty, price_eur is null.
 Return ONLY JSON:
 {"same":["B3","V2"],"same_colour":["B3"],"price_eur":0,"price_reason_es":"una frase: con qué referencias y por qué ese precio","not_same":{"B4":"motivo breve en español"},"flaws_zh":"desgaste visible del ANUNCIO en chino, máx. 15 caracteres (p. ej. 四角轻微磨损); vacío si no se ve ninguno","target_match":true,"condition_grade":"Nuevo|Como nuevo|Muy buen estado|Buen estado|Correcto|Malo","completeness_es":"","quality_score":0,"authenticity_risk":"LOW|MEDIUM|HIGH","exotic_skin":false,"decision_reasons_es":["1 a 4 motivos breves en español; nada de precios"]}`;
-async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,first}){
+const REF_STRICT_BAG=`
+STRICT MODE FOR BAGS (overrides anything above): a wrong confirmation is far worse than a missed one. If you are not certain, the reference is NOT the same. A reference without photo is never the same.
+Also return "listing_model_confidence" (0-100: how sure you are of the exact model line and size of the LISTING) and "confidence", an object with a 0-100 value for every code in "same". Only put a code in "same" with confidence 95 or more.`;
+const REF_VISUAL_INSTRUCTION=`You are the first visual filter of Luxury Hunter. The first images are a second-hand bag LISTING. Then come REFERENCE photos, each preceded by its code and text.
+Give EVERY reference a score 0-100: how likely it is the SAME PRODUCT as the listing: same model line, same version and size/format, same silhouette, closure, handles/strap, hardware style and material family. Colour may differ. 0-30 clearly different product or the photo shows something else; 40-59 same family but a visible difference; 60-100 it may be the same. When unsure between two sizes keep it at 60 or more: a stricter check follows.
+Return ONLY JSON: {"scores":{"B1":85,"B2":10}}`;
+const REF_CONFIRM_INSTRUCTION=`You are the final auditor of Luxury Hunter. A previous checker said each REFERENCE below is the SAME PRODUCT as the LISTING. One wrong reference means a wrong resale price and lost money. Your job is to try to DISPROVE each one.
+The first images are the LISTING. Then each reference comes with its code, its text and its photo.
+For EACH reference look actively for any difference: model line, version, size or proportions, silhouette, closure, handle or strap type, hardware style, quilting or stitching pattern, logo placement, material family. Measurements more than 15 % apart are a difference. Colour may differ. If the photo shows another bag or does not let you verify the model and size, it is NOT confirmed. Do not trust the previous checker.
+Return ONLY JSON: {"verdicts":{"B3":{"same":true,"confidence":98,"difference_es":""}}} with one entry per reference. confidence is 0-100 that your verdict "same" is right.`;
+const shuffled=a=>{const o=[...a];for(let i=o.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[o[i],o[j]]=[o[j],o[i]];}return o;};
+async function mapLimit(list,limit,fn){
+  const out=new Array(list.length);let next=0;
+  await Promise.all(Array.from({length:Math.min(limit,list.length)},async()=>{while(next<list.length){const i=next++;out[i]=await fn(list[i],i);}}));
+  return out;
+}
+// Check con imagen de las 100 (modelo barato, en tandas de 25): no confirma
+// nada, solo ordena y quita lo que claramente es otro producto. Sin foto, fuera.
+async function visualShortlist({key,item,task,refs,first}){
+  const listing=await fetchGeminiImageParts(item,2);
+  const photos=await mapLimit(refs,12,r=>refPhotoPart(r));
+  const withPhoto=refs.map((r,i)=>({r,photo:photos[i],rank:i})).filter(x=>x.photo);
+  const stats={retrieved:refs.length,no_photo:refs.length-withPhoto.length,seen:0,failed_batches:0,listing_images:listing.length};
+  if(!listing.length||!withPhoto.length)return {kept:[],stats};
+  const batches=[];for(let i=0;i<withPhoto.length;i+=REF_VISUAL_BATCH)batches.push(withPhoto.slice(i,i+REF_VISUAL_BATCH));
+  const scores=new Map();
+  await mapLimit(batches,4,async batch=>{
+    const parts=[{text:`${REF_VISUAL_INSTRUCTION}\n\nTASK: ${task.task_name}\nLISTING TITLE: ${item.title}\nIDENTIFIED AS: ${first.description_es||[first.brand,first.model,first.variant,first.size,first.material,first.colour].filter(Boolean).join(' · ')}\n\nLISTING PHOTOS:`},...listing,{text:'REFERENCES:'}];
+    for(const x of batch){parts.push({text:refTable([x.r])});parts.push({...x.photo,detail:'low'});}
+    try{
+      const res=await geminiJsonRequest({key,model:aiTriageModel(),parts,googleSearch:false,purpose:'screen'});
+      const got=res.data?.scores&&typeof res.data.scores==='object'?res.data.scores:{};
+      for(const [c,v] of Object.entries(got))scores.set(String(c).trim().toUpperCase(),Number(v));
+      stats.seen+=batch.length;
+    }catch(e){
+      if(isAiPolicyFlag(e)||e?.aiBudget||e?.geminiCapacity)throw e;
+      stats.failed_batches++;console.warn('Check visual de referencias:',e.message);
+    }
+  });
+  // Una ficha que no se pudo mirar no pasa: todo lo que cuenta ha de haberse visto.
+  const kept=withPhoto.filter(x=>Number(scores.get(String(x.r._code).toUpperCase()))>=REF_VISUAL_MIN_SCORE)
+    .sort((a,b)=>Number(scores.get(String(b.r._code).toUpperCase()))-Number(scores.get(String(a.r._code).toUpperCase()))||a.rank-b.rank)
+    .slice(0,REF_BAG_PHOTO_MAX).map(x=>x.r);
+  stats.kept=kept.length;
+  return {kept,stats};
+}
+// Segunda comprobación, en otro orden y buscando diferencias.
+async function confirmSameRefs({key,item,task,refs,first}){
+  const listing=await fetchGeminiImageParts(item,Number(process.env.REF_LISTING_PHOTOS||4));
+  if(!listing.length)return {confirmed:[],rejected:{}};
+  const order=shuffled(refs);
+  const photos=await Promise.all(order.map(r=>refPhotoPart(r)));
+  const parts=[{text:`${REF_CONFIRM_INSTRUCTION}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\n\nLISTING\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2000)}\nIDENTIFIED AS: ${first.description_es||''}\n\nLISTING PHOTOS:`},...listing,{text:'REFERENCES:'}];
+  order.forEach((r,i)=>{parts.push({text:refTable([r])});if(photos[i])parts.push(photos[i]);});
+  const res=await geminiJsonRequest({key,model:aiModel(),parts,googleSearch:false,purpose:'verify'});
+  const v=res.data?.verdicts&&typeof res.data.verdicts==='object'?res.data.verdicts:{};
+  const norm=Object.fromEntries(Object.entries(v).map(([k,x])=>[String(k).trim().toUpperCase(),x]));
+  const confirmed=[],rejected={};
+  order.forEach((r,i)=>{
+    const x=norm[String(r._code).toUpperCase()];
+    if(photos[i]&&x?.same===true&&Number(x.confidence)>=REF_MIN_CONFIDENCE)confirmed.push(r._code);
+    else rejected[r._code]=String(x?.difference_es||'sin confirmar').slice(0,120);
+  });
+  return {confirmed,rejected};
+}
+async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,first,strict=false}){
   const listing=analyzeImages?await fetchGeminiImageParts(item,Number(process.env.REF_LISTING_PHOTOS||4)):[];
   const photos=await Promise.all(refs.map(r=>refPhotoPart(r)));
-  const head=`${REF_PHOTO_INSTRUCTION}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nFIRST IDENTIFICATION (text): ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour})}\n\nLISTING PHOTOS:`;
+  const head=`${REF_PHOTO_INSTRUCTION}${strict?REF_STRICT_BAG:''}\n\nTASK: ${task.task_name}\nTARGET PRODUCT: ${task.product_query}\n\nLISTING\nSOURCE: ${item.source}\nTITLE: ${item.title}\nDESCRIPTION: ${String(item.description||'').slice(0,2500)}\nFIRST IDENTIFICATION (text): ${JSON.stringify({brand:first.brand,model:first.model,variant:first.variant,size:first.size,material:first.material,colour:first.colour})}\n\nLISTING PHOTOS:`;
   const parts=[{text:head},...listing,{text:'REFERENCES (code | model | size | measurements | material | colour | condition | sold? | published | notes):'}];
   refs.forEach((r,i)=>{
     const v=refValue(r,1);
@@ -4298,7 +4391,12 @@ async function checkReferencePhotos({key,item,task,refs,purpose,analyzeImages,fi
   const r=await geminiJsonRequest({key,model:aiModel(),parts,googleSearch:false,purpose});
   const d=r.data||{};
   const allowed=new Set(refs.map(x=>x._code));
-  const same=(Array.isArray(d.same)?d.same:[]).map(c=>String(c).trim().toUpperCase()).filter(c=>allowed.has(c));
+  let same=(Array.isArray(d.same)?d.same:[]).map(c=>String(c).trim().toUpperCase()).filter(c=>allowed.has(c));
+  if(strict){
+    const withPhoto=new Set(refs.filter((_,i)=>photos[i]).map(x=>String(x._code).toUpperCase()));
+    const conf=Object.fromEntries(Object.entries(d.confidence&&typeof d.confidence==='object'?d.confidence:{}).map(([k,v])=>[String(k).trim().toUpperCase(),Number(v)]));
+    same=listing.length&&Number(d.listing_model_confidence)>=REF_MIN_CONFIDENCE?same.filter(c=>withPhoto.has(c)&&conf[c]>=REF_MIN_CONFIDENCE):[];
+  }
   return {data:d,same,photos:photos.filter(Boolean).length,listingImages:listing.length};
 }
 async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportProgress,negotiated}){
@@ -4313,12 +4411,13 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   const excludeId=String(item.source)==='vestiaire'?item.source_id:null;
   // Todas las fichas del modelo con su código (B1… por peso); la primera
   // pasada ve las 80 primeras y el resto se revisa después por parecido.
-  const base=refCandidates(baseInfo.rows,{prefix:'B',limit:REF_MAX_BASE+REF_EXTRA_BASE,excludeId});
+  const bag=!isWatchTask(task.task_name);
+  const base=refCandidates(baseInfo.rows,{prefix:'B',limit:bag?5000:REF_MAX_BASE+REF_EXTRA_BASE,excludeId});
   // La primera lectura ve solo las 40 más parecidas por el título (misma talla
   // y color primero), no las 80 que más pesan.
   const base0=pickPhotoRefs(base,{item,max:Number(process.env.REF_SCREEN_MAX||40)});
   const live=refCandidates(liveInfo.rows,{prefix:'V',limit:REF_MAX_LIVE,excludeId});
-  const prompt=referencePrompt(task,item,base0,pickPhotoRefs(live,{item,max:24}),economics);
+  const prompt=bag?identifyPrompt(task,item):referencePrompt(task,item,base0,pickPhotoRefs(live,{item,max:24}),economics);
   const inspect=async(purpose,images)=>{
     const parts=analyzeImages?await fetchGeminiImageParts(item,images):[];
     const r=await geminiJsonRequest({key,model:aiModel(),parts:[{text:prompt},...parts],googleSearch:false,purpose});
@@ -4359,7 +4458,8 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
   // contando todas las elegidas, podría salir rentable.
   const promising=d=>['STRONG BUY','BUY','WATCH'].includes(evaluate(d).dec.decision);
   const boost={};for(const c of [...sameB,...sameV])boost[c]=3;for(const c of [...simB,...simV])boost[c]=boost[c]||1;
-  const poolAll=s1.target_match===false?[]:pickPhotoRefs([...base,...live],{ident:s1,item,boost,max:REF_PHOTO_MAX});
+  const descQuery=bag?[s1.description_es,s1.variant,s1.size,s1.material,s1.colour,s1.hardware].filter(Boolean).join(' · '):'';
+  const poolAll=s1.target_match===false?[]:pickPhotoRefs([...base,...live],{ident:s1,item,boost,max:bag?REF_RETRIEVE_MAX:REF_PHOTO_MAX,descQuery});
   let d={...s1,base_same:[],vestiaire_same:[]};
   let confirmed=false, photoCheck=null, unprofitableAnyway=null;
   // La comprobación con fotos (la parte cara) solo si con las 5 más parecidas
@@ -4374,21 +4474,38 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     // quedan candidatas, se miran las siguientes.
     const checked=[],same=[],notSame={};let photos=0,pd={};
     try{
-      for(let round=0;round<2&&checked.length<poolAll.length;round++){
-        const refs=poolAll.slice(checked.length,checked.length+REF_PHOTO_MAX);
+      let toCheck=poolAll,visual=null;
+      if(bag){
+        reportProgress(45,'Check con imagen',`${poolAll.length} fichas parecidas por descripción`);
+        const v=analyzeImages?await visualShortlist({key,item,task,refs:poolAll,first:s1}):{kept:[],stats:{retrieved:poolAll.length}};
+        toCheck=v.kept;visual=v.stats;
+      }
+      for(let round=0;round<(bag?1:2)&&checked.length<toCheck.length;round++){
+        const refs=toCheck.slice(checked.length,checked.length+(bag?REF_BAG_PHOTO_MAX:REF_PHOTO_MAX));
         reportProgress(55+round*10,'Comprobando referencias con fotos',`${refs.length} referencias, una a una`);
-        const pc=await checkReferencePhotos({key,item,task,refs,purpose:strong?'verify':'screen',analyzeImages,first:s1});
+        const pc=await checkReferencePhotos({key,item,task,refs,purpose:strong?'verify':'screen',analyzeImages,first:s1,strict:bag});
         checked.push(...refs.map(r=>r._code));same.push(...pc.same);photos+=pc.photos;
         if(pc.data?.not_same&&typeof pc.data.not_same==='object')Object.assign(notSame,pc.data.not_same);
         if(round===0)pd=pc.data||{};
         if(same.length)break;
       }
+      const firstSame=[...same];
+      let audit=null;
+      // Segunda comprobación solo si, con lo confirmado, aún puede ser una compra.
+      if(bag&&same.length&&promising({...s1,base_same:same.filter(c=>c.startsWith('B')),vestiaire_same:same.filter(c=>c.startsWith('V')),ai_price_eur:Number(pd.price_eur)>0?Number(pd.price_eur):null})){
+        reportProgress(80,'Segunda comprobación',`${same.length} referencias`);
+        const refs=poolAll.filter(r=>same.includes(r._code));
+        const c=await confirmSameRefs({key,item,task,refs,first:s1});
+        audit={checked:same.length,confirmed:c.confirmed.length,rejected:c.rejected};
+        same.length=0;same.push(...c.confirmed);
+      }else if(bag&&same.length){audit={skipped:'no rentable'};}
       d={...s1,...Object.fromEntries(['target_match','condition_grade','completeness_es','quality_score','authenticity_risk','exotic_skin','decision_reasons_es','flaws_zh'].filter(k=>pd[k]!=null&&pd[k]!=='').map(k=>[k,pd[k]])),
         base_same:same.filter(c=>c.startsWith('B')),vestiaire_same:same.filter(c=>c.startsWith('V')),
         ai_price_eur:same.length&&Number(pd.price_eur)>0?Number(pd.price_eur):null,price_reason_es:String(pd.price_reason_es||'').slice(0,240),
         same_colour:(Array.isArray(pd.same_colour)?pd.same_colour:[]).map(c=>String(c).trim().toUpperCase()).filter(c=>same.includes(c))};
       confirmed=strong;
-      photoCheck={checked,same,not_same:notSame,photos,model:strong?'verify':'screen'};
+      photoCheck={checked,same,not_same:notSame,photos,model:strong?'verify':'screen',...(bag?{visual,first_same:firstSame,audit}:{})};
+      if(bag)console.log(`Referencias «${String(item.title||'').slice(0,40)}»: ${poolAll.length} por descripción → ${visual?.kept??0} tras imagen → ${firstSame.length} iguales → ${same.length} confirmadas.`);
     }catch(e){
       // Sin presupuesto de IA a esta hora: el anuncio se deja para más tarde
       // (no se guarda como "sin precio").
