@@ -1,0 +1,146 @@
+import {extractXianyuTags,hasXianyuVerificationTag} from './xianyu-verification.mjs';
+
+export function parseProfilePrice(value){
+  const raw=String(value??'').trim().replaceAll(',','');
+  const match=raw.match(/^(?:[¥￥]\s*)?(\d+(?:\.\d+)?)\s*(万)?$/);
+  if(!match)return null;
+  const n=Number(match[1])*(match[2]?10000:1);
+  return Number.isFinite(n)&&n>0?n:null;
+}
+
+function timestamp(value){
+  if(value===null||value===undefined||value==='')return null;
+  const n=Number(value);
+  const absolute=/(?:Z|[+-]\d\d:?\d\d)$/i.test(String(value).trim());
+  const ms=Number.isFinite(n)?(n<10_000_000_000?n*1000:n):absolute?Date.parse(String(value)):NaN;
+  return Number.isFinite(ms)&&!Number.isNaN(new Date(ms).getTime())?new Date(ms).toISOString():null;
+}
+
+// The profile endpoint returns cards under data.cardList. Keep unknown values
+// unknown: the product status and verification badge belong to each card.
+export function parseXianyuProfilePage(payload){
+  const cards=payload?.data?.cardList;
+  if(!Array.isArray(cards))return {ok:false,items:[],complete:false};
+  const items=[];
+  const ids=new Set();
+  for(const card of cards){
+    const data=card?.cardData;
+    if(!data||!(data.itemStatus===0||data.itemStatus==='0'))continue;
+    const id=String(data.id??'').trim();
+    const title=String(data.title??'').trim();
+    if(!id||!title||ids.has(id))continue;
+    ids.add(id);
+    const tags=extractXianyuTags(data);
+    const rawPic=String(data.picInfo?.picUrl||'').trim();
+    const image=rawPic.startsWith('//')?`https:${rawPic}`:rawPic;
+    items.push({id,title,url:`https://www.goofish.com/item?id=${encodeURIComponent(id)}`,
+      price:data.priceInfo?.price??null,image:/^https:\/\//i.test(image)?image:'',tags,
+      publishedAt:timestamp(data.publishTime??data.gmtCreate??data.createTime),
+      verification:hasXianyuVerificationTag(tags)?'available':'unknown'});
+  }
+  return {ok:true,items,complete:payload.data.nextPage===false||payload.data.nextPage===0};
+}
+
+export function parseXianyuProfileHead(payload){
+  const data=payload?.data?.module;
+  if(!data?.base)return null;
+  const tags=Array.isArray(data.base.ylzTags)?data.base.ylzTags:[];
+  const seller=tags.find(t=>t?.attributes?.role==='seller');
+  return {
+    name:String(data.base.displayName||'').trim(),
+    credit:String(seller?.text||'').trim(),
+    // The tab totals are not necessarily active stock or seller reviews.
+    totalItems:data.tabs?.item?.number??null,
+    totalRatings:data.tabs?.rate?.number??null
+  };
+}
+
+export function parseXianyuDetail(payload,requestedId){
+  const item=payload?.data?.itemDO;
+  const seller=payload?.data?.sellerDO||{};
+  if(!item||typeof item!=='object')return null;
+  const id=String(item.itemId??item.id??'').trim();
+  if(!id||id!==String(requestedId))return null;
+  const tags=extractXianyuTags(item);
+  const publishedAt=timestamp(item.publishTime??item.gmtCreate??item.createTime);
+  const pics=Array.isArray(item.imageInfos)?item.imageInfos.map(x=>String(x?.url||'')).filter(x=>/^https:\/\//i.test(x)):[];
+  return {id,sellerId:String(seller.sellerId||'').trim(),sellerName:String(seller.nick||seller.nickName||'').trim(),
+    sellerCredit:String(seller.zhimaLevelInfo?.levelName||'').trim(),
+    title:String(item.title||'').trim(),description:String(item.description||item.desc||'').trim(),
+    images:pics,publishedAt,tags,verification:hasXianyuVerificationTag(tags)?'available':'unknown'};
+}
+
+// Baseline only after a complete first scan. A partial scan is not enough to
+// infer that previously unseen items were posted after the seller was followed.
+export function classifyProfileSnapshot({items=[],knownIds=[],baselineComplete=false,complete=false}={}){
+  const known=new Set(knownIds.map(String));
+  if(!baselineComplete)return {newItems:[],establishBaseline:!!complete};
+  return {newItems:items.filter(item=>!known.has(String(item.id))),establishBaseline:false};
+}
+
+const RISK=/FAIL_SYS_USER_VALIDATE|RGV587|FAIL_SYS_ILLEGAL_ACCESS|punish|baxia|_____tmd_____/i;
+const LOGIN=/FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED|FAIL_SYS_TOKEN_EMPTY|未登录|passport|login/i;
+export class XianyuProfileError extends Error {
+  constructor(kind,message){super(message);this.kind=kind;}
+}
+
+async function responsePayload(response){
+  if(!response)throw new XianyuProfileError('incomplete','La página no devolvió su lista de productos.');
+  if(!response.ok()){
+    const status=response.status();
+    throw new XianyuProfileError(status===401?'login':status===403||status===429?'risk':'http',`Xianyu respondió HTTP ${status}.`);
+  }
+  const payload=await response.json();
+  const ret=JSON.stringify(payload?.ret||'');
+  if(RISK.test(ret))throw new XianyuProfileError('risk','Xianyu pide una verificación de seguridad.');
+  if(LOGIN.test(ret))throw new XianyuProfileError('login','La sesión de Xianyu ha caducado.');
+  return payload;
+}
+
+// Uses only responses generated by the profile page itself. No synthetic API
+// requests. A failed or capped scan remains incomplete and cannot be used as
+// an initial baseline.
+export async function collectXianyuProfile(page,sellerId,{maxPages=10,timeoutMs=15000}={}){
+  const id=String(sellerId||'').trim();
+  if(!id)throw new XianyuProfileError('invalid','Falta el ID del vendedor.');
+  const listMatch=r=>r.url().includes('mtop.idle.web.xyh.item.list');
+  const headMatch=r=>r.url().includes('mtop.idle.web.user.page.head');
+  const first=page.waitForResponse(listMatch,{timeout:timeoutMs}).catch(()=>null);
+  const head=page.waitForResponse(headMatch,{timeout:timeoutMs}).catch(()=>null);
+  await page.goto(`https://www.goofish.com/personal?userId=${encodeURIComponent(id)}`,
+    {waitUntil:'domcontentloaded',timeout:timeoutMs});
+  const pageUrl=page.url();
+  if(RISK.test(pageUrl))throw new XianyuProfileError('risk','Xianyu pide una verificación de seguridad.');
+  if(LOGIN.test(pageUrl))throw new XianyuProfileError('login','La sesión de Xianyu ha caducado.');
+  let response=await first;
+  let headData=null;
+  const headResponse=await head;
+  if(headResponse)headData=parseXianyuProfileHead(await responsePayload(headResponse));
+  const byId=new Map();
+  let complete=false,pages=0;
+  while(response&&pages<maxPages){
+    const parsed=parseXianyuProfilePage(await responsePayload(response));
+    if(!parsed.ok)throw new XianyuProfileError('incomplete','La lista del perfil no tiene el formato esperado.');
+    for(const item of parsed.items)byId.set(item.id,item);
+    pages++;
+    if(parsed.complete){complete=true;break;}
+    if(pages>=maxPages)break;
+    const next=page.waitForResponse(listMatch,{timeout:timeoutMs}).catch(()=>null);
+    await page.evaluate(()=>window.scrollTo(0,document.body.scrollHeight));
+    response=await next;
+  }
+  return {head:headData,items:[...byId.values()],complete,pages};
+}
+
+export async function collectXianyuDetail(page,itemId,{timeoutMs=20000}={}){
+  const id=String(itemId||'').trim();
+  if(!/^\d+$/.test(id))throw new XianyuProfileError('invalid','ID de anuncio no válido.');
+  const pending=page.waitForResponse(r=>r.url().includes('mtop.taobao.idle.pc.detail'),{timeout:timeoutMs}).catch(()=>null);
+  await page.goto(`https://www.goofish.com/item?id=${encodeURIComponent(id)}`,
+    {waitUntil:'domcontentloaded',timeout:timeoutMs});
+  if(RISK.test(page.url()))throw new XianyuProfileError('risk','Xianyu pide una verificación de seguridad.');
+  if(LOGIN.test(page.url()))throw new XianyuProfileError('login','La sesión de Xianyu ha caducado.');
+  const detail=parseXianyuDetail(await responsePayload(await pending),id);
+  if(!detail)throw new XianyuProfileError('incomplete','La ficha no confirmó el ID del producto.');
+  return detail;
+}

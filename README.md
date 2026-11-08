@@ -1,5 +1,17 @@
 # Luxury Hunter v1.4.3
 
+## Vendedores seguidos de Xianyu
+
+El radar amplía sus consultas con modelos documentados en [el análisis de mercado](docs/xianyu-mercado-2026-11.md), usando el mismo turno de búsqueda. No utiliza Just One API. Los anuncios que pasan a análisis usan el presupuesto de IA existente. Los vendedores se identifican por ID de cuenta; no se fusionan por apodo.
+
+**Revisión de perfiles desactivada por defecto:** el código para recuperar identidades y consultar perfiles está preparado, pero una prueba real recibió una verificación de seguridad al consultar una ficha. Además, las 20 tarjetas de la primera página de un perfil probado no incluyeron fechas ni etiquetas verificables en los campos leídos. No está demostrada la cobertura de novedades. `XIANYU_SELLER_PROFILES_ENABLED` solo habilita esta función experimental al establecerlo en `true`; no se debe activar hasta resolver el acceso y validar el resultado real.
+
+Se empieza a seguir automáticamente a un vendedor después de observar dos anuncios distintos con `验货宝`, al menos el 80 % de los anuncios observados con esa etiqueta y una señal de reputación suficiente (crédito excelente, o valoraciones/ventas positivas). También se puede activar o detener el seguimiento con `PATCH /api/xianyu/sellers/{id}` y `{"status":"following"}` o `{"status":"candidate"}`. Solo los anuncios nuevos posteriores al inicio del seguimiento generan un aviso de vendedor en Telegram. La etiqueta significa que la verificación está disponible para ese anuncio; no demuestra que el artículo ya la haya superado.
+
+`GET /api/xianyu/sellers` muestra la lista ordenada y sus datos disponibles; el bot envía un resumen de vendedores seguidos por Telegram como máximo cada 24 horas. El mensaje `NUEVO · VENDEDOR SEGUIDO EN XIANYU` se envía aparte del aviso de oportunidad. La evaluación busca referencias del modelo correspondiente, incluso si no tiene tarea propia; sin referencias fiables no se marca BUY.
+
+**Límites de la función experimental:** revisaría como máximo un perfil por turno, con un intervalo mínimo de 20 minutos para el carril de vendedores y 2 horas por perfil, hasta 10 páginas por perfil y dos fichas de novedades por visita. Si la primera revisión del perfil no es completa, no se usa como base para detectar novedades. Un anuncio solo se incorpora si la fecha confirma que tiene menos de 24 horas y aparece su propia etiqueta `验货宝`; los datos que faltan quedan pendientes. Puede haber publicaciones omitidas por límites, cambios de la plataforma o verificaciones de seguridad: no se garantiza la detección de todas. Ante una verificación se pausa Xianyu. La lista y los avisos se conservan con el estado persistente SQLite.
+
 ## Yahoo Auctions Japan: Mac primero, ReefAPI de reserva
 
 Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). Cuando el Mac está despierto y Chrome con la extensión responde, usa esa búsqueda local. Si el Mac no está disponible o una consulta local falla, usa la búsqueda de ReefAPI para esa consulta. La reserva de ReefAPI solo lee resultados de búsqueda; no consume créditos en fichas detalladas. El bot no presenta pujas.
