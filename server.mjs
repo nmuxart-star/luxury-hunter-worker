@@ -2011,7 +2011,6 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
   const detailLimit=clampInt(process.env.ONEMAP_DETAIL_LIMIT||12,12,1,30);
   // Lista de One Map: hasta 2 páginas de 100 (las que acaban antes) y se
   // guardan todas las que dejan tiempo para pujar (≥30 min), no solo 8.
-  const listPages=clampInt(process.env.ONEMAP_LIST_PAGES||2,2,1,3);
   const listMax=clampInt(process.env.ONEMAP_LIST_MAX||80,80,10,200);
   const minLeftMs=Math.max(5,Number(process.env.ONEMAP_MIN_LEFT_MIN||30))*60e3;
   const perQueryLimit=Math.max(1,Math.ceil(detailLimit/Math.max(1,selected.length)));
