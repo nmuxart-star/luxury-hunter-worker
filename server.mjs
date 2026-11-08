@@ -2022,14 +2022,36 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
   for(const q of selected){
     const searchUrl=oneMapSearchUrl(q);
     try{
-      const snap=await japanBrowserSnapshot(browserContext,`${searchUrl}#lh-json-pages=${listPages}`,4000);
+      const snap=await japanBrowserSnapshot(browserContext,searchUrl,4000);
       let listed=null;
       try{const j=JSON.parse(snap.body);if(Array.isArray(j?.items))listed=oneMapJsonCards(j.items);}catch{}
       // Extensión antigua: devuelve la pantalla con las tarjetas de siempre.
       if(!listed&&(snap.status>=400||!/JDirectItems Auction/i.test(snap.title)||!/Search Results:/i.test(snap.body))){
         throw new Error(`One Map no devolvió resultados accesibles (HTTP ${snap.status}${snap.body&&snap.status>=400?`: ${String(snap.body).slice(0,80)}`:''})`);
       }
-      const parsed=listed||parseOneMapAuctions(snap.html);
+      let parsed=listed||parseOneMapAuctions(snap.html);
+      // Todas las páginas que hagan falta, como una persona: la extensión sigue el
+      // enlace «siguiente» de la web, con pausa de 8–15 s entre páginas. Como la
+      // lista va por hora de fin, se para en cuanto una página llega a subastas
+      // que acaban fuera de la ventana de aviso (o si pide verificación).
+      if(!listed){
+        let cur=snap;
+        const maxPages=clampInt(process.env.ONEMAP_MAX_PAGES||8,8,1,15);
+        const windowMs=AUCTION_SHOW_HOURS*3600e3;
+        for(let page=2;page<=maxPages;page++){
+          const last=parsed[parsed.length-1];
+          if(!cur.nextHref||!last||last.timeLeftMs>windowMs)break;
+          await new Promise(r=>setTimeout(r,8000+Math.random()*7000));
+          let nxt;
+          try{nxt=await japanBrowserSnapshot(browserContext,cur.nextHref,4000);}catch(e){console.warn(`One Map página ${page}: ${e.message}`);break;}
+          if(nxt.status>=400||!/Search Results:/i.test(nxt.body||''))break;
+          const more=parseOneMapAuctions(nxt.html);
+          if(!more.length)break;
+          const have=new Set(parsed.map(c=>c.id));
+          parsed=parsed.concat(more.filter(c=>!have.has(c.id)));
+          cur=nxt;
+        }
+      }
       const cards=parsed
         .filter(c=>c.timeLeftMs>=minLeftMs&&c.timeLeftMs<=AUCTION_SHOW_HOURS*3600e3&&(Number(c.bids)||0)>=AUCTION_MIN_BIDS)
         .filter(c=>{

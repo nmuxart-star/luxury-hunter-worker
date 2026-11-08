@@ -22,11 +22,61 @@ async function snapshot(tabId,search){
       copy('h1',2,html.body);
       copy('.vx-row',30,html.body);
     }
-    return {status:200,finalUrl:location.href,title:document.title,
+    // Enlace «siguiente» de la paginación de la propia web (solo en búsquedas).
+    let nextHref='';
+    if(isSearch){
+      const links=[...document.querySelectorAll('a[href]')];
+      const rel=document.querySelector('a[rel~="next"][href]');
+      const byText=links.find(a=>/^\s*(next|siguiente|›|»|>|next\s*page)\s*$/i.test(a.textContent||'')||/next|siguiente/i.test(a.getAttribute('aria-label')||''));
+      const el=rel||byText;
+      if(el&&!/disabled/.test(el.className+(el.parentElement?.className||'')))nextHref=el.href;
+    }
+    return {status:200,finalUrl:location.href,title:document.title,nextHref,
       body:document.body?.innerText?.slice(0,30000)||'',html:html.documentElement.outerHTML};
   },args:[search]});
   return injection.result;
 }
+
+const BOT_CHECK=/confirme que es humano|confirm(e|a)? que es humano|confirm you are (a )?human|verify you are (a )?human|just a moment|人間であることを確認|are you a robot/i;
+const isBotCheck=r=>BOT_CHECK.test(String(r?.title||'')+' '+String(r?.body||'').slice(0,400));
+
+// Aviso en el ordenador cuando One Map pide el control «Confirme que es humano»:
+// se trae la ventana al frente, se espera a que Nil lo resuelva y se vuelve a
+// minimizar. Mientras tanto no se hace ninguna petición más.
+let captchaWaiting=false;
+const NOTE_ID='lh-onemap-captcha';
+const ICON='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR4nO3PQQ0AIBDAMMC/50MGL0JaBVu2zOwOHGsHrAVYC7AWYC3AWoC1AGsB1gKsBVgLsBZgLcBagLUAawHWAqwFWAuwFmAtwFqAtQ/6BQHqXl7IAAAAAElFTkSuQmCC';
+function notifyCaptcha(){
+  try{chrome.notifications.create(NOTE_ID,{type:'basic',iconUrl:ICON,title:'One Map pide verificación',
+    message:'Pulsa aquí y resuelve «Confirme que es humano». El bot espera.',priority:2,requireInteraction:true});}catch{}
+}
+async function showJobWindow(){
+  if(jobWindow)await chrome.windows.update(jobWindow.id,{state:'normal',focused:true}).catch(()=>{});
+}
+async function handleCaptcha(tabId){
+  if(captchaWaiting)return;
+  captchaWaiting=true;
+  notifyCaptcha();
+  await showJobWindow();
+  const until=Date.now()+20*60_000;let lastNote=Date.now();
+  try{
+    while(Date.now()<until){
+      await sleep(3000);
+      const tab=await chrome.tabs.get(tabId).catch(()=>null);
+      if(!tab)break;
+      if(!BOT_CHECK.test(tab.title||'')&&tab.status==='complete'){
+        await chrome.notifications.clear(NOTE_ID).catch(()=>{});
+        break;
+      }
+      if(Date.now()-lastNote>5*60_000){notifyCaptcha();lastNote=Date.now();}
+    }
+  }finally{
+    await chrome.notifications.clear(NOTE_ID).catch(()=>{});
+    if(jobWindow)await chrome.windows.update(jobWindow.id,{state:'minimized'}).catch(()=>{});
+    captchaWaiting=false;
+  }
+}
+chrome.notifications?.onClicked.addListener(()=>{void showJobWindow();});
 
 async function waitForPage(tabId,search){
   const until=Date.now()+(search?25_000:18_000);
@@ -34,6 +84,7 @@ async function waitForPage(tabId,search){
   while(Date.now()<until){
     try{
       last=await snapshot(tabId,search);
+      if(isBotCheck(last))return last;
       if(search){
         if(/Search Results:\s*\d[\d,]*\s*Items?/i.test(last.body))return last;
       }else if(last.body.length>200&&(/Current Price|Item condition|Seller|現在価格/i.test(last.body))){
@@ -172,6 +223,11 @@ async function handle(job,token){
   try{
     opened=await openHidden(job.url);
     const result=await waitForPage(opened.tabId,search);
+    if(isBotCheck(result)){
+      await bridge(`/result/${job.id}`,token,'POST',{...result,status:403,url:job.url}).catch(()=>{});
+      await handleCaptcha(opened.tabId);
+      return;
+    }
     await bridge(`/result/${job.id}`,token,'POST',{...result,url:job.url});
   }catch(error){
     await bridge(`/result/${job.id}`,token,'POST',{url:job.url,status:502,
@@ -182,7 +238,7 @@ async function handle(job,token){
 }
 
 async function poll(){
-  if(polling)return;
+  if(polling||captchaWaiting)return;
   polling=true;
   try{
     const {bridgeToken}=await chrome.storage.local.get('bridgeToken');
