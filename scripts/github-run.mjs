@@ -79,6 +79,8 @@ const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',0,0,30);
 // como mucho cada FAST_LANE_MINUTES (lo decide el servidor), para llegar en
 // minutos a los anuncios recién subidos. No mueve su revisión completa.
 const FAST_TASKS=String(process.env.FAST_TASKS||'').split(',').map(x=>x.trim()).filter(Boolean);
+const ACTIVE_SOURCES=String(process.env.ACTIVE_SOURCES||'xianyu,buyee').split(',').map(x=>x.trim()).filter(Boolean);
+const FAST_LABEL=ACTIVE_SOURCES.includes('buyee')?'Xianyu + Mercari':'Xianyu';
 const workerStartedAt=Date.now();
 // El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
 let budgetStartedAt=workerStartedAt;
@@ -195,7 +197,7 @@ try{
           const q=await api('POST',`/api/tasks/${task.id}/run`,{fast:true});
           if(q.skipped)return;
           anyTaskStarted=true;
-          console.log(`\n=== RÁPIDO ${task.task_name} (Xianyu + Mercari) ===`);
+          console.log(`\n=== RÁPIDO ${task.task_name} (${FAST_LABEL}) ===`);
           const run=await waitRun(q.runId);
           console.log(`DONE rápido ${task.task_name}: ${run.status}`);
         }catch(e){console.error(`FAILED rápido ${task.task_name}:`,e?.message||e);}
@@ -204,7 +206,7 @@ try{
     // Pasada de subastas (regla de Nil, 07-11-2026): en cada ciclo, todos los
     // modelos activos buscan en One Map las subastas que acaban en ≤2 h y
     // tienen alguna puja. Solo One Map por el Chrome del Mac, sin Mercari ni Xianyu.
-    if(!['0','off','false','no'].includes(String(process.env.AUCTION_LANE||'').toLowerCase())){
+    if(ACTIVE_SOURCES.includes('buyee')&&!['0','off','false','no'].includes(String(process.env.AUCTION_LANE||'').toLowerCase())){
       const full=new Set(runnable.map(t=>t.id));
       const auctionList=tasks.filter(t=>t.enabled&&!full.has(t.id)&&(t.sources||[]).includes('buyee')&&(t.japan_queries||[]).length);
       await runPool(auctionList,Math.min(2,TASK_CONCURRENCY),async task=>{

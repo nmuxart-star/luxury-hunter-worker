@@ -78,9 +78,11 @@ jobs:
       PORT: '8200'
       # Velocidad: tareas en paralelo y ciclos repetidos dentro de cada ejecución.
       TASK_CONCURRENCY: ${{ vars.TASK_CONCURRENCY || '4' }}
-      # Carril rápido: Xianyu + Mercari, lo más nuevo, cada FAST_LANE_MINUTES.
-      # Los 5 modelos que más rotan en Vestiaire (medido el 07-11-2026).
-      FAST_TASKS: ${{ vars.FAST_TASKS || 'Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Lady Dior,Gucci Jackie' }}
+      # Plataformas en marcha. Standby de Mercari y One Map: ACTIVE_SOURCES=xianyu,buyee las reactiva.
+      ACTIVE_SOURCES: ${{ vars.ACTIVE_SOURCES || 'xianyu' }}
+      # Carril rápido: lo más nuevo de cada modelo, cada FAST_LANE_MINUTES.
+      # Los modelos con más anuncios nuevos por búsqueda en Xianyu (medido el 08-11-2026) y los que ya estaban.
+      FAST_TASKS: ${{ vars.FAST_TASKS || 'Lady Dior,Dior Saddle,Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Gucci Jackie,Celine Triomphe,Loewe Puzzle,Radar oportunidades,Cartier Santos y Tank,Omega Seamaster 300M,Omega Speedmaster,Tudor' }}
       FAST_LANE_MINUTES: ${{ vars.FAST_LANE_MINUTES || '20' }}
       LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '0' }}
       # Cada ejecución, como mucho 38 min de tareas (+~6 min de preparación).

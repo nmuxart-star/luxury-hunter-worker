@@ -1772,7 +1772,16 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
   const perQuery=[];
   let kept=0;
-  const all=(queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
+  let all=(queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
+  // Cada modelo tiene dos formas de buscarlo: se turnan, para ver anuncios
+  // distintos sin hacer más búsquedas.
+  if(all.length>1&&maxQueries===1){
+    const turns=getSetting('xianyu_query_turn',{})||{};
+    const n=Number(turns[all[0]])||0;
+    turns[all[0]]=(n+1)%1000;
+    saveSetting('xianyu_query_turn',turns);
+    if(n%2)all=[all[1],all[0],...all.slice(2)];
+  }
   let done=0;
   for(const keyword of all.slice(0,2)){
     // La 2ª búsqueda solo si XIANYU_MAX_QUERIES=2 o si la 1ª salió vacía.
@@ -1844,7 +1853,8 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
     }
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
-    await sleep(2500+Math.random()*2500);
+    // Pausa de persona entre búsquedas: las ráfagas son lo que dispara las verificaciones.
+    await sleep(Math.max(2,Number(process.env.XIANYU_GAP_SEC||10))*1e3+Math.random()*8000);
   }
   if(perQuery.length)xianyuMarkSearch();
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());
@@ -4755,6 +4765,9 @@ function buildExecutionManifest(task, plan, run=null, session=null) {
   };
 }
 
+// Regla de Nil (08-11-2026): todo a Xianyu; Mercari y One Map, en standby.
+// Para reactivarlas: variable ACTIVE_SOURCES=xianyu,buyee.
+const ACTIVE_SOURCES=String(process.env.ACTIVE_SOURCES||'xianyu,buyee').split(',').map(x=>x.trim()).filter(Boolean);
 async function globalSearch(body) {
   const product=String(body.product||body.product_query||'').trim();
   if(!product) throw new Error('Escribe el producto que quieres buscar.');
@@ -4764,7 +4777,8 @@ async function globalSearch(body) {
   const fastLane=!!body.fast&&!auctionLane;
   // Solo Xianyu y Japón (Mercari + One Map); Corea y el resto, eliminados.
   const asked=Array.isArray(body.sources)&&body.sources.length?body.sources.filter(s=>['xianyu','buyee'].includes(s)):['xianyu','buyee'];
-  const sources=auctionLane?['buyee']:fastLane?['xianyu','buyee']:(asked.length?asked:['xianyu','buyee']);
+  // Plataformas en standby (ACTIVE_SOURCES): no se buscan; su código y sus datos siguen intactos.
+  const sources=(auctionLane?['buyee']:fastLane?['xianyu','buyee']:(asked.length?asked:['xianyu','buyee'])).filter(s=>ACTIVE_SOURCES.includes(s));
   const sessionId=randomUUID();
   const startedAt=new Date().toISOString();
 
