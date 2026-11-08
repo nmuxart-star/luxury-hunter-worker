@@ -1,5 +1,15 @@
 # Luxury Hunter v1.4.3
 
+## Vendedores seguidos de Xianyu
+
+El bot registra los vendedores que aparecen en sus **búsquedas ya programadas**, sin consultas adicionales a Xianyu ni a una API de pago. Los identifica por ID de cuenta; nunca fusiona vendedores solo porque tengan el mismo nombre. `GET /api/xianyu/sellers` devuelve la lista ordenada con nivel de crédito, ventas, anuncios activos, valoraciones, porcentaje positivo y cuántos anuncios observados tenían la etiqueta `验货宝`. Un campo ausente queda vacío; el número de anuncios observados no es el inventario total del vendedor.
+
+Se empieza a seguir automáticamente a un vendedor después de observar dos anuncios distintos con `验货宝`, al menos el 80 % de los anuncios observados con esa etiqueta y una señal de reputación suficiente (crédito excelente, o valoraciones/ventas positivas). También se puede activar o detener el seguimiento con `PATCH /api/xianyu/sellers/{id}` y `{"status":"following"}` o `{"status":"candidate"}`. Solo los anuncios nuevos posteriores al inicio del seguimiento generan un aviso de vendedor en Telegram. La etiqueta significa que la verificación está disponible para ese anuncio; no demuestra que el artículo ya la haya superado.
+
+El mensaje `NUEVO · VENDEDOR SEGUIDO EN XIANYU` se envía aparte del aviso `COMPRA`/`COMPRA MUY RECOMENDADA`. Si el análisis ya encontró comparables de Vestiaire, el aviso muestra reventa, coste importado y beneficio estimado; el flujo de análisis y su regla de no marcar BUY sin referencias siguen siendo los mismos. Los avisos se deduplican por ID de anuncio y se guardan en el estado persistente del bot.
+
+**Cobertura:** la búsqueda por modelos solo detecta anuncios que entran en esos resultados. Por tanto, este seguimiento no garantiza detectar todas las publicaciones de un vendedor. Para garantizarlo haría falta una fuente autorizada que ofrezca el inventario completo o notificaciones de cada perfil; este cambio no consulta fichas ni perfiles por separado.
+
 ## Yahoo Auctions Japan: Mac primero, ReefAPI de reserva
 
 Al activar «Japón» en una tarea, Luxury Hunter consulta las subastas de Yahoo Auctions en One Map, ordenadas por finalización. Lee la puja actual, número de pujas y tiempo restante, y analiza hasta 8 fichas por ejecución (`ONEMAP_DETAIL_LIMIT`). Cuando el Mac está despierto y Chrome con la extensión responde, usa esa búsqueda local. Si el Mac no está disponible o una consulta local falla, usa la búsqueda de ReefAPI para esa consulta. La reserva de ReefAPI solo lee resultados de búsqueda; no consume créditos en fichas detalladas. El bot no presenta pujas.

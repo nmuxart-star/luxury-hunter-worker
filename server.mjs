@@ -10,6 +10,7 @@ import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
+import {sellerFromXianyuCard,sellerWatchEligible,sellerRank} from './scripts/xianyu-sellers.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
 import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
@@ -225,6 +226,34 @@ CREATE TABLE IF NOT EXISTS notifications (
   sent_to TEXT,
   sent_at TEXT NOT NULL,
   UNIQUE(task_id, listing_id, kind)
+);
+CREATE TABLE IF NOT EXISTS xianyu_sellers (
+  seller_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  seller_type TEXT NOT NULL DEFAULT 'sin confirmar',
+  credit TEXT NOT NULL DEFAULT '',
+  sold_count INTEGER,
+  active_count INTEGER,
+  review_count INTEGER,
+  positive_rate REAL,
+  badges_json TEXT NOT NULL DEFAULT '[]',
+  watch_status TEXT NOT NULL DEFAULT 'candidate',
+  followed_at TEXT,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS xianyu_seller_seen (
+  seller_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  verified_tag INTEGER NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  PRIMARY KEY(seller_id,source_id)
+);
+CREATE TABLE IF NOT EXISTS xianyu_seller_alerts (
+  source_id TEXT PRIMARY KEY,
+  seller_id TEXT NOT NULL,
+  sent_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS listing_feedback (
   listing_id INTEGER PRIMARY KEY,
@@ -1532,6 +1561,7 @@ function parseXianyuSearchJson(json){
     const link=String(main.targetUrl||'').replace('fleamarket://','https://www.goofish.com/');
     const pub=Number(click.publishTime);
     const tags=extractXianyuTags(ex);
+    const seller=sellerFromXianyuCard(main,ex);
     if(click.tag==='freeship'&&!tags.includes('包邮'))tags.push('包邮');
     out.push({
       tags,
@@ -1543,7 +1573,15 @@ function parseXianyuSearchJson(json){
       url:link||(id?`https://www.goofish.com/item?id=${id}`:''),
       image:ex.picUrl?String(ex.picUrl).replace(/^\/\//,'https://'):'',
       area:ex.area||'',
-      seller:ex.userNickName||'',
+      seller:seller.name,
+      sellerId:seller.id,
+      sellerCredit:seller.credit,
+      sellerSales:seller.sold,
+      sellerItems:seller.active,
+      sellerReviewCount:seller.reviews,
+      sellerReviewRate:seller.positiveRate,
+      sellerType:seller.type,
+      sellerBadges:seller.badges,
       wants:click.wantNum??null,
       publishedAt:Number.isFinite(pub)&&pub>0?new Date(pub).toISOString():null
     });
@@ -1648,8 +1686,37 @@ function xianyuUnblockAccount(){
   db.prepare("DELETE FROM app_settings WHERE key='xianyu_account_blocked'").run();
 }
 
+function recordXianyuSeller(it){
+  const id=String(it?.sellerId||'').trim();
+  if(!id||!it?.id)return;
+  const now=new Date().toISOString();
+  const verified=hasXianyuVerificationTag(it.tags)?1:0;
+  db.prepare(`INSERT INTO xianyu_sellers(seller_id,name,seller_type,credit,sold_count,active_count,review_count,positive_rate,badges_json,first_seen,last_seen)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(seller_id) DO UPDATE SET
+      name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE name END,
+      seller_type=CASE WHEN excluded.seller_type<>'sin confirmar' THEN excluded.seller_type ELSE seller_type END,
+      credit=CASE WHEN excluded.credit<>'' THEN excluded.credit ELSE credit END,
+      sold_count=COALESCE(excluded.sold_count,sold_count),active_count=COALESCE(excluded.active_count,active_count),
+      review_count=COALESCE(excluded.review_count,review_count),positive_rate=COALESCE(excluded.positive_rate,positive_rate),
+      badges_json=CASE WHEN excluded.badges_json<>'[]' THEN excluded.badges_json ELSE badges_json END,
+      last_seen=excluded.last_seen`).run(id,String(it.seller||''),it.sellerType||'sin confirmar',it.sellerCredit||'',
+      it.sellerSales??null,it.sellerItems??null,it.sellerReviewCount??null,it.sellerReviewRate??null,
+      JSON.stringify(it.sellerBadges||[]),now,now);
+  db.prepare(`INSERT INTO xianyu_seller_seen(seller_id,source_id,verified_tag,first_seen,last_seen) VALUES(?,?,?,?,?)
+    ON CONFLICT(seller_id,source_id) DO UPDATE SET verified_tag=MAX(verified_tag,excluded.verified_tag),last_seen=excluded.last_seen`)
+    .run(id,String(it.id),verified,now,now);
+  const counts=db.prepare(`SELECT COUNT(*) observed,SUM(verified_tag) verified FROM xianyu_seller_seen WHERE seller_id=?`).get(id);
+  const profile=db.prepare('SELECT * FROM xianyu_sellers WHERE seller_id=?').get(id);
+  if(profile.watch_status==='candidate'&&sellerWatchEligible({observed:counts.observed,verified:counts.verified,
+    credit:profile.credit,sold:profile.sold_count,reviews:profile.review_count,positiveRate:profile.positive_rate})){
+    db.prepare("UPDATE xianyu_sellers SET watch_status='following',followed_at=? WHERE seller_id=? AND watch_status='candidate'").run(now,id);
+  }
+}
+
 function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
   if(!it?.id||!it?.title)return {kept:false,reason:'missingCoreFields'};
+  recordXianyuSeller(it);
   if(!hasXianyuVerificationTag(it.tags))return {kept:false,reason:'noVerificationTag'};
   if(!Number.isFinite(Number(it.price))||Number(it.price)<=0)return {kept:false,reason:'invalidPrice'};
 
@@ -1710,6 +1777,7 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
     ...(detail?.['卖家信息']||oldSeller),
     '卖家昵称':it.seller||prev?.seller_name||oldSeller['卖家昵称']||null,
     '卖家ID':it.sellerId||oldSeller['卖家ID']||null,
+    '卖家类型':it.sellerType||oldSeller['卖家类型']||'sin confirmar',
     '卖家头像':it.sellerAvatar||oldSeller['卖家头像']||null,
     '卖家注册天数':it.sellerRegDays??oldSeller['卖家注册天数']??null,
     '芝麻信用':it.sellerCredit??oldSeller['芝麻信用']??null,
@@ -5927,6 +5995,60 @@ async function telegramSend(text,photoUrl=null,{buttons=null,previewUrl=null,noP
   return {sent:true};
 }
 
+function xianyuSellerList(){
+  return db.prepare(`SELECT s.*,COUNT(v.source_id) AS observed,SUM(v.verified_tag) AS verified
+    FROM xianyu_sellers s LEFT JOIN xianyu_seller_seen v ON v.seller_id=s.seller_id
+    GROUP BY s.seller_id ORDER BY s.last_seen DESC`).all().map(s=>({
+      id:s.seller_id,url:`https://www.goofish.com/personal?userId=${encodeURIComponent(s.seller_id)}`,
+      name:s.name,type:s.seller_type,credit:s.credit,sold:s.sold_count,
+      active:s.active_count,reviews:s.review_count,positiveRate:s.positive_rate,
+      observed:s.observed,verified:s.verified||0,verifiedShare:s.observed?(s.verified||0)/s.observed:0,
+      score:sellerRank({observed:s.observed,verified:s.verified||0,credit:s.credit,
+        sold:s.sold_count,reviews:s.review_count,positiveRate:s.positive_rate}),
+      status:s.watch_status,followedAt:s.followed_at,lastSeen:s.last_seen,
+      badges:JSON.parse(s.badges_json||'[]')
+    })).sort((a,b)=>(b.status==='following')-(a.status==='following')||b.score-a.score||b.observed-a.observed);
+}
+
+async function sendXianyuSellerAlerts(items){
+  if(!telegramConfigured())return {sent:0,reason:'telegram-not-configured'};
+  let sent=0;
+  for(const x of items||[]){
+    if(x.source!=='xianyu'||!xianyuListingHasVerificationTag(x))continue;
+    let sellerId='';
+    try{sellerId=String(JSON.parse(x.raw_json||'{}')?.['卖家信息']?.['卖家ID']||'').trim();}catch{}
+    if(!sellerId)continue;
+    const seller=db.prepare(`SELECT s.*,v.first_seen AS item_first_seen FROM xianyu_sellers s
+      JOIN xianyu_seller_seen v ON v.seller_id=s.seller_id AND v.source_id=?
+      WHERE s.seller_id=? AND s.watch_status='following' AND v.verified_tag=1
+        AND v.first_seen>s.followed_at`).get(String(x.source_id),sellerId);
+    if(!seller)continue;
+    const reserved=db.prepare('INSERT OR IGNORE INTO xianyu_seller_alerts(source_id,seller_id,sent_at) VALUES(?,?,?)')
+      .run(String(x.source_id),sellerId,new Date().toISOString());
+    if(!reserved.changes)continue;
+    const profile=[seller.credit,seller.sold_count!=null?`${seller.sold_count} vendidos`:null,
+      seller.review_count!=null?`${seller.review_count} valoraciones`:null,
+      seller.positive_rate!=null?`${seller.positive_rate}% positivas`:null].filter(Boolean).join(' · ');
+    const decision=String(x.decision||'').toUpperCase();
+    const resale=Number(x.resale_low_eur)>0?`📈 Reventa conservadora ${eur0(x.resale_low_eur)} · coste importado ${eur0(x.landed_cost_eur)} · beneficio ${eur0(x.net_profit_low_eur)}`
+      :'📈 Sin pronóstico fiable todavía; revisar comparables antes de comprar.';
+    const message=[`🏪 <b>NUEVO · VENDEDOR SEGUIDO EN XIANYU</b>`,
+      `<a href="https://www.goofish.com/personal?userId=${encodeURIComponent(sellerId)}"><b>${htmlEsc(seller.name||sellerId)}</b></a> · ${htmlEsc(seller.seller_type)}`,
+      profile?htmlEsc(profile):'Reputación pública: datos incompletos',
+      `✅ Etiqueta 验货宝 disponible en este anuncio (no equivale a autenticidad aprobada).`,
+      `<b>${htmlEsc(x.title||'Anuncio')}</b> · ${eur0(x.price_eur)}`,
+      resale,decision?`Análisis: ${htmlEsc(decision)}`:'Análisis: pendiente',alertLink(x)].filter(Boolean).join('\n');
+    try{
+      await telegramSend(message,x.image_url||null,{buttons:alertButtons(x.id),previewUrl:x.url||null});
+      sent++;
+    }catch(error){
+      db.prepare('DELETE FROM xianyu_seller_alerts WHERE source_id=? AND seller_id=?').run(String(x.source_id),sellerId);
+      throw error;
+    }
+  }
+  return {sent};
+}
+
 // ── TELEGRAM BUTTONS V1 ─────────────────────────────────────────────────
 // Cada aviso lleva "✅ Me interesa" / "❌ No me interesa". Lo que pulse Nil
 // se guarda en listing_feedback: los descartados no vuelven a avisarse ni a
@@ -7756,6 +7878,12 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
     );
 
     try{
+      result.status.sellerAlerts=await sendXianyuSellerAlerts(finalItems);
+    }catch(e){
+      result.status.sellerAlerts={sent:0,error:e.message};
+      console.error(`Seller alerts task ${taskId}:`,e.message);
+    }
+    try{
       const median=taskMedianAskingEur(taskId);
       const withRatio=finalItems.map(x=>({
         ...x,
@@ -9457,6 +9585,20 @@ const server=http.createServer(async(req,res)=>{
         return json(res,200,{accounts});
       }
       return json(res,200,{accounts:[]});
+    }
+    if(req.method==='GET'&&u.pathname==='/api/xianyu/sellers'){
+      const sellers=xianyuSellerList();
+      return json(res,200,{sellers,coverage:'Anuncios observados en las búsquedas del bot; no catálogo completo del vendedor.'});
+    }
+    const sellerRoute=u.pathname.match(/^\/api\/xianyu\/sellers\/([^/]+)$/);
+    if(req.method==='PATCH'&&sellerRoute){
+      const sellerId=decodeURIComponent(sellerRoute[1]);
+      const body=await readBody(req);
+      if(!['following','candidate'].includes(body.status))return json(res,400,{error:'status debe ser following o candidate'});
+      const changed=db.prepare(`UPDATE xianyu_sellers SET watch_status=?,followed_at=CASE WHEN ?='following' AND watch_status<>'following' THEN ? WHEN ?='candidate' THEN NULL ELSE followed_at END WHERE seller_id=?`)
+        .run(body.status,body.status,new Date().toISOString(),body.status,sellerId);
+      if(!changed.changes)return json(res,404,{error:'Vendedor no encontrado por ID estable en las búsquedas.'});
+      return json(res,200,{seller:xianyuSellerList().find(s=>s.id===sellerId)});
     }
     if(req.method==='POST'&&u.pathname==='/api/telegram/test-alert'){
       const b=await readBody(req);
