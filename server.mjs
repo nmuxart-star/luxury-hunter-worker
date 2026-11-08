@@ -2005,6 +2005,30 @@ function japanSearchSpecs(){
 
 // One Map muestra las subastas de Yahoo Japón sin iniciar sesión. Una cuenta
 // personal sirve para pujar manualmente; el radar solo lee y recomienda.
+// Turno para buscar en One Map: cola de una en una con pausa mínima, tope por
+// ejecución y descanso por búsqueda (se guarda cuándo se hizo cada una).
+let oneMapChain=Promise.resolve();
+let oneMapRunCount=0;
+let oneMapLastAt=0;
+function oneMapThrottle(q){
+  const job=oneMapChain.then(async()=>{
+    const maxRun=clampInt(process.env.ONEMAP_RUN_MAX||8,8,1,40);
+    const restMs=Math.max(0,Number(process.env.ONEMAP_QUERY_REST_MIN||60))*60e3;
+    const gapMs=Math.max(5,Number(process.env.ONEMAP_GAP_SEC||25))*1e3;
+    if(oneMapRunCount>=maxRun)return false;
+    const last=getSetting('onemap_last_search',{})||{};
+    if(restMs&&Date.now()-Number(last[q]||0)<restMs)return false;
+    const wait=oneMapLastAt+gapMs+Math.random()*8000-Date.now();
+    if(wait>0)await new Promise(r=>setTimeout(r,wait));
+    oneMapRunCount++;oneMapLastAt=Date.now();
+    last[q]=oneMapLastAt;
+    for(const k of Object.keys(last))if(Date.now()-Number(last[k])>24*3600e3)delete last[k];
+    saveSetting('onemap_last_search',last);
+    return true;
+  });
+  oneMapChain=job.catch(()=>{});
+  return job;
+}
 async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null,sessionId},browserContext){
   if(!browserContext)return {ok:false,kept:0,error:'Playwright browser unavailable'};
   const selected=normalizeLines(queries||[]).slice(0,clampInt(process.env.ONEMAP_MAX_QUERIES||2,2,1,4));
@@ -2020,6 +2044,10 @@ async function searchOneMapAuctions({queries,maxItems=30,minEur=null,maxEur=null
   const spec={id:'yahoo-auctions-jp',label:'Yahoo! Auctions Japan',purchaseVia:'One Map / FROM JAPAN',mode:'browser',detailWaitMs:1000};
   for(const q of selected){
     const searchUrl=oneMapSearchUrl(q);
+    // Ritmo de persona (07-11-2026: 40+ búsquedas en 6 min hacían saltar el
+    // control «Confirme que es humano»): una sola a la vez, ≥25 s entre una y
+    // otra, la misma búsqueda como mucho cada 60 min y un tope por ejecución.
+    if(!await oneMapThrottle(q)){console.log(`One Map "${q}": se salta (ya buscada hace poco o tope de la ejecución).`);continue;}
     try{
       const snap=await japanBrowserSnapshot(browserContext,searchUrl,4000);
       let listed=null;
