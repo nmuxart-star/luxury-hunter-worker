@@ -308,3 +308,15 @@ test('bolsos: una ficha que no se pudo mirar con imagen no llega a confirmarse',
   assert.equal(a.resale_mean_eur,null);
   assert.equal(h.prompts.some(p=>/reference checker/.test(p.text)),false);
 });
+
+test('Xianyu: la pausa tras una verificación se guarda y dura 4 h entre ejecuciones',()=>{
+  const store={};
+  const ctx=vm.createContext({Number,Math,Date,getSetting:(k,f)=>k in store?store[k]:f,saveSetting:(k,v)=>{store[k]=v;}});
+  vm.runInContext(`const XIANYU_RISK_PAUSE_MS=4*3600e3;${extract('function xianyuRiskPauseLeftMs(){','function xianyuKnownAccounts(')}`,ctx);
+  assert.equal(ctx.xianyuRiskPauseLeftMs(),0);
+  ctx.xianyuStartRiskPause();
+  const left=ctx.xianyuRiskPauseLeftMs();
+  assert.ok(left>3.99*3600e3&&left<=4*3600e3,String(left));
+  store.xianyu_risk_pause.until=Date.now()-1;
+  assert.equal(ctx.xianyuRiskPauseLeftMs(),0);
+});

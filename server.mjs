@@ -1459,6 +1459,16 @@ const XIANYU_PAUSE_MS=2*3600e3;
 // en cada ejecución es lo que mantiene la cuenta marcada.
 const XIANYU_RISK_PAUSE_MS=4*3600e3;
 let xianyuPauseLen=XIANYU_PAUSE_MS;
+// La pausa tras una verificación tiene que sobrevivir a la ejecución: en la
+// nube cada ejecución es un proceso nuevo y, sin guardarla, el bot volvía a
+// llamar a la puerta de la cuenta marcada unas 9 veces por hora.
+function xianyuRiskPauseLeftMs(){
+  const until=Number((getSetting('xianyu_risk_pause',null)||{}).until)||0;
+  return Math.max(0,until-Date.now());
+}
+function xianyuStartRiskPause(){
+  saveSetting('xianyu_risk_pause',{until:Date.now()+XIANYU_RISK_PAUSE_MS,at:new Date().toISOString()});
+}
 
 function xianyuKnownAccounts(){
   const primary=String(process.env.XIANYU_STATE_FILE||'').trim();
@@ -1840,8 +1850,9 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       xianyuPausedAt=Date.now();
       xianyuPauseCode='risk';
       xianyuPauseLen=XIANYU_RISK_PAUSE_MS;
-      xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa el resto de esta ejecución para proteger tu cuenta.';
-      await reportHealthIssue('xianyu-risk',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad. Se reintentará en la próxima ejecución.').catch(()=>{});
+      xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa 4 horas para proteger tu cuenta.';
+      xianyuStartRiskPause();
+      await reportHealthIssue('xianyu-risk',xianyuPausedReason+' El bot lo volverá a intentar solo cuando pasen las 4 horas.').catch(()=>{});
       perQuery.push({query:keyword,risk:true});
       break;
     }
@@ -1899,6 +1910,8 @@ function xianyuDirectSessionBlock(){
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'direct',perQuery:[],kept:0};
+  const riskLeft=xianyuRiskPauseLeftMs();
+  if(riskLeft>0)return {ok:true,state:'paused',warning:`Xianyu en pausa tras una verificación anti-bot (quedan ${Math.ceil(riskLeft/60e3)} min).`,perQuery:[],kept:0,provider:'direct'};
   const accountBlocked=xianyuAccountBlocked();
 
   const runAccount=async()=>{
