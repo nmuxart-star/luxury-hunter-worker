@@ -1,4 +1,4 @@
-import http from 'node:http';
+import https from 'node:https';
 
 export async function resolverDesafioEnNube(payloadTask) {
   const apiKey = process.env.CAPSOLVER_API_KEY;
@@ -14,7 +14,7 @@ export async function resolverDesafioEnNube(payloadTask) {
 
   return new Promise((resolve, reject) => {
     const opciones = {
-      hostname: '://capsolver.com',
+      hostname: 'api.capsolver.com',
       port: 443,
       path: '/createTask',
       method: 'POST',
@@ -24,7 +24,7 @@ export async function resolverDesafioEnNube(payloadTask) {
       }
     };
 
-    const req = http.request(opciones, (res) => {
+    const req = https.request(opciones, (res) => {
       let cuerpo = '';
       res.on('data', (chunk) => cuerpo += chunk);
       res.on('end', () => {
