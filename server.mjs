@@ -1466,8 +1466,16 @@ function xianyuRiskPauseLeftMs(){
   const until=Number((getSetting('xianyu_risk_pause',null)||{}).until)||0;
   return Math.max(0,until-Date.now());
 }
+// Si la verificación vuelve poco después de acabar la pausa anterior, la cuenta
+// sigue marcada: descansa más (4 h → 8 h → 24 h) en vez de volver a probar.
+const XIANYU_RISK_LEVELS_H=String(process.env.XIANYU_RISK_PAUSE_HOURS||'4,8,24').split(',').map(Number).filter(n=>n>0);
 function xianyuStartRiskPause(){
-  saveSetting('xianyu_risk_pause',{until:Date.now()+XIANYU_RISK_PAUSE_MS,at:new Date().toISOString()});
+  const prev=getSetting('xianyu_risk_pause',null)||{};
+  const levels=XIANYU_RISK_LEVELS_H.length?XIANYU_RISK_LEVELS_H:[4];
+  const recent=prev.until&&Date.now()-Number(prev.until)<6*3600e3;
+  const level=recent?Math.min((Number(prev.level)||0)+1,levels.length-1):0;
+  saveSetting('xianyu_risk_pause',{until:Date.now()+levels[level]*3600e3,level,hours:levels[level],at:new Date().toISOString()});
+  return levels[level];
 }
 
 function xianyuKnownAccounts(){
@@ -1779,6 +1787,16 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   if(!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
+  // Ritmo de persona (regla 10-11-2026): entre una búsqueda y la siguiente
+  // pasan XIANYU_GAP_SEC s (150 ± 60), también si la anterior fue de otra
+  // ejecución. Sin Mercari ni One Map las tareas acaban en segundos y las
+  // búsquedas salían en ráfaga; era lo que disparaba la verificación.
+  {
+    const gap=Math.max(5,Number(process.env.XIANYU_GAP_SEC||150))*1e3;
+    const jitter=gap*0.4*(Math.random()*2-1);
+    const wait=xianyuLastSearchAt()+gap+jitter-Date.now();
+    if(wait>0)await sleep(Math.min(wait,gap*1.4));
+  }
   const maxQueries=clampInt(process.env.XIANYU_MAX_QUERIES||1,1,1,2);
   const perQuery=[];
   let kept=0;
@@ -1850,9 +1868,9 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       xianyuPausedAt=Date.now();
       xianyuPauseCode='risk';
       xianyuPauseLen=XIANYU_RISK_PAUSE_MS;
-      xianyuPausedReason='Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa 4 horas para proteger tu cuenta.';
-      xianyuStartRiskPause();
-      await reportHealthIssue('xianyu-risk',xianyuPausedReason+' El bot lo volverá a intentar solo cuando pasen las 4 horas.').catch(()=>{});
+      const pauseHours=xianyuStartRiskPause();
+      xianyuPausedReason=`Xianyu ha pedido una verificación anti-bot; Xianyu queda en pausa ${pauseHours} horas para proteger tu cuenta.`;
+      await reportHealthIssue('xianyu-risk',xianyuPausedReason+` El bot lo volverá a intentar solo cuando pasen las ${pauseHours} horas.`).catch(()=>{});
       perQuery.push({query:keyword,risk:true});
       break;
     }
@@ -1865,7 +1883,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     }
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     // Pausa de persona entre búsquedas: las ráfagas son lo que dispara las verificaciones.
-    await sleep(Math.max(2,Number(process.env.XIANYU_GAP_SEC||10))*1e3+Math.random()*8000);
+    await sleep(2500+Math.random()*2500);
   }
   if(perQuery.length)xianyuMarkSearch();
   db.prepare('INSERT INTO runs(source,kind,summary,created_at) VALUES(?,?,?,?)').run('xianyu','live-search-direct',`Queries ${perQuery.length}; kept ${kept}`,new Date().toISOString());

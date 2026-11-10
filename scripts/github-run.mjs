@@ -67,6 +67,11 @@ const CYCLE_MIN_MINUTES=envInt('CYCLE_MIN_MINUTES',20,5,180);
 // según lo que tardó en sus últimas pasadas, le da tiempo a terminar; los
 // demás pasan a la siguiente ejecución. 0 = todas las tareas en cada pasada.
 const RUN_BUDGET_MINUTES=envInt('RUN_BUDGET_MINUTES',38,0,340);
+// Duración mínima de una ejecución: si las tareas acaban en segundos (solo
+// Xianyu), la ejecución sigue en ciclos hasta cumplirla en vez de terminar y
+// encadenar otra al instante. Antes llegaban a 10-16 ejecuciones por hora,
+// cada una con su propio Chromium visitando la cuenta de Xianyu. 0 = apagado.
+const RUN_MIN_MINUTES=envInt('RUN_MIN_MINUTES',0,0,300);
 // Si al arrancar todavía no toca ningún modelo, la ejecución espera al
 // siguiente (como mucho IDLE_WAIT_MAX_MINUTES) en vez de terminar vacía:
 // una ejecución vacía no encadena la siguiente y el bot se quedaba parado
@@ -165,6 +170,7 @@ try{
   while(true){
     cycle++;
     const cycleStartedAt=Date.now();
+    if(cycle>1)budgetStartedAt=cycleStartedAt;
     let tasks=(await api('GET','/api/tasks')).tasks||[];
     // Las ejecuciones encadenadas respetan interval_minutes de cada modelo.
     // Solo un lanzamiento manual real fuerza todas las tareas activas.
@@ -272,6 +278,15 @@ try{
 
     const cycleMinutes=(Date.now()-cycleStartedAt)/60000;
     console.log(`Ciclo ${cycle} completado en ${cycleMinutes.toFixed(1)} min.`);
+    if(RUN_MIN_MINUTES&&anyTaskStarted&&!runAllTasks){
+      const sinceStart=(Date.now()-workerStartedAt)/60000;
+      const left=RUN_MIN_MINUTES-sinceStart;
+      if(left>0.5){
+        console.log(`Ejecución corta (${sinceStart.toFixed(1)} min): sigo ${Math.round(left)} min más en ciclos, para no encadenar ejecuciones sin parar.`);
+        await sleep(Math.min(left,Math.max(CYCLE_MIN_MINUTES,5))*60000);
+        continue;
+      }
+    }
     if(!LOOP_MINUTES||RUN_BUDGET_MINUTES)break;
     const waitMs=Math.max(0,CYCLE_MIN_MINUTES*60000-(Date.now()-cycleStartedAt));
     const elapsedMin=(Date.now()-workerStartedAt+waitMs)/60000;
