@@ -17,6 +17,7 @@ import {descTokens,descIndex,descScore,refSheetDoubt} from './scripts/ref-retrie
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {macOneMapReady,macOneMapSnapshot,macXianyuSearch} from './scripts/onemap-mac-client.mjs';
+import { resolverDesafioEnNube } from './scripts/capsolver-bridge.mjs';
 // Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
 const VESTIAIRE_LIVE_REALIZATION=0.90;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1582,14 +1583,47 @@ function parseXianyuSearchJson(json){
 async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile=null}={}){
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
+  
+  // [CAPSOLVER] Funció per detectar i resoldre el mur de Goofish
+  const checkCaptcha = async () => {
+    const currentUrl = page.url();
+    const isCaptchaVisible = XIANYU_RISK_RE.test(currentUrl) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
+    if (isCaptchaVisible) {
+      console.log(`[Capsolver] Bloqueo detectado en búsqueda Xianyu (${currentUrl}). Iniciando resolución...`);
+      const solucion = await resolverDesafioEnNube({ type: "AntiBaxiaTask", websiteURL: currentUrl });
+      if (solucion) {
+        console.log('[Capsolver] Solución obtenida. Recargando la búsqueda...');
+        await page.reload({waitUntil: 'domcontentloaded'});
+        await page.waitForTimeout(3000);
+        const sigueBloqueada = XIANYU_RISK_RE.test(page.url()) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
+        if (!sigueBloqueada) {
+          console.log('[Capsolver] ¡Éxito! Muro anti-bot superado en la búsqueda.');
+          return true;
+        } else {
+          console.log('[Capsolver Error] La página sigue bloqueada.');
+        }
+      }
+    }
+    return false;
+  };
+
   try{
     if(!x.warmed){
       await page.goto('https://www.goofish.com/',{waitUntil:'domcontentloaded',timeout:40000});
       await sleep(1500+Math.random()*1500);
+      await checkCaptcha(); // Comprovar si ens bloqueja a l'entrada
       x.warmed=true;
     }
-    const first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
+    
+    let first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
     await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
+    
+    // Si salta el CAPTCHA, el resolem i tornem a disparar la cerca
+    if (await checkCaptcha()) {
+      first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:20000});
+      await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
+    }
+
     let resp;
     try{
       resp=await first;
@@ -1602,14 +1636,11 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     let json=await resp.json().catch(()=>null);
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
     if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
-    // Ordenar por "más nuevos" para enterarse antes. Si la web cambia y no
-    // se puede, se usan los resultados por relevancia.
+    
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
       try{
         await sleep(1000+Math.random()*1000);
-        // Sin sesión Goofish muestra la ventana "iniciar sesión" encima;
-        // se cierra como haría cualquier visitante.
         for(let i=0;i<3&&await page.locator('[class*="login-modal-wrap"]').first().isVisible().catch(()=>false);i++){
           const close=page.locator('[class*="login-modal-wrap"] [class*="close"], [class*="login-modal-wrap"] .ant-modal-close').first();
           if(await close.count())await close.click({timeout:3000}).catch(()=>{});
@@ -1626,8 +1657,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
-    // Rango de precio de la tarea en la propia web (como un usuario): así los
-    // 30 resultados son del rango útil y no baratijas o artículos de lujo fuera de presupuesto.
+    
     let priced=false;
     if((minCny||maxCny)&&String(process.env.XIANYU_PRICE_FILTER||'1')!=='0'){
       try{
