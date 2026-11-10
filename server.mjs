@@ -1616,11 +1616,15 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     }
     
     let first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
+    // Silencia el error de timeout si esta promesa queda huérfana (evita caída por unhandledRejection)
+    first.catch(()=>{});
+    
     await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
     
     // Si salta el CAPTCHA, el resolem i tornem a disparar la cerca
     if (await checkCaptcha()) {
       first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:20000});
+      first.catch(()=>{}); // La protegemos también por si falla otra cosa
       await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
     }
 
@@ -1636,14 +1640,11 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     let json=await resp.json().catch(()=>null);
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
     if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
-    // Ordenar por "más nuevos" para enterarse antes. Si la web cambia y no
-    // se puede, se usan los resultados por relevancia.
+    
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
       try{
         await sleep(1000+Math.random()*1000);
-        // Sin sesión Goofish muestra la ventana "iniciar sesión" encima;
-        // se cierra como haría cualquier visitante.
         for(let i=0;i<3&&await page.locator('[class*="login-modal-wrap"]').first().isVisible().catch(()=>false);i++){
           const close=page.locator('[class*="login-modal-wrap"] [class*="close"], [class*="login-modal-wrap"] .ant-modal-close').first();
           if(await close.count())await close.click({timeout:3000}).catch(()=>{});
@@ -1653,6 +1654,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         await page.getByText('新发布',{exact:true}).first().click({timeout:6000});
         await sleep(800+Math.random()*700);
         const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
+        next.catch(()=>{}); // Protección extra
         await page.getByText('最新',{exact:true}).first().click({timeout:6000});
         const j2=await (await next).json().catch(()=>null);
         if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
@@ -1660,8 +1662,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
-    // Rango de precio de la tarea en la propia web (como un usuario): así los
-    // 30 resultados son del rango útil y no baratijas o artículos de lujo fuera de presupuesto.
+    
     let priced=false;
     if((minCny||maxCny)&&String(process.env.XIANYU_PRICE_FILTER||'1')!=='0'){
       try{
@@ -1671,6 +1672,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
           if(minCny){await inputs.nth(0).fill(String(minCny));await sleep(700+Math.random()*800);}
           if(maxCny){await inputs.nth(1).fill(String(maxCny));await sleep(700+Math.random()*800);}
           const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
+          next.catch(()=>{}); // Protección extra
           await page.keyboard.press('Tab');
           const j3=await (await next).json().catch(()=>null);
           if(xianyuAuthIn(j3))return {login:true,where:'sesión caducada'};
@@ -1684,7 +1686,6 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     await page.close().catch(()=>{});
   }
 }
-
 function xianyuLastSearchAt(){
   const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_search'").get();
   return Number(row?.value_json||0)||0;
