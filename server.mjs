@@ -5775,11 +5775,15 @@ function pruneOldData(){
     db.exec('DELETE FROM prune_ids');
     db.prepare(`INSERT INTO prune_ids(id) SELECT l.id FROM listings l
       WHERE COALESCE(l.last_seen,l.first_seen,'')<?
-        AND NOT EXISTS(SELECT 1 FROM notifications x WHERE x.listing_id=l.id AND x.kind<>'global-digest')
+        AND NOT EXISTS(SELECT 1 FROM notifications x WHERE x.listing_id=l.id AND x.kind NOT IN ('global-digest','feed'))
         AND NOT EXISTS(SELECT 1 FROM listing_feedback f WHERE f.listing_id=l.id)`).run(cut);
+    // REGLA DE NIL (10-11-2026): un anuncio con «me interesa» (✅ de Telegram) o
+    // que ya tuvo un aviso propio nunca se borra. El aviso de «anuncio nuevo»
+    // (feed) no protege: va a cientos al día y la memoria se llenaría.
     for(const t of ['task_analyses','analyses','search_session_items'])
       n[t]=db.prepare(`DELETE FROM ${t} WHERE listing_id IN (SELECT id FROM prune_ids)`).run().changes;
     n.digest=db.prepare(`DELETE FROM notifications WHERE kind='global-digest' AND sent_at<?`).run(cut).changes;
+    n.feed=db.prepare(`DELETE FROM notifications WHERE kind='feed' AND listing_id IN (SELECT id FROM prune_ids)`).run().changes;
     n.fingerprints=db.prepare('DELETE FROM listing_fingerprints WHERE first_seen<?').run(cut).changes;
     n.dups=db.prepare('DELETE FROM listing_fingerprint_dups WHERE listing_id IN (SELECT id FROM prune_ids)').run().changes;
     n.listings=db.prepare('DELETE FROM listings WHERE id IN (SELECT id FROM prune_ids)').run().changes;

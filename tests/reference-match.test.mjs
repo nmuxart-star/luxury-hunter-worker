@@ -484,3 +484,30 @@ test('repetidos: solo Xianyu y se puede apagar',()=>{
   on.add('s',other);
   assert.equal(on.ctx.dropRepeatedListings('s',other),0);
 });
+
+// LIMPIEZA DE LA MEMORIA DEL BOT: lo que Nil marcó con «me interesa» nunca se borra
+test('limpieza: los anuncios con ✅ o con aviso propio se quedan; los de «anuncio nuevo» sin más, se borran',()=>{
+  const db=new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE listings(id INTEGER PRIMARY KEY,last_seen TEXT,first_seen TEXT);
+    CREATE TABLE notifications(task_id INT,listing_id INT,kind TEXT,sent_at TEXT);
+    CREATE TABLE listing_feedback(listing_id INTEGER PRIMARY KEY,action TEXT);
+    CREATE TABLE task_analyses(listing_id INT);CREATE TABLE analyses(listing_id INT);CREATE TABLE search_session_items(session_id TEXT,listing_id INT);
+    CREATE TABLE search_sessions(id TEXT,started_at TEXT);CREATE TABLE task_runs(started_at TEXT);CREATE TABLE runs(created_at TEXT);
+    CREATE TABLE listing_fingerprints(fp TEXT,first_seen TEXT);CREATE TABLE listing_fingerprint_dups(listing_id INT);`);
+  const old='2026-10-01T00:00:00Z';
+  for(const id of [1,2,3,4,5,6])db.prepare('INSERT INTO listings VALUES(?,?,?)').run(id,old,old);
+  db.prepare('INSERT INTO listing_feedback VALUES(1,?)').run('interested');          // ✅ de Telegram
+  db.prepare("INSERT INTO notifications VALUES(1,2,'instant',?)").run(old);          // aviso de compra
+  db.prepare("INSERT INTO notifications VALUES(1,3,'feed',?)").run(old);             // solo «anuncio nuevo»
+  db.prepare("INSERT INTO notifications VALUES(1,4,'global-digest',?)").run(old);    // solo el resumen
+  db.prepare("INSERT INTO notifications VALUES(1,5,'feed',?)").run(old);
+  db.prepare('INSERT INTO listing_feedback VALUES(5,?)').run('interested');          // «anuncio nuevo» + ✅
+  const ctx=vm.createContext({Number,Date,Math,console:{log(){},warn(){},error(){}},db,fs:{statSync(){throw new Error('x');}},DB_PATH:'x',process:{env:{}},
+    getSetting:()=>null,saveSetting(){}});
+  vm.runInContext(extract('function pruneOldData(){','\n}\n',source.indexOf('function pruneOldData(){'))+'\n}\n',ctx);
+  ctx.pruneOldData();
+  const left=db.prepare('SELECT id FROM listings ORDER BY id').all().map(r=>Number(r.id));
+  assert.deepEqual(left,[1,2,5]);                                                    // 3, 4 y 6 fuera; 1, 2 y 5 se quedan
+  assert.equal(Number(db.prepare("SELECT COUNT(*) c FROM notifications WHERE kind='feed' AND listing_id=3").get().c),0);
+  assert.equal(Number(db.prepare("SELECT COUNT(*) c FROM notifications WHERE kind='feed' AND listing_id=5").get().c),1);
+});
