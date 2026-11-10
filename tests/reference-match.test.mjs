@@ -511,3 +511,15 @@ test('limpieza: los anuncios con ✅ o con aviso propio se quedan; los de «anun
   assert.equal(Number(db.prepare("SELECT COUNT(*) c FROM notifications WHERE kind='feed' AND listing_id=3").get().c),0);
   assert.equal(Number(db.prepare("SELECT COUNT(*) c FROM notifications WHERE kind='feed' AND listing_id=5").get().c),1);
 });
+
+// Enlace de los avisos: el de Xianyu leído desde el Mac trae cientos de caracteres de seguimiento
+test('aviso: el enlace web de Xianyu es el limpio y el aviso no se pasa del límite',()=>{
+  const ctx=vm.createContext({String,encodeURIComponent,process:{env:{}}});
+  vm.runInContext(`${extract('function htmlEsc(','function moneyEmail(')}\n${extract('const APP_BRIDGE_URL','async function telegramSendListing(')}\n${extract('function alertLink(','function instantAlertText(')}`,ctx);
+  const dirty='https://www.goofish.com/item?id=1097939614632&referPageArgs=Loewe+Puzzle&gulSource=search&extra='+encodeURIComponent(JSON.stringify({labelIds:'539,919,472',source:'7',search_id:'x'.repeat(60),q:'Loewe Puzzle'})).repeat(4);
+  const link=ctx.alertLink({source:'xianyu',source_id:'1097939614632',url:dirty});
+  assert.ok(!/referPageArgs|gulSource/.test(link));
+  assert.ok(link.length<420,String(link.length));
+  assert.equal((link.match(/<a /g)||[]).length,(link.match(/<\/a>/g)||[]).length);
+  assert.match(link,/web=https%3A%2F%2Fwww\.goofish\.com%2Fitem%3Fid%3D1097939614632/);
+});

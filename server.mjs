@@ -6033,7 +6033,14 @@ async function telegramSend(text,photoUrl=null,{buttons=null,previewUrl=null,noP
   const preview=noPreview?{link_preview_options:{is_disabled:true}}
     :previewUrl?{link_preview_options:{url:previewUrl}}
     :{disable_web_page_preview:false};
-  await telegramApi('sendMessage',{chat_id,text:text.slice(0,4096),parse_mode:'HTML',...preview,...extra});
+  try{
+    await telegramApi('sendMessage',{chat_id,text:text.slice(0,4096),parse_mode:'HTML',...preview,...extra});
+  }catch(e){
+    if(!/can't parse entities/i.test(String(e.message)))throw e;
+    // Formato roto: se quitan las etiquetas y se manda como texto plano.
+    const plain=text.replace(/<a href="([^"]*)">[^<]*<\/a>/g,'$1').replace(/<[^>]*>/g,'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
+    await telegramApi('sendMessage',{chat_id,text:plain.slice(0,4096),...preview,...extra});
+  }
   return {sent:true};
 }
 
@@ -6851,7 +6858,12 @@ function alertRefs(v){
 function alertLink(x){
   if(!x.url)return '';
   const app=listingAppLink(x);
-  return `📱 <a href="${htmlEsc(app)}">Abrir el anuncio</a>${app!==x.url?`  ·  <a href="${htmlEsc(x.url)}">web</a>`:''}`;
+  // Los anuncios leídos desde el Chrome del Mac traen un enlace con cientos de
+  // caracteres de seguimiento: se usa el enlace limpio, para que el aviso no pase
+  // el límite de Telegram ni se corte dentro de una etiqueta.
+  const id=String(x.source_id||'').trim()||String(x.url).match(/[?&]id=(\d+)/)?.[1]||'';
+  const web=x.source==='xianyu'&&id?`https://www.goofish.com/item?id=${id}`:x.url;
+  return `📱 <a href="${htmlEsc(app)}">Abrir el anuncio</a>${app!==web?`  ·  <a href="${htmlEsc(web)}">web</a>`:''}`;
 }
 function instantAlertText(x,{soft=false}={}){
   let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
@@ -7002,7 +7014,7 @@ function xianyuFeedText(x){
     `🛡️ 验货宝 · vendedor 信用极好${reviewed}`,
     repeats?`🔁 Mismo anuncio de ${repeats} vendedor${repeats===1?'':'es'} más (solo te enseño uno)`:'',
     alertLink(x)
-  ].filter(Boolean).join('\n').slice(0,1000);
+  ].filter(Boolean).join('\n');
 }
 async function sendXianyuFeed(task,runId,items){
   if(['0','false','off','no'].includes(String(process.env.XIANYU_FEED||'').toLowerCase()))return {sent:0,reason:'disabled'};
