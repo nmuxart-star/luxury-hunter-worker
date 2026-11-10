@@ -6899,6 +6899,83 @@ function limitTaskAlerts(task,picks,{kinds}){
   return out;
 }
 
+// ── TODOS LOS ANUNCIOS NUEVOS DE XIANYU A TELEGRAM (regla de Nil, 10-11-2026) ──
+// Cada anuncio nuevo de Xianyu con vendedor de crédito máximo (卖家信用极好) y
+// la etiqueta 验货宝 (test de autenticación) se manda por Telegram, sin
+// excepción de precio. Los que la IA ha analizado y ve interesantes (comprar,
+// vigilar) llevan la marca «⭐ INTERESANTE · IA». Los que ya tuvieron un aviso
+// propio (compra, posible oportunidad, sin pronóstico, triaje, subasta) no se
+// repiten. XIANYU_FEED=off lo apaga.
+const FEED_NO_CODES=new Set(['counterfeit_title','exotic_skin','accessory_only','not_a_bag','xianyu_too_cheap','no_price']);
+function xianyuFeedEligible(x){
+  if(String(x?.source||'').toLowerCase()!=='xianyu')return false;
+  if(!xianyuListingHasVerificationTag(x))return false;
+  let raw={};try{raw=JSON.parse(x?.raw_json||'{}')}catch{}
+  const tags=[...(raw?.['商品信息']?.['商品标签']||[]),...(raw?.['卖家信息']?.['卖家标签']||[]),...(Array.isArray(raw?.tags)?raw.tags:[])].map(String);
+  if(!tags.some(t=>/信用极好/.test(t)))return false;
+  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
+  const code=v.prescreen?.code||v.final?.prescreen?.code;
+  if(code&&FEED_NO_CODES.has(code))return false;
+  if(String(x.authenticity_risk||'').toUpperCase()==='HIGH')return false;
+  return true;
+}
+function xianyuFeedText(x){
+  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
+  const decision=String(x.decision||'').toUpperCase();
+  const interesting=['STRONG BUY','BUY','WATCH'].includes(decision);
+  const ago=alertAgo(listingPublishedAtMs(x));
+  if(interesting){
+    // El aviso completo de siempre, con la marca de interesante delante.
+    return instantAlertText(x).replace(/^<b>[^\n]*<\/b>/,`<b>⭐ INTERESANTE · IA: ${htmlEsc(ALERT_DECISION_ES[decision]||decision)}</b>`);
+  }
+  const title=String(x.title||'').replace(/感兴趣的话点.*$/,'').replace(/\s+/g,' ').trim().slice(0,90);
+  const reviewed=x.decision&&String(x.decision).toUpperCase()!=='REVIEW'?`\n🤖 IA: ${htmlEsc(ALERT_DECISION_ES[decision]||decision)}${Number.isFinite(Number(x.opportunity_score))&&Number(x.opportunity_score)>0?` · nota ${Math.round(x.opportunity_score)}`:''}`:'';
+  return [
+    `<b>🆕 NUEVO</b> · ${htmlEsc(x._task_name||'')}`,
+    htmlEsc(title),
+    `💶 <b>${alertMoney(x)}</b>${ago?` · ${ago}`:''} · Xianyu`,
+    `🛡️ 验货宝 · vendedor 信用极好${reviewed}`,
+    alertLink(x)
+  ].filter(Boolean).join('\n').slice(0,1000);
+}
+async function sendXianyuFeed(task,runId,items){
+  if(['0','false','off','no'].includes(String(process.env.XIANYU_FEED||'').toLowerCase()))return {sent:0,reason:'disabled'};
+  if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
+  const sentKinds=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind IN ('feed','instant','soft','auction','norefs','triage') LIMIT 1`);
+  const maxAgeMs=Math.max(10,Number(process.env.XIANYU_FEED_MAX_AGE_MIN||360))*60e3;
+  const cap=Math.max(1,Number(process.env.XIANYU_FEED_MAX_PER_RUN||150));
+  const picks=(items||[]).filter(x=>{
+    if(!xianyuFeedEligible(x))return false;
+    if(Date.now()-Date.parse(x.first_seen||'')>maxAgeMs)return false;
+    if(listingFeedback(x.id)==='not_interested')return false;
+    return !sentKinds.get(Number(x.id));
+  }).map(x=>({...x,_task_name:task.task_name}));
+  // Primero los interesantes, luego el resto por precio.
+  const rank=x=>['STRONG BUY','BUY','WATCH'].indexOf(String(x.decision||'').toUpperCase());
+  picks.sort((a,b)=>((rank(b)>=0?10-rank(b):0)-(rank(a)>=0?10-rank(a):0))||Number(a.price_eur)-Number(b.price_eur));
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,'feed','telegram',?)`);
+  let sent=0,failed=0;
+  for(const x of picks.slice(0,cap)){
+    const text=xianyuFeedText(x);
+    for(let attempt=0;attempt<2;attempt++){
+      try{
+        await telegramSend(text,listingTelegramImages(x,1)[0]||null,{buttons:alertButtons(x.id),previewUrl:x.url||null,noPreview:true});
+        mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
+        sent++;
+        break;
+      }catch(e){
+        // Telegram limita el ritmo: si pide esperar, se espera y se reintenta una vez.
+        const wait=Number(String(e.message).match(/retry after (\d+)/i)?.[1]);
+        if(wait&&attempt===0){await sleep((Math.min(wait,60)+1)*1000);continue;}
+        failed++;console.error('Aviso de anuncio nuevo:',e.message);break;
+      }
+    }
+    await sleep(1200);
+  }
+  if(sent||failed)console.log(`Task ${task.id}: ${sent} anuncio(s) nuevo(s) de Xianyu enviado(s) por Telegram${failed?` (${failed} fallos)`:''}${picks.length>cap?`; ${picks.length-cap} quedan para la siguiente`:''}.`);
+  return {sent,failed,pending:Math.max(0,picks.length-cap)};
+}
+
 async function sendInstantAlerts(task,runId,items){
   if(['0','false','off','no'].includes(String(process.env.INSTANT_ALERTS||'').toLowerCase())){
     return {sent:0,reason:'disabled'};
@@ -7846,6 +7923,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
         _priceVsTaskMedian:median&&Number(x.price_eur)>0?Number(x.price_eur)/median:null
       }));
       result.status.instantAlerts=await sendInstantAlerts(task,Number(runId),withRatio);
+      result.status.xianyuFeed=await sendXianyuFeed(task,Number(runId),withRatio).catch(e=>({sent:0,error:e.message}));
     }catch(e){
       result.status.instantAlerts={sent:0,error:e.message};
       console.error(`Instant alerts task ${taskId}:`,e.message);

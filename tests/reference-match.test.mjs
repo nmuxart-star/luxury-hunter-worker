@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import {refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers,MATCH_VERSION} from '../scripts/reference-match.mjs';
 import {compWeight,compStats,weightedQuantile} from '../scripts/vestiaire-bag-match.mjs';
+import {xianyuListingHasVerificationTag} from '../scripts/xianyu-verification.mjs';
 import {descTokens,descIndex,descScore,refSheetDoubt} from '../scripts/ref-retrieval.mjs';
 
 const ago=d=>new Date(Date.now()-d*86400e3).toISOString().slice(0,10);
@@ -376,4 +377,55 @@ test('Xianyu en el Mac: sin sesión en su Chrome → no se usa y se avisa',async
   const h=macHarness({reply:{finalUrl:'https://www.goofish.com/login',login:true,text:null}});
   const r=await h.ctx.xianyuTryMac('x',{});
   assert.equal(r.used,false);assert.equal(r.login,true);
+});
+
+// TODOS LOS ANUNCIOS NUEVOS DE XIANYU A TELEGRAM
+function feedHarness({env={},already=new Set(),feedback={}}={}){
+  const sent=[],marks=[];
+  const ctx=vm.createContext({JSON,Date,Number,String,Math,Set,Promise,console,process:{env},
+    xianyuListingHasVerificationTag,
+    htmlEsc:s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'),
+    ALERT_DECISION_ES:{'STRONG BUY':'COMPRA MUY RECOMENDADA',BUY:'COMPRA RECOMENDADA',WATCH:'VIGILAR',REJECT:'DESCARTAR',REVIEW:'REVISAR'},
+    alertMoney:x=>`¥${x.original_price} (≈ ${Math.round(x.price_eur)} €)`,alertAgo:()=>'hace 12 min',listingPublishedAtMs:()=>Date.now(),alertLink:x=>`🔗 ${x.url}`,
+    instantAlertText:x=>`<b>🔥 COMPRA</b> · ${x._task_name}\nLady Dior · 1.000 €\n🔗 ${x.url}`,
+    telegramConfigured:()=>true,telegramSend:async(text,photo,opts)=>{sent.push({text,photo,opts});return {sent:true};},
+    listingTelegramImages:x=>x.image_url?[x.image_url]:[],alertButtons:id=>[[{callback_data:`ok:${id}`}]],
+    listingFeedback:id=>feedback[id]||null,sleep:async()=>{},
+    db:{prepare:sql=>/SELECT 1 FROM notifications/.test(sql)?{get:id=>already.has(id)?{1:1}:undefined}:{run:(...a)=>marks.push(a)}}});
+  vm.runInContext(extract('const FEED_NO_CODES','async function sendInstantAlerts('),ctx);
+  return {ctx,sent,marks};
+}
+const feedItem=(id,{credit='卖家信用极好',tag='验货宝',decision=null,verification={},price=900,age=0,extra={}}={})=>({
+  id,source:'xianyu',url:`https://www.goofish.com/item?id=${id}`,title:`戴妃包 ${id} 感兴趣的话点“我想要”`,price_eur:price,original_price:price*7.8,currency:'CNY',
+  first_seen:new Date(Date.now()-age*60e3).toISOString(),decision,opportunity_score:decision?70:null,verification_json:JSON.stringify(verification),
+  raw_json:JSON.stringify({'商品信息':{'商品标签':[tag,credit].filter(Boolean)}}),image_url:'https://img.example/a.jpg',...extra});
+test('feed Xianyu: solo vendedor de crédito máximo con 验货宝; sin ellos no sale',()=>{
+  const {ctx}=feedHarness();
+  assert.equal(ctx.xianyuFeedEligible(feedItem(1)),true);
+  assert.equal(ctx.xianyuFeedEligible(feedItem(2,{credit:'卖家信用优秀'})),false);
+  assert.equal(ctx.xianyuFeedEligible(feedItem(3,{tag:null})),false);
+  assert.equal(ctx.xianyuFeedEligible({...feedItem(4),source:'mercari-jp'}),false);
+  assert.equal(ctx.xianyuFeedEligible(feedItem(5,{verification:{prescreen:{code:'counterfeit_title'}}})),false);
+  assert.equal(ctx.xianyuFeedEligible(feedItem(6,{verification:{prescreen:{code:'price_ceiling'}}})),true);   // caro, pero se avisa
+  assert.equal(ctx.xianyuFeedEligible(feedItem(7,{extra:{authenticity_risk:'HIGH'}})),false);
+});
+test('feed Xianyu: envía todos los nuevos, marca los interesantes y no repite',async()=>{
+  const h=feedHarness({already:new Set([13]),feedback:{14:'not_interested'}});
+  const items=[feedItem(10),feedItem(11,{decision:'WATCH'}),feedItem(12,{decision:'REJECT'}),feedItem(13),feedItem(14),feedItem(15,{credit:'卖家信用优秀'}),feedItem(16,{age:600})];
+  const r=await h.ctx.sendXianyuFeed({id:1,task_name:'Lady Dior'},5,items);
+  assert.equal(r.sent,3);                                   // 10, 11 y 12; 13 ya avisado, 14 descartado, 15 sin crédito, 16 viejo
+  const texts=h.sent.map(x=>x.text);
+  assert.match(texts[0],/⭐ INTERESANTE · IA: VIGILAR/);       // los interesantes, primero y marcados
+  assert.match(texts[1],/🆕 NUEVO/);assert.doesNotMatch(texts[1],/INTERESANTE/);
+  assert.match(texts[1],/验货宝 · vendedor 信用极好/);
+  assert.doesNotMatch(texts[1],/感兴趣/);                       // sin la coletilla de Xianyu
+  assert.equal(h.sent[0].photo,'https://img.example/a.jpg');
+  assert.equal(h.marks.length,3);
+});
+test('feed Xianyu: apagado, sin Telegram y tope por ejecución',async()=>{
+  const off=feedHarness({env:{XIANYU_FEED:'off'}});
+  assert.equal((await off.ctx.sendXianyuFeed({id:1,task_name:'x'},1,[feedItem(1)])).reason,'disabled');
+  const cap=feedHarness({env:{XIANYU_FEED_MAX_PER_RUN:'2'}});
+  const r=await cap.ctx.sendXianyuFeed({id:1,task_name:'x'},1,[feedItem(1),feedItem(2),feedItem(3)]);
+  assert.equal(r.sent,2);assert.equal(r.pending,1);
 });
