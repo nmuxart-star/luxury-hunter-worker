@@ -2,7 +2,7 @@
 // enviarla a Luxury Hunter Inbox. Se inyecta solo cuando Nil pulsa el icono de
 // la extensión sobre esa pestaña; no lee nada más ni se ejecuta por su cuenta.
 // Es una función autocontenida: no puede usar nada de fuera.
-function lhExtractListing(){
+async function lhExtractListing(){
   const clean=t=>String(t||'').replace(/\s+/g,' ').trim();
   const text=el=>clean(el?.innerText||el?.textContent||'');
   const meta=n=>clean(document.querySelector(`meta[property="${n}"],meta[name="${n}"],meta[itemprop="${n}"]`)?.content);
@@ -24,10 +24,27 @@ function lhExtractListing(){
     if(seller)out.description+=` | Vendedor en Xianyu: ${seller[1]} años, ${seller[2]} vendidos, ${seller[3]} % de valoraciones buenas`;
     if(/验货宝/.test(body))out.description+=' | Con 验货宝 (test de autenticación)';
     out.currency='CNY';
-    // Fotos del producto: «xy_item». Las «mtopupload» sin carpeta de usuario son avatares.
-    const own=[...document.images].map(i=>i.currentSrc||i.src||'').filter(u=>/xy_item/.test(u));
-    const fallback=[...document.images].map(i=>i.currentSrc||i.src||'').filter(u=>/mtopupload/.test(u)&&/\/\d{8,}\//.test(u));
-    for(const u of (own.length?own:fallback))addImage(u.replace(/_\d+x\d+[^/]*$/,'').replace(/_\.webp$/,''));
+    // Fotos del producto. Se espera hasta 4 s a que la galería las cargue.
+    const normalize=u=>u.replace(/_\d+x\d+[^/]*$/,'').replace(/_\.webp$/,'');
+    const productPhotos=()=>{
+      const found=[];
+      const consider=(u,w,h)=>{
+        if(!u||!/(alicdn|goofish|taobao)\./.test(u)||/-tps-|avatar|logo|sprite|icon/i.test(u))return;
+        // Las del producto llevan «xy_item», «fleamarket» o la carpeta numérica del vendedor; las demás, solo si son grandes.
+        const own=/xy_item|fleamarket|\/\d{8,}\//.test(u);
+        if(own||(w>=250&&h>=250))found.push(normalize(u));
+      };
+      for(const img of document.images)consider(img.currentSrc||img.src||'',img.naturalWidth||0,img.naturalHeight||0);
+      // Galerías que pintan las fotos como fondo.
+      for(const el of document.querySelectorAll('[class*="carousel"],[class*="swiper"],[class*="slide"],[class*="gallery"],[class*="item-main"],[class*="photo"]')){
+        const bg=(getComputedStyle(el).backgroundImage||'').match(/url\(["']?([^"')]+)["']?\)/);
+        if(bg)consider(bg[1],el.clientWidth||0,el.clientHeight||0);
+      }
+      return [...new Set(found)];
+    };
+    let photos=productPhotos();
+    for(let i=0;i<8&&!photos.length;i++){await new Promise(r=>setTimeout(r,500));photos=productPhotos();}
+    photos.forEach(addImage);
   }else{
     // Resto de plataformas: datos estándar de la página (Open Graph, JSON-LD de producto).
     out.title=meta('og:title')||clean(document.querySelector('h1')?.innerText)||clean(document.title);
@@ -75,5 +92,6 @@ function lhExtractListing(){
   out.title=out.title.slice(0,250);
   out.description=out.description.slice(0,1500);
   out.images=images.slice(0,12);
+  out.debug={pageImages:document.images.length,largeImages:[...document.images].filter(i=>(i.naturalWidth||0)>=250).length};
   return out;
 }

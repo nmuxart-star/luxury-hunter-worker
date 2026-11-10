@@ -374,7 +374,7 @@ async function sendTabToInbox(tab){
     await badge(tabId,'…','#6b7280');
     const {bridgeToken}=await chrome.storage.local.get('bridgeToken');
     if(!bridgeToken)throw new Error('Falta la clave del puente: ábrela en las opciones de la extensión.');
-    const [injection]=await chrome.scripting.executeScript({target:{tabId},files:['page-extractor.js']}).then(async()=>chrome.scripting.executeScript({target:{tabId},func:()=>lhExtractListing()}));
+    const [injection]=await chrome.scripting.executeScript({target:{tabId},files:['page-extractor.js']}).then(async()=>chrome.scripting.executeScript({target:{tabId},func:async()=>await lhExtractListing()}));
     const data=injection?.result;
     if(!data?.title)throw new Error('No he podido leer el anuncio: espera a que cargue la página.');
     let response;
