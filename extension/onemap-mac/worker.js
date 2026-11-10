@@ -356,6 +356,41 @@ async function start(){
   await chrome.alarms.create('onemap-poll',{periodInMinutes:0.5});
   await poll();
 }
+// ── Enviar a Luxury Hunter Inbox el anuncio de la pestaña activa ───────────
+// Al pulsar el icono de la extensión: se lee la ficha de ESA pestaña (solo
+// esa, con el permiso activeTab) y se manda a la app en 127.0.0.1:8732.
+const INBOX='http://127.0.0.1:8732';
+async function badge(tabId,text,color,ms=0){
+  try{
+    await chrome.action.setBadgeBackgroundColor({tabId,color});
+    await chrome.action.setBadgeText({tabId,text});
+    if(ms)setTimeout(()=>chrome.action.setBadgeText({tabId,text:''}).catch(()=>{}),ms);
+  }catch{}
+}
+async function sendTabToInbox(tab){
+  const tabId=tab?.id;
+  try{
+    if(!tabId||!/^https?:/.test(tab.url||''))throw new Error('Abre un anuncio en esta pestaña y vuelve a pulsar el icono.');
+    await badge(tabId,'…','#6b7280');
+    const {bridgeToken}=await chrome.storage.local.get('bridgeToken');
+    if(!bridgeToken)throw new Error('Falta la clave del puente: ábrela en las opciones de la extensión.');
+    const [injection]=await chrome.scripting.executeScript({target:{tabId},files:['page-extractor.js']}).then(async()=>chrome.scripting.executeScript({target:{tabId},func:()=>lhExtractListing()}));
+    const data=injection?.result;
+    if(!data?.title)throw new Error('No he podido leer el anuncio: espera a que cargue la página.');
+    let response;
+    try{
+      response=await fetch(`${INBOX}/api/manual/browser-import`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${bridgeToken}`},body:JSON.stringify(data)});
+    }catch{throw new Error('La app Luxury Hunter Inbox no está abierta. Ábrela y vuelve a pulsar.');}
+    const body=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(body.error||`La app respondió ${response.status}.`);
+    await badge(tabId,'✓','#16a34a',5000);
+  }catch(error){
+    await badge(tabId,'!','#dc2626',8000);
+    try{chrome.notifications.create('lh-inbox-error',{type:'basic',iconUrl:ICON,title:'No se ha enviado el anuncio',message:String(error?.message||error),priority:1});}catch{}
+  }
+}
+chrome.action.onClicked.addListener(tab=>{void sendTabToInbox(tab);});
+
 chrome.runtime.onInstalled.addListener(()=>{void hookXianyu();});
 chrome.runtime.onInstalled.addListener(start);
 chrome.runtime.onStartup.addListener(start);
