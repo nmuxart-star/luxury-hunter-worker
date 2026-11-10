@@ -73,7 +73,7 @@ export async function visitGoofish(context,{waitMs=6000}={}){
       
       if(isCaptchaVisible){
         riskControl=true;
-        console.log(`[Capsolver] Bloqueo detectado en Goofish (${url2}). Iniciando resolución...`);
+        console.log('[Capsolver] Bloqueo detectado en Goofish. Iniciando resolución...');
         
         const payload = {
           type: "AntiBaxiaTask", 
@@ -83,10 +83,20 @@ export async function visitGoofish(context,{waitMs=6000}={}){
         const solucion = await resolverDesafioEnNube(payload);
         
         if (solucion) {
-          console.log('[Capsolver] Solución obtenida. El CAPTCHA se ha resuelto.');
-          riskControl=false;
+          console.log('[Capsolver] Solución obtenida. Recargando la página para verificar...');
           await page.reload({waitUntil: 'domcontentloaded'});
           await page.waitForTimeout(3000);
+          
+          // COMPROBAR DE NUEVO SI SIGUE BLOQUEADA
+          const urlDespues = page.url();
+          const sigueBloqueada = /punish|baxia|captcha|_____tmd_____/i.test(urlDespues) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
+          
+          if (!sigueBloqueada) {
+            console.log('[Capsolver] ¡Éxito! El muro anti-bot ha desaparecido.');
+            riskControl = false; // Solo quitamos el aviso si de verdad funcionó
+          } else {
+            console.log('[Capsolver Error] Se aplicó la solución pero la página sigue bloqueada.');
+          }
         } else {
           console.log('[Capsolver Error] No se obtuvo solución válida de la API.');
         }
