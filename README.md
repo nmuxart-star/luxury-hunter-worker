@@ -106,54 +106,11 @@ demás fuentes continúan funcionando.
 `Configuración` muestra las cuentas detectadas sin mostrar cookies. La opción
 de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserva.
 
-### Just One API para Xianyu
+### Xianyu: búsquedas desde el Chrome del Mac
 
-Luxury Hunter usa solo [Product Search V1](https://docs.justoneapi.com/en/api/xianyu-goofish/product-search-v1)
-de Just One API. No llama a Product Details ni abre fichas. Conserva de la
-respuesta de búsqueda la imagen y galería que vengan, descripción, fecha de
-publicación, etiqueta `验货宝` y los campos del vendedor que estén disponibles.
-Los datos ausentes quedan vacíos; no se completan con otra petición. La etiqueta
-se comprueba en cada anuncio y solo se guarda o muestra Xianyu si la lleva. El
-texto libre del vendedor no cuenta como prueba de la etiqueta.
+Xianyu es hoy la única fuente activa (`ACTIVE_SOURCES=xianyu`). Con `XIANYU_VIA_MAC` el bot busca desde el Chrome del Mac mediante la extensión «Luxury Hunter Mac local»: `only` (solo el Mac; si Xianyu pide una verificación, el bot espera `XIANYU_MAC_HOLD_MIN` minutos sin insistir), `prefer` (el Mac y, si no está conectado, la cuenta del servidor) u `off`.
 
-En la respuesta real de búsqueda, la fecha llega en `clickParam.args.publishTime`
-y la galería en `exContent.detailParams.imageInfos`; ambos se leen del mismo
-resultado. El apodo, ID y avatar del vendedor se conservan cuando aparecen.
-Las etiquetas del vendedor pueden aportar número de opiniones y porcentaje de
-valoraciones positivas. Antigüedad de la cuenta, crédito y ventas quedan vacíos
-si la búsqueda no devuelve esos datos.
-
-El bot ordena por `newest` y aplica una ventana máxima de 24 horas por fecha
-real de publicación (`XIANYU_SEARCH_MAX_AGE_HOURS`, 24 por defecto). Descarta
-resultados sin imagen, señal de vendedor o fecha de publicación, y no sustituye
-una fecha desconocida por la hora en que se encontró el anuncio. Los anuncios
-añadidos manualmente solo se pueden abrir si ya aparecieron en una búsqueda.
-
-En GitHub, crea el secreto de Actions `JUSTONEAPI_TOKEN` con el token de tu cuenta.
-El workflow selecciona Just One API por defecto y no inicia las sesiones de
-navegador de Xianyu. Si ya existe una variable `XIANYU_PROVIDER`, ponla en
-`justoneapi`. Para usar el flujo local con sesión, establece `XIANYU_PROVIDER=direct`.
-
-En una instalación local, añade a `.env`:
-
-```dotenv
-XIANYU_PROVIDER=justoneapi
-JUSTONEAPI_TOKEN=tu_token
-```
-
-Cada página de resultados de Just One API es una petición facturada. Una
-búsqueda de dos páginas genera dos cargos y nunca entra en fichas. Las
-búsquedas pagadas se espacian según el número de páginas y tienen un límite
-de **20 peticiones al día y 650 al mes** (hora de Madrid); también se cuentan
-los intentos fallidos. `XIANYU_DAILY_SEARCH_LIMIT` y
-`XIANYU_MONTHLY_SEARCH_LIMIT` pueden bajar esos límites, nunca subirlos.
-Al alcanzar el límite diario se omiten los turnos pagados hasta el día
-siguiente; la cuenta de Xianyu conserva sus turnos. Si no se recupera el
-estado persistente de GitHub, se pausan las búsquedas pagadas para proteger
-el contador. A ¥0,20 por petición, 20 al día durante un mes de 31 días serían
-¥124 como máximo. El coste en euros puede variar si cambian la tarifa o el
-tipo de cambio. `XIANYU_SEARCH_MAX_AGE_HOURS` controla la antigüedad máxima
-de los anuncios. Los errores se registran sin detener las demás fuentes.
+El bot ordena por «más nuevos», aplica el rango de precio de la tarea y una ventana máxima de 24 horas por fecha real de publicación (`XIANYU_SEARCH_MAX_AGE_HOURS`). Descarta resultados sin imagen, señal de vendedor o fecha de publicación, y no sustituye una fecha desconocida por la hora en que se encontró el anuncio. La etiqueta `验货宝` se comprueba en cada anuncio; el texto libre del vendedor no cuenta como prueba. Los anuncios añadidos manualmente solo se pueden abrir si ya aparecieron en una búsqueda.
 
 ## v1.7 — Más mercados y costes por origen
 

@@ -1636,11 +1636,14 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     let json=await resp.json().catch(()=>null);
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
     if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
-    
+    // Ordenar por "más nuevos" para enterarse antes. Si la web cambia y no
+    // se puede, se usan los resultados por relevancia.
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
       try{
         await sleep(1000+Math.random()*1000);
+        // Sin sesión Goofish muestra la ventana "iniciar sesión" encima;
+        // se cierra como haría cualquier visitante.
         for(let i=0;i<3&&await page.locator('[class*="login-modal-wrap"]').first().isVisible().catch(()=>false);i++){
           const close=page.locator('[class*="login-modal-wrap"] [class*="close"], [class*="login-modal-wrap"] .ant-modal-close').first();
           if(await close.count())await close.click({timeout:3000}).catch(()=>{});
@@ -1657,7 +1660,8 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
-    
+    // Rango de precio de la tarea en la propia web (como un usuario): así los
+    // 30 resultados son del rango útil y no baratijas o artículos de lujo fuera de presupuesto.
     let priced=false;
     if((minCny||maxCny)&&String(process.env.XIANYU_PRICE_FILTER||'1')!=='0'){
       try{
@@ -9595,7 +9599,7 @@ async function sendGlobalDigest({to=null,force=false,config={}}={}){
 function statusPayload() {
   return {
     app:'Luxury Hunter v1.7.1', port:PORT, xianyuBaseUrl:XIANYU_BASE_URL,
-    xianyuProvider:xianyuProvider(),justOneApiConfigured:!!String(process.env.JUSTONEAPI_TOKEN||'').trim(),
+    xianyuProvider:xianyuProvider(),
     oneMapAccountStatus,
     geminiConfigured:aiConfigured(), aiProvider:aiProvider(), aiModel:aiModel(), emailConfigured:smtpConfig().configured,
     listingCount:db.prepare('SELECT COUNT(*) n FROM listings').get().n,
