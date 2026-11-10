@@ -387,6 +387,48 @@ test('Xianyu en el Mac: sin sesión en su Chrome → no se usa y se avisa',async
   assert.equal(r.used,false);assert.equal(r.login,true);
 });
 
+// REPARTO MAC / NUBE (XIANYU_VIA_MAC=split)
+function splitHarness(share='50'){
+  const store={};
+  const ctx=vm.createContext({Number,Math,Date,String,JSON,Promise,process:{env:{XIANYU_VIA_MAC:'split',XIANYU_MAC_SHARE:share,ONEMAP_MAC_BRIDGE_TOKEN:'t'.repeat(40)}},
+    getSetting:(k,f)=>k in store?store[k]:f,saveSetting:(k,v)=>{store[k]=v;},macOneMapReady:async()=>true});
+  vm.runInContext(extract('const xianyuMacMode=','async function searchXianyuDirect('),ctx);
+  return {ctx,store};
+}
+test('Reparto Mac/nube: el modo split se acepta y el reparto es exacto (50 %, 100 %, 0 %, 30 %)',()=>{
+  const h=splitHarness();
+  assert.equal(vm.runInContext('xianyuMacMode()',h.ctx),'split');
+  const count=share=>{let mac=0;for(let n=0;n<100;n++)if(h.ctx.xianyuSplitPick(n,share)==='mac')mac++;return mac;};
+  assert.equal(count(50),50);assert.equal(count(100),100);assert.equal(count(0),0);assert.equal(count(30),30);
+  const seq=[0,1,2,3,4,5].map(n=>h.ctx.xianyuSplitPick(n,50));
+  assert.deepEqual(seq,['cloud','mac','cloud','mac','cloud','mac']);         // se turnan, no salen rachas
+});
+test('Reparto Mac/nube: el contador se guarda entre ejecuciones y respeta XIANYU_MAC_SHARE',()=>{
+  const h=splitHarness('50');
+  const turns=Array.from({length:6},()=>h.ctx.xianyuSplitTurn());
+  assert.deepEqual(turns,['cloud','mac','cloud','mac','cloud','mac']);
+  assert.equal(h.store.xianyu_split.n,6);
+  const otra=splitHarness('25');
+  const t25=Array.from({length:100},()=>otra.ctx.xianyuSplitTurn());
+  assert.equal(t25.filter(x=>x==='mac').length,25);
+  assert.equal(vm.runInContext('xianyuSplitShare()',splitHarness('abc').ctx),50);                // valor raro → 50 %
+  assert.equal(vm.runInContext('xianyuSplitShare()',splitHarness('150').ctx),100);
+});
+test('Reparto Mac/nube: ordenador apagado → todo a la nube; una vía parada → la otra hace todo; Mac en espera → su turno se salta',()=>{
+  const {ctx}=splitHarness();
+  let gastados=0;
+  const turn=t=>()=>{gastados++;return t;};
+  const d=(o,t='mac')=>ctx.xianyuSplitDecide({macReady:true,macHold:false,cloudBlocked:false,...o,turn:turn(t)});
+  assert.equal(d({macReady:false},'mac'),'cloud');                            // Mac apagado: 100 % nube
+  assert.equal(gastados,0);                                                   // y no se gasta turno
+  assert.equal(d({macReady:false,cloudBlocked:true}),'none');                 // todo parado
+  assert.equal(d({cloudBlocked:true},'cloud'),'mac');                         // nube parada: todo al Mac
+  assert.equal(d({cloudBlocked:true,macReady:false,macHold:true}),'wait');    // nube parada y Mac esperando
+  assert.equal(d({},'mac'),'mac');assert.equal(d({},'cloud'),'cloud');        // los dos libres: manda el turno
+  assert.equal(d({macReady:false,macHold:true},'mac'),'wait');                // verificación pendiente: se salta
+  assert.equal(d({macReady:false,macHold:true},'cloud'),'cloud');            // pero la nube sigue con su turno
+});
+
 // TODOS LOS ANUNCIOS NUEVOS DE XIANYU A TELEGRAM
 function feedHarness({env={},already=new Set(),feedback={}}={}){
   const sent=[],marks=[];

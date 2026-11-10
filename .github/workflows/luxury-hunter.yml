@@ -92,6 +92,7 @@ jobs:
       RUN_MIN_MINUTES: ${{ vars.RUN_MIN_MINUTES || '30' }}
       # Xianyu desde el Chrome del Mac: prefer (si el Mac no está, usa el servidor) | only (nunca el servidor) | off.
       XIANYU_VIA_MAC: ${{ vars.XIANYU_VIA_MAC || 'prefer' }}
+      XIANYU_MAC_SHARE: ${{ vars.XIANYU_MAC_SHARE || '50' }}
       CYCLE_MIN_MINUTES: ${{ vars.CYCLE_MIN_MINUTES || '20' }}
       # Avisos inmediatos (email siempre; Telegram si hay secretos).
       INSTANT_ALERT_DECISIONS: ${{ vars.INSTANT_ALERT_DECISIONS || 'STRONG BUY,BUY' }}

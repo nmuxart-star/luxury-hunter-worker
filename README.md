@@ -108,7 +108,9 @@ de cuenta fija en una tarea usa solo esa cuenta; `Automática` permite la reserv
 
 ### Xianyu: búsquedas desde el Chrome del Mac
 
-Xianyu es hoy la única fuente activa (`ACTIVE_SOURCES=xianyu`). Con `XIANYU_VIA_MAC` el bot busca desde el Chrome del Mac mediante la extensión «Luxury Hunter Mac local»: `only` (solo el Mac; si Xianyu pide una verificación, el bot espera `XIANYU_MAC_HOLD_MIN` minutos sin insistir), `prefer` (el Mac y, si no está conectado, la cuenta del servidor) u `off`.
+Xianyu es hoy la única fuente activa (`ACTIVE_SOURCES=xianyu`). Con `XIANYU_VIA_MAC` el bot elige por dónde busca. Desde el Chrome del Mac se usa la extensión «Luxury Hunter Mac local». Modos: `split` (reparto, el actual), `only` (solo el Mac; si Xianyu pide una verificación, el bot espera `XIANYU_MAC_HOLD_MIN` minutos sin insistir), `prefer` (el Mac y, si no está conectado, la cuenta del servidor) y `off`.
+
+**Reparto `split`:** con el ordenador encendido y conectado, el `XIANYU_MAC_SHARE` % de las búsquedas (50 por defecto) sale desde el Chrome del Mac y el resto desde la nube. El reparto es exacto: un contador guardado entre ejecuciones, no al azar. Con el ordenador apagado, el 100 % va a la nube. Si una vía queda parada (la nube en pausa por una verificación o sin sesión), la otra hace todas las búsquedas. Si el Mac espera a que se resuelva una verificación en el Chrome, su turno se salta, sin pasar esas búsquedas a la nube.
 
 El bot ordena por «más nuevos», aplica el rango de precio de la tarea y una ventana máxima de 24 horas por fecha real de publicación (`XIANYU_SEARCH_MAX_AGE_HOURS`). Descarta resultados sin imagen, señal de vendedor o fecha de publicación, y no sustituye una fecha desconocida por la hora en que se encontró el anuncio. La etiqueta `验货宝` se comprueba en cada anuncio; el texto libre del vendedor no cuenta como prueba. Los anuncios añadidos manualmente solo se pueden abrir si ya aparecieron en una búsqueda.
 
