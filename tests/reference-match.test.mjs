@@ -375,6 +375,12 @@ test('Xianyu en el Mac: Mac desconectado → no se usa (el bot decide si cae al 
   const c=await caido.ctx.xianyuTryMac('x',{});
   assert.equal(c.used,false);assert.match(c.reason,/no respondió/);
 });
+test('Xianyu en el Mac: la pausa del servidor no frena al Mac; con el Mac caído o en espera, sí',async()=>{
+  assert.equal(await macHarness({reply:{}}).ctx.xianyuMacUsable(),true);
+  assert.equal(await macHarness({ready:false,reply:{}}).ctx.xianyuMacUsable(),false);
+  assert.equal(await macHarness({mode:'off',reply:{}}).ctx.xianyuMacUsable(),false);
+  assert.equal(await macHarness({hold:5*60e3,reply:{}}).ctx.xianyuMacUsable(),false);
+});
 test('Xianyu en el Mac: sin sesión en su Chrome → no se usa y se avisa',async()=>{
   const h=macHarness({reply:{finalUrl:'https://www.goofish.com/login',login:true,text:null}});
   const r=await h.ctx.xianyuTryMac('x',{});

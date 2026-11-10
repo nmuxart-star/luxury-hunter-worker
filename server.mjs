@@ -1799,6 +1799,14 @@ function xianyuMacResultToSearch(r){
   if(!json)return {noResponse:true,mac:true,where:r.error||`${url} · "${r.title||''}"`};
   return {risk:false,mac:true,sorted:!!r.sorted,priced:!!r.priced,items:parseXianyuSearchJson(json),ret:json?.ret||null};
 }
+// ¿Se puede buscar ahora desde el Mac? Si sí, las pausas de la cuenta del
+// servidor (verificación, sesión, ritmo) no cuentan: son del servidor, no de tu Chrome.
+async function xianyuMacUsable(){
+  if(xianyuMacMode()==='off')return false;
+  const token=xianyuMacToken();
+  if(!token||xianyuMacHoldLeftMs()>0)return false;
+  return !!(await macOneMapReady(token).catch(()=>false));
+}
 // {used:true,res} si se buscó en el Mac; {used:false,reason,hold} si no se pudo.
 async function xianyuTryMac(keyword,{minCny,maxCny}){
   if(xianyuMacMode()==='off')return {used:false,reason:'desactivado'};
@@ -1828,10 +1836,11 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     xianyuPausedReason=null;
   }
   if(xianyuPausedReason&&Date.now()-xianyuPausedAt>xianyuPauseLen){xianyuPausedReason=null;xianyuPauseCode=null;xianyuPauseLen=XIANYU_PAUSE_MS;}
-  if(xianyuPausedReason){
+  const macOkEarly=await xianyuMacUsable();
+  if(xianyuPausedReason&&!macOkEarly){
     return {ok:true,state:'paused',warning:xianyuPausedReason,perQuery:[],kept:0};
   }
-  if(!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
+  if(!macOkEarly&&!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
   // Ritmo de persona (regla 10-11-2026): entre una búsqueda y la siguiente
@@ -1992,14 +2001,15 @@ async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'direct',perQuery:[],kept:0};
   const riskLeft=xianyuRiskPauseLeftMs();
-  if(riskLeft>0)return {ok:true,state:'paused',warning:`Xianyu en pausa tras una verificación anti-bot (quedan ${Math.ceil(riskLeft/60e3)} min).`,perQuery:[],kept:0,provider:'direct'};
+  const macOk=riskLeft>0||xianyuDirectSessionBlock()?await xianyuMacUsable():false;
+  if(riskLeft>0&&!macOk)return {ok:true,state:'paused',warning:`Xianyu en pausa tras una verificación anti-bot (quedan ${Math.ceil(riskLeft/60e3)} min).`,perQuery:[],kept:0,provider:'direct'};
   const accountBlocked=xianyuAccountBlocked();
 
   const runAccount=async()=>{
     const fn=searchXianyuDirect;
     // La cuenta revisa sus 30 anuncios: la página ya trae 30.
     const accountOpts={...opts,slotReserved:true,maxItems:30};
-    const res=xianyuDirectSessionBlock()||await fn(accountOpts);
+    const res=(!macOk&&xianyuDirectSessionBlock())||await fn(accountOpts);
     const verification=String(process.env.XIANYU_SESSION_STATUS||'').trim()==='risk_control'||
       (res.perQuery||[]).some(q=>q?.risk)||(res.state==='paused'&&xianyuPauseCode==='risk');
     if(verification){
