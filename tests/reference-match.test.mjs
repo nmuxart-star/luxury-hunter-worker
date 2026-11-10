@@ -414,7 +414,7 @@ test('Reparto Mac/nube: el contador se guarda entre ejecuciones y respeta XIANYU
   assert.equal(vm.runInContext('xianyuSplitShare()',splitHarness('abc').ctx),50);                // valor raro → 50 %
   assert.equal(vm.runInContext('xianyuSplitShare()',splitHarness('150').ctx),100);
 });
-test('Reparto Mac/nube: ordenador apagado → todo a la nube; una vía parada → la otra hace todo; Mac en espera → su turno se salta',()=>{
+test('Reparto Mac/nube: ordenador apagado → todo a la nube; una vía parada → la otra hace todo; verificación en el Mac → todo a la nube',()=>{
   const {ctx}=splitHarness();
   let gastados=0;
   const turn=t=>()=>{gastados++;return t;};
@@ -423,10 +423,14 @@ test('Reparto Mac/nube: ordenador apagado → todo a la nube; una vía parada �
   assert.equal(gastados,0);                                                   // y no se gasta turno
   assert.equal(d({macReady:false,cloudBlocked:true}),'none');                 // todo parado
   assert.equal(d({cloudBlocked:true},'cloud'),'mac');                         // nube parada: todo al Mac
-  assert.equal(d({cloudBlocked:true,macReady:false,macHold:true}),'wait');    // nube parada y Mac esperando
+  assert.equal(d({cloudBlocked:true,macReady:false,macHold:true}),'none');    // nube parada y Mac con verificación: nada disponible
   assert.equal(d({},'mac'),'mac');assert.equal(d({},'cloud'),'cloud');        // los dos libres: manda el turno
-  assert.equal(d({macReady:false,macHold:true},'mac'),'wait');                // verificación pendiente: se salta
-  assert.equal(d({macReady:false,macHold:true},'cloud'),'cloud');            // pero la nube sigue con su turno
+  const antesHold=gastados;
+  assert.equal(d({macReady:false,macHold:true},'mac'),'cloud');               // verificación en el Mac: todo a la nube
+  assert.equal(d({macReady:false,macHold:true},'cloud'),'cloud');
+  assert.equal(d({macHold:true},'mac'),'cloud');
+  assert.equal(gastados,antesHold);                                           // sin gastar turno: no se elige entre vías
+  assert.equal(d({},'mac'),'mac');                                            // al acabar la espera se retoma el reparto
 });
 
 // TODOS LOS ANUNCIOS NUEVOS DE XIANYU A TELEGRAM

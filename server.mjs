@@ -1869,7 +1869,8 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
 // apagado, todo va a la nube. El reparto es exacto: un contador guardado entre
 // ejecuciones, no al azar. Si una vía está parada (la nube en pausa por una
 // verificación o sin sesión), la otra hace todo; si el Mac espera a que Nil
-// resuelva una verificación, su turno se salta (no se carga más la cuenta).
+// resuelva una verificación, todas las búsquedas pasan a la nube hasta que el
+// Mac vuelva a buscar sin verificación; entonces se retoma el reparto.
 const xianyuSplitShare=()=>{const n=Number(process.env.XIANYU_MAC_SHARE??50);return Number.isFinite(n)?Math.min(100,Math.max(0,n)):50;};
 // Turno n con reparto share %: 'mac' o 'cloud', con los turnos del Mac repartidos de forma pareja.
 function xianyuSplitPick(n,share){return Math.floor((n+1)*share/100)>Math.floor(n*share/100)?'mac':'cloud';}
@@ -1882,9 +1883,12 @@ function xianyuSplitTurn(){
 // Por dónde sale esta búsqueda: 'mac' | 'cloud' | 'wait' (el Mac espera una verificación) | 'none'.
 // El turno solo se gasta cuando de verdad se puede elegir entre las dos vías.
 function xianyuSplitDecide({macReady,macHold,cloudBlocked,turn}){
-  if(!macReady&&!macHold)return cloudBlocked?'none':'cloud';   // ordenador apagado: todo a la nube
-  if(cloudBlocked)return macHold?'wait':'mac';                 // nube parada: todo al Mac
-  return turn()==='mac'?(macHold?'wait':'mac'):'cloud';
+  // Verificación pendiente en el Chrome del Mac (regla de Nil, 11-11-2026): todo a la
+  // nube hasta que el Mac vuelva a buscar sin verificación; entonces se retoma el reparto.
+  if(macHold)return cloudBlocked?'none':'cloud';
+  if(!macReady)return cloudBlocked?'none':'cloud';             // ordenador apagado: todo a la nube
+  if(cloudBlocked)return 'mac';                                // nube parada: todo al Mac
+  return turn()==='mac'?'mac':'cloud';
 }
 async function xianyuSplitRoute(){
   const token=xianyuMacToken();
