@@ -1584,12 +1584,12 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
   
-  // [CAPSOLVER] Funció per detectar i resoldre el mur de Goofish
+// [CAPSOLVER] Funció per detectar i resoldre el mur de Goofish
   const checkCaptcha = async () => {
     const currentUrl = page.url();
     const isCaptchaVisible = XIANYU_RISK_RE.test(currentUrl) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
     if (isCaptchaVisible) {
-      console.log(`[Capsolver] Bloqueo detectado en búsqueda Xianyu (${currentUrl}). Iniciando resolución...`);
+      console.log('[Capsolver] Bloqueo detectado en búsqueda Xianyu. Iniciando resolución...');
       const solucion = await resolverDesafioEnNube({ type: "AntiBaxiaTask", websiteURL: currentUrl });
       if (solucion) {
         console.log('[Capsolver] Solución obtenida. Recargando la búsqueda...');
