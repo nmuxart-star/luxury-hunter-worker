@@ -188,6 +188,11 @@ jobs:
             sudo apt-get install -y xvfb >/dev/null
           fi
 
+      - name: Ejecutar el Bot
+        env:
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+        run: node scripts/github-luxury-hunter.mjs
+
       - name: Start Xianyu connector when encrypted state is configured
         env:
           XIANYU_STATE_PASSWORD: ${{ secrets.XIANYU_STATE_PASSWORD }}
