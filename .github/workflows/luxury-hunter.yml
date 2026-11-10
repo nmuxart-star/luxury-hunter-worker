@@ -30,6 +30,7 @@ jobs:
     env:
       # IA: OpenAI si existe OPENAI_API_KEY; si no, Gemini.
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
       OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-6.1-sol' }}
       OPENAI_TRIAGE_MODEL: ${{ vars.OPENAI_TRIAGE_MODEL || 'gpt-6-luna' }}
       AI_TRIAGE_MIN_SCORE: ${{ vars.AI_TRIAGE_MIN_SCORE || '50' }}
@@ -321,4 +322,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run luxury-hunter.yml --ref "${GITHUB_REF_NAME}" -f auto_chain=true || echo "Could not chain next run"
-
