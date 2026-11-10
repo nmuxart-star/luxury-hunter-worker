@@ -16,7 +16,7 @@ import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
 import {descTokens,descIndex,descScore,refSheetDoubt} from './scripts/ref-retrieval.mjs';
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
-import {macOneMapReady,macOneMapSnapshot} from './scripts/onemap-mac-client.mjs';
+import {macOneMapReady,macOneMapSnapshot,macXianyuSearch} from './scripts/onemap-mac-client.mjs';
 // Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
 const VESTIAIRE_LIVE_REALIZATION=0.90;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1771,6 +1771,43 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
 }
 
 
+// ── Xianyu desde el Chrome del Mac (regla de Nil, 10-11-2026) ──────────────
+// XIANYU_VIA_MAC: 'prefer' (por defecto) busca desde el Chrome del Mac y, si
+// el Mac no está conectado, usa la cuenta desde el servidor como siempre;
+// 'only' no usa nunca el servidor; 'off' lo apaga. Si Xianyu pide una
+// verificación en el Mac, no se cae al servidor (marcaría más la cuenta):
+// se avisa a Nil en el ordenador y se espera XIANYU_MAC_HOLD_MIN minutos.
+const xianyuMacMode=()=>{const m=String(process.env.XIANYU_VIA_MAC||'prefer').toLowerCase();return ['prefer','only','off'].includes(m)?m:'prefer';};
+const xianyuMacToken=()=>String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
+function xianyuMacHoldLeftMs(){return Math.max(0,(Number((getSetting('xianyu_mac_hold',null)||{}).until)||0)-Date.now());}
+function xianyuMacResultToSearch(r){
+  let json=null;
+  try{json=r.text?JSON.parse(r.text):null;}catch{}
+  const url=String(r.finalUrl||'');
+  if(r.blocked==='risk'||XIANYU_RISK_RE.test(url)||xianyuRiskIn(json))return {risk:true,mac:true};
+  if(r.login||/login|passport/i.test(url)||xianyuAuthIn(json))return {login:true,mac:true,where:'el Chrome del Mac no tiene la sesión de Xianyu abierta'};
+  if(!json)return {noResponse:true,mac:true,where:r.error||`${url} · "${r.title||''}"`};
+  return {risk:false,mac:true,sorted:!!r.sorted,priced:!!r.priced,items:parseXianyuSearchJson(json),ret:json?.ret||null};
+}
+// {used:true,res} si se buscó en el Mac; {used:false,reason,hold} si no se pudo.
+async function xianyuTryMac(keyword,{minCny,maxCny}){
+  if(xianyuMacMode()==='off')return {used:false,reason:'desactivado'};
+  const token=xianyuMacToken();
+  if(!token)return {used:false,reason:'sin clave del puente'};
+  const left=xianyuMacHoldLeftMs();
+  if(left>0)return {used:false,hold:true,reason:`verificación pendiente en tu Chrome (quedan ${Math.ceil(left/60e3)} min)`};
+  if(!await macOneMapReady(token).catch(()=>false))return {used:false,reason:'el Chrome del Mac no está conectado'};
+  try{
+    const res=xianyuMacResultToSearch(await macXianyuSearch(keyword,{minCny,maxCny},token));
+    if(res.risk){
+      saveSetting('xianyu_mac_hold',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_HOLD_MIN||10))*60e3,at:new Date().toISOString()});
+      return {used:true,res:{...res,macRisk:true}};
+    }
+    if(res.login)return {used:false,reason:res.where,login:true};
+    return {used:true,res};
+  }catch(e){return {used:false,reason:`el Mac no respondió (${String(e.message||e).slice(0,80)})`};}
+}
+
 async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto',slotReserved=false}){
   // Como mucho una búsqueda de Xianyu cada XIANYU_MIN_INTERVAL_MIN minutos
   // (entre todas las tareas y ejecuciones). Menos peticiones = menos verificaciones.
@@ -1791,8 +1828,9 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   // pasan XIANYU_GAP_SEC s (150 ± 60), también si la anterior fue de otra
   // ejecución. Sin Mercari ni One Map las tareas acaban en segundos y las
   // búsquedas salían en ráfaga; era lo que disparaba la verificación.
+  const macPeek=xianyuMacMode()!=='off'&&xianyuMacToken()&&xianyuMacHoldLeftMs()===0&&await macOneMapReady(xianyuMacToken()).catch(()=>false);
   {
-    const gap=Math.max(5,Number(process.env.XIANYU_GAP_SEC||150))*1e3;
+    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||45:process.env.XIANYU_GAP_SEC||150))*1e3;
     const jitter=gap*0.4*(Math.random()*2-1);
     const wait=xianyuLastSearchAt()+gap+jitter-Date.now();
     if(wait>0)await sleep(Math.min(wait,gap*1.4));
@@ -1821,7 +1859,22 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     const fixed=accountStrategy==='fixed'
       ?files.find(file=>path.basename(file)===path.basename(String(accountStateFile||'')))||null
       :null;
-    const attempt=await tryXianyuAccounts({
+    const mac=await xianyuTryMac(keyword,{minCny,maxCny});
+    if(!mac.used&&(mac.hold||xianyuMacMode()==='only')){
+      // En espera por una verificación en el Mac, o modo «solo Mac»: no se usa el servidor.
+      const warning=`Xianyu desde el Mac: ${mac.reason}.`;
+      perQuery.push({query:keyword,mac:true,skipped:mac.reason});
+      console.log(warning);
+      return {ok:true,state:'paused',warning,perQuery,kept};
+    }
+    if(!mac.used&&mac.reason!=='desactivado')console.log(`Xianyu: no se busca desde el Mac (${mac.reason}); se usa la cuenta desde el servidor.`);
+    if(mac.used&&mac.res.macRisk){
+      const warning='Xianyu ha pedido una verificación en tu Chrome del Mac: te he avisado en el ordenador. No se usa el servidor mientras tanto.';
+      perQuery.push({query:keyword,mac:true,macRisk:true});
+      await reportHealthIssue('xianyu-mac-risk',warning).catch(()=>{});
+      return {ok:true,state:'paused',warning,perQuery,kept};
+    }
+    const attempt=mac.used?{result:mac.res,expired:[],usedFile:xianyuActiveAccount}:await tryXianyuAccounts({
       files,preferred:xianyuActiveAccount,failed:xianyuFailedAccounts,
       fixed:accountStrategy==='fixed'?fixed||'missing':null,
       search:async stateFile=>{
@@ -1833,7 +1886,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     const failedLabels=attempt.expired;
     for(const label of failedLabels)console.log(`Xianyu: sesión ${label} caducada; probando la siguiente cuenta.`);
     let publicFallback=false;
-    if(res.login&&files.length&&accountStrategy!=='fixed'){
+    if(res.login&&!mac.used&&files.length&&accountStrategy!=='fixed'){
       console.log('Xianyu: todas las sesiones disponibles caducaron; probando resultados públicos sin sesión.');
       try{
         res=await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile:null});

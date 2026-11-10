@@ -22,6 +22,17 @@ export function allowedVestiaireQuery(value){
   return q.length>=3&&q.length<=80&&!/[\r\n<>]/.test(q);
 }
 
+// Búsqueda de Xianyu desde el Chrome del Mac (regla de Nil, 10-11-2026): el
+// servidor de la nube está marcado por Xianyu; el Chrome de Nil tiene su sesión
+// y su conexión de casa. Solo se pasa una palabra de búsqueda y un rango de precio.
+export function allowedXianyuQuery(value){
+  const q=String(value??'').trim();
+  return q.length>=1&&q.length<=80&&!/[\r\n<>]/.test(q);
+}
+export const xianyuSearchUrl=q=>`https://www.goofish.com/search?q=${encodeURIComponent(String(q).trim())}`;
+const cnyOrNull=v=>{const n=Number(v);return Number.isFinite(n)&&n>0&&n<1e7?Math.round(n):null;};
+const XIANYU_TIMEOUT_MS=130_000;
+
 function send(res,status,body){
   res.writeHead(status,{'content-type':'application/json; charset=utf-8',
     'cache-control':'no-store'});
@@ -60,19 +71,20 @@ export function createOneMapMacBridge({token,timeoutMs=DEFAULT_TIMEOUT_MS}={}){
         const job=[...jobs.values()].find(x=>!x.dispatched);
         if(!job)return send(res,200,{job:null});
         job.dispatched=true;
-        return send(res,200,{job:{id:job.id,url:job.url,...(job.kind?{kind:job.kind,query:job.query}:{})}});
+        return send(res,200,{job:{id:job.id,url:job.url,...(job.kind?{kind:job.kind,query:job.query}:{}),...(job.kind==='xianyu'?{minCny:job.minCny,maxCny:job.maxCny}:{})}});
       }
-      if(req.method==='POST'&&(path==='/snapshot'||path==='/vestiaire')){
+      if(req.method==='POST'&&(path==='/snapshot'||path==='/vestiaire'||path==='/xianyu')){
         const body=await readJson(req);
-        const vestiaire=path==='/vestiaire';
-        if(vestiaire?!allowedVestiaireQuery(body?.query):!allowedOneMapUrl(body?.url))return send(res,400,{error:vestiaire?'Búsqueda no permitida':'URL no permitida'});
+        const vestiaire=path==='/vestiaire',xianyu=path==='/xianyu';
+        if(xianyu?!allowedXianyuQuery(body?.query):vestiaire?!allowedVestiaireQuery(body?.query):!allowedOneMapUrl(body?.url))return send(res,400,{error:xianyu||vestiaire?'Búsqueda no permitida':'URL no permitida'});
         if(jobs.size>=MAX_PENDING)return send(res,503,{error:'cola llena'});
         const id=randomUUID();
-        const job=vestiaire?{id,url:VESTIAIRE_HOME,kind:'vestiaire',query:String(body.query),dispatched:false}:{id,url:body.url,dispatched:false};
+        const job=xianyu?{id,url:xianyuSearchUrl(body.query),kind:'xianyu',query:String(body.query).trim(),minCny:cnyOrNull(body.minCny),maxCny:cnyOrNull(body.maxCny),dispatched:false}
+          :vestiaire?{id,url:VESTIAIRE_HOME,kind:'vestiaire',query:String(body.query),dispatched:false}:{id,url:body.url,dispatched:false};
         jobs.set(id,job);
         const timer=setTimeout(()=>{
           if(jobs.delete(id))send(res,504,{error:'El Chrome del Mac no respondió a tiempo'});
-        },timeoutMs);
+        },xianyu?Math.max(timeoutMs,XIANYU_TIMEOUT_MS):timeoutMs);
         job.finish=(status,payload)=>{
           clearTimeout(timer);
           if(jobs.delete(id))send(res,status,payload);

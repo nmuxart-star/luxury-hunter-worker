@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Luxury Hunter Mac local",
-  "version": "0.6.0",
-  "description": "Consulta subastas de One Map y busca en Vestiaire desde el Chrome del Mac para Luxury Hunter.",
+  "version": "0.7.0",
+  "description": "Consulta subastas de One Map, busca en Vestiaire y en Xianyu desde el Chrome del Mac para Luxury Hunter.",
   "minimum_chrome_version": "116",
   "permissions": [
     "alarms",
@@ -15,7 +15,9 @@
     "https://www.fromjapan.co.jp/*",
     "https://es.vestiairecollective.com/*",
     "https://search.vestiairecollective.com/*",
-    "http://127.0.0.1:8210/*"
+    "http://127.0.0.1:8210/*",
+    "https://www.goofish.com/*",
+    "https://h5api.m.goofish.com/*"
   ],
   "background": {
     "service_worker": "worker.js"

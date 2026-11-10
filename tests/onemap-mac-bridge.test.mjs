@@ -65,3 +65,27 @@ test('el puente acepta búsquedas cortas de Vestiaire y nada más',async()=>{
     await new Promise(resolve=>server.close(resolve));
   }
 });
+
+test('el puente acepta búsquedas de Xianyu solo con palabra de búsqueda y la entrega al Chrome del Mac',async()=>{
+  const token='b'.repeat(40);
+  const server=createOneMapMacBridge({token,timeoutMs:3000});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const base=`http://127.0.0.1:${server.address().port}`;
+  const headers={authorization:`Bearer ${token}`,'content-type':'application/json'};
+  try{
+    const bad=await fetch(base+'/xianyu',{method:'POST',headers,body:JSON.stringify({query:'<script>'})});
+    assert.equal(bad.status,400);
+    const noUrl=await fetch(base+'/xianyu',{method:'POST',headers,body:JSON.stringify({url:'https://evil.example/'})});
+    assert.equal(noUrl.status,400);
+    const pending=fetch(base+'/xianyu',{method:'POST',headers,body:JSON.stringify({query:'迪奥 戴妃包',minCny:'3000',maxCny:9000.4})});
+    let job;
+    for(let i=0;i<20&&!job;i++){job=(await (await fetch(base+'/next',{headers})).json()).job;if(!job)await new Promise(r=>setTimeout(r,10));}
+    assert.equal(job.kind,'xianyu');
+    assert.equal(job.url,'https://www.goofish.com/search?q='+encodeURIComponent('迪奥 戴妃包'));
+    assert.equal(job.minCny,3000);assert.equal(job.maxCny,9000);
+    const posted=await fetch(base+`/result/${job.id}`,{method:'POST',headers,body:JSON.stringify({url:job.url,status:200,finalUrl:job.url,title:'闲鱼',html:'',body:JSON.stringify({text:'{"data":{"resultList":[]}}',sorted:true,priced:false})})});
+    assert.equal(posted.status,200);
+    const r=await (await pending).json();
+    assert.equal(JSON.parse(r.body).sorted,true);
+  }finally{server.close();}
+});

@@ -46,17 +46,17 @@ const isBotCheck=r=>BOT_CHECK.test(String(r?.title||'')+' '+String(r?.body||'').
 let captchaWaiting=false;
 const NOTE_ID='lh-onemap-captcha';
 const ICON='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR4nO3PQQ0AIBDAMMC/50MGL0JaBVu2zOwOHGsHrAVYC7AWYC3AWoC1AGsB1gKsBVgLsBZgLcBagLUAawHWAqwFWAuwFmAtwFqAtQ/6BQHqXl7IAAAAAElFTkSuQmCC';
-function notifyCaptcha(){
-  try{chrome.notifications.create(NOTE_ID,{type:'basic',iconUrl:ICON,title:'One Map pide verificación',
-    message:'Pulsa aquí y resuelve «Confirme que es humano». El bot espera.',priority:2,requireInteraction:true});}catch{}
+function notifyCaptcha(site='One Map'){
+  try{chrome.notifications.create(NOTE_ID,{type:'basic',iconUrl:ICON,title:`${site} pide verificación`,
+    message:site==='Xianyu'?'Pulsa aquí y resuelve el control de seguridad de Xianyu (deslizador). El bot espera.':'Pulsa aquí y resuelve «Confirme que es humano». El bot espera.',priority:2,requireInteraction:true});}catch{}
 }
 async function showJobWindow(){
   if(jobWindow)await chrome.windows.update(jobWindow.id,{state:'normal',focused:true}).catch(()=>{});
 }
-async function handleCaptcha(tabId){
+async function handleCaptcha(tabId,stillBlocked=tab=>BOT_CHECK.test(tab.title||''),site='One Map'){
   if(captchaWaiting)return;
   captchaWaiting=true;
-  notifyCaptcha();
+  notifyCaptcha(site);
   await showJobWindow();
   const until=Date.now()+20*60_000;let lastNote=Date.now();
   try{
@@ -64,11 +64,11 @@ async function handleCaptcha(tabId){
       await sleep(3000);
       const tab=await chrome.tabs.get(tabId).catch(()=>null);
       if(!tab)break;
-      if(!BOT_CHECK.test(tab.title||'')&&tab.status==='complete'){
+      if(!stillBlocked(tab)&&tab.status==='complete'){
         await chrome.notifications.clear(NOTE_ID).catch(()=>{});
         break;
       }
-      if(Date.now()-lastNote>5*60_000){notifyCaptcha();lastNote=Date.now();}
+      if(Date.now()-lastNote>5*60_000){notifyCaptcha(site);lastNote=Date.now();}
     }
   }finally{
     await chrome.notifications.clear(NOTE_ID).catch(()=>{});
@@ -216,8 +216,100 @@ async function handleVestiaire(job,token){
   }
 }
 
+// ── Xianyu (Goofish) desde el Chrome del Mac ──────────────────────────────
+// Abre la búsqueda en la ventana minimizada de siempre, deja que la propia web
+// pida sus resultados (el script xianyu-hook.js copia la respuesta), y ordena
+// por «más nuevos» y filtra el precio como lo haría una persona.
+const GOOFISH_BLOCK=/punish|baxia|captcha|_____tmd_____/i;
+async function hookXianyu(){
+  try{await chrome.scripting.unregisterContentScripts({ids:['lh-xianyu-hook']});}catch{}
+  try{await chrome.scripting.registerContentScripts([{id:'lh-xianyu-hook',matches:['https://www.goofish.com/*'],js:['xianyu-hook.js'],world:'MAIN',runAt:'document_start',persistAcrossSessions:true}]);}
+  catch(e){console.warn('Luxury Hunter Xianyu: no se pudo registrar el script',e.message);}
+}
+async function xianyuResponses(tabId){
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>(window.__lhXY||[]).map(x=>x.text)});
+    return r?.result||[];
+  }catch{return [];}
+}
+async function xianyuWaitNew(tabId,have,ms){
+  const until=Date.now()+ms;
+  while(Date.now()<until){
+    const list=await xianyuResponses(tabId);
+    if(list.length>have)return list;
+    const tab=await chrome.tabs.get(tabId).catch(()=>null);
+    if(!tab||GOOFISH_BLOCK.test(tab.url||''))return null;
+    await sleep(700);
+  }
+  return null;
+}
+async function xianyuClick(tabId,text){
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[text],func:t=>{
+      const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
+      if(!el)return false;el.click();return true;}});
+    return !!r?.result;
+  }catch{return false;}
+}
+async function xianyuPrice(tabId,min,max){
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[min,max],func:(lo,hi)=>{
+      const box=document.querySelector('div[class*="search-price-input-container"]');
+      if(!box)return false;
+      const inputs=[...box.querySelectorAll('input')];
+      if(inputs.length<2)return false;
+      const set=(el,v)=>{el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,String(v));el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
+      if(lo)set(inputs[0],lo);
+      if(hi)set(inputs[1],hi);
+      (hi?inputs[1]:inputs[0]).blur();
+      return true;}});
+    return !!r?.result;
+  }catch{return false;}
+}
+async function handleXianyu(job,token){
+  let opened;
+  const reply=payload=>bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:job.url,title:'',html:'',...payload});
+  try{
+    await hookXianyu();
+    opened=await openHidden(job.url);
+    const tabId=opened.tabId;
+    await waitLoaded(tabId);
+    let list=await xianyuWaitNew(tabId,0,40_000);
+    let tab=await chrome.tabs.get(tabId).catch(()=>null);
+    if(!list||GOOFISH_BLOCK.test(tab?.url||'')){
+      const blocked=GOOFISH_BLOCK.test(tab?.url||'');
+      await reply({status:blocked?403:502,finalUrl:tab?.url||job.url,title:tab?.title||'',
+        body:JSON.stringify({blocked:blocked?'risk':null,login:/login|passport/i.test(tab?.url||''),text:null})});
+      if(blocked)await handleCaptcha(tabId,t=>GOOFISH_BLOCK.test(t.url||''),'Xianyu');
+      return;
+    }
+    let text=list[list.length-1],sorted=false,priced=false;
+    // Más nuevos primero.
+    await sleep(900+Math.random()*900);
+    if(await xianyuClick(tabId,'新发布')){
+      await sleep(700+Math.random()*700);
+      if(await xianyuClick(tabId,'最新')){
+        const l2=await xianyuWaitNew(tabId,list.length,15_000);
+        if(l2){list=l2;text=l2[l2.length-1];sorted=true;}
+      }
+    }
+    // Rango de precio de la tarea.
+    if((job.minCny||job.maxCny)&&await xianyuPrice(tabId,job.minCny,job.maxCny)){
+      const l3=await xianyuWaitNew(tabId,list.length,15_000);
+      if(l3){list=l3;text=l3[l3.length-1];priced=true;}
+    }
+    tab=await chrome.tabs.get(tabId).catch(()=>null);
+    await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced})});
+  }catch(error){
+    await reply({status:502,body:JSON.stringify({error:String(error?.message||error)})}).catch(()=>{});
+  }finally{
+    await closeHidden(opened);
+  }
+}
+
 async function handle(job,token){
   if(job.kind==='vestiaire')return handleVestiaire(job,token);
+  if(job.kind==='xianyu')return handleXianyu(job,token);
   const search=job.url.includes('/yahoo-auctions/search/');
   let opened;
   try{
@@ -261,6 +353,7 @@ async function start(){
   await chrome.alarms.create('onemap-poll',{periodInMinutes:0.5});
   await poll();
 }
+chrome.runtime.onInstalled.addListener(()=>{void hookXianyu();});
 chrome.runtime.onInstalled.addListener(start);
 chrome.runtime.onStartup.addListener(start);
 chrome.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='onemap-poll')void poll();});

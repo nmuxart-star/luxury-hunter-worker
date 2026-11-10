@@ -335,3 +335,45 @@ test('Xianyu: la pausa sube de 4 a 8 y a 24 h si la verificación vuelve ensegui
   store.xianyu_risk_pause.until=Date.now()-7*3600e3;         // lleva 7 h sin problemas
   assert.equal(ctx.xianyuStartRiskPause(),4);
 });
+
+// XIANYU DESDE EL CHROME DEL MAC
+function macHarness({mode='prefer',ready=true,reply,hold=0}){
+  const store={};if(hold)store.xianyu_mac_hold={until:Date.now()+hold};
+  const calls=[];
+  const ctx=vm.createContext({Number,Math,Date,String,JSON,Promise,process:{env:{XIANYU_VIA_MAC:mode,ONEMAP_MAC_BRIDGE_TOKEN:'t'.repeat(40)}},
+    getSetting:(k,f)=>k in store?store[k]:f,saveSetting:(k,v)=>{store[k]=v;},
+    macOneMapReady:async()=>ready,macXianyuSearch:async(...a)=>{calls.push(a);if(reply instanceof Error)throw reply;return reply;},
+    XIANYU_RISK_RE:/RGV587|punish/i,xianyuRiskIn:j=>/RGV587/.test(JSON.stringify(j||'')),xianyuAuthIn:j=>/SESSION_EXPIRED/.test(JSON.stringify(j||'')),
+    parseXianyuSearchJson:j=>j.data.resultList});
+  vm.runInContext(extract('const xianyuMacMode=','async function searchXianyuDirect('),ctx);
+  return {ctx,store,calls};
+}
+test('Xianyu en el Mac: una búsqueda buena devuelve los anuncios',async()=>{
+  const h=macHarness({reply:{finalUrl:'https://www.goofish.com/search?q=x',text:JSON.stringify({data:{resultList:[1,2,3]}}),sorted:true,priced:true}});
+  const r=await h.ctx.xianyuTryMac('迪奥',{minCny:100,maxCny:900});
+  assert.equal(r.used,true);assert.deepEqual([...r.res.items],[1,2,3]);assert.equal(r.res.sorted,true);
+  assert.equal(h.calls[0][1].maxCny,900);
+});
+test('Xianyu en el Mac: una verificación frena 10 min y no se cae al servidor',async()=>{
+  const h=macHarness({reply:{finalUrl:'https://www.goofish.com/punish?x',blocked:'risk',text:null}});
+  const r=await h.ctx.xianyuTryMac('x',{});
+  assert.equal(r.used,true);assert.equal(r.res.macRisk,true);
+  const again=await h.ctx.xianyuTryMac('x',{});
+  assert.equal(again.used,false);assert.equal(again.hold,true);
+  assert.equal(h.calls.length,1);                        // la segunda ni llega al Mac
+});
+test('Xianyu en el Mac: Mac desconectado → no se usa (el bot decide si cae al servidor); modo apagado no toca el Mac',async()=>{
+  const off=macHarness({ready:false,reply:{}});
+  const r=await off.ctx.xianyuTryMac('x',{});
+  assert.equal(r.used,false);assert.match(r.reason,/no está conectado/);
+  const apagado=macHarness({mode:'off',reply:{}});
+  assert.equal((await apagado.ctx.xianyuTryMac('x',{})).reason,'desactivado');
+  const caido=macHarness({reply:new Error('timeout')});
+  const c=await caido.ctx.xianyuTryMac('x',{});
+  assert.equal(c.used,false);assert.match(c.reason,/no respondió/);
+});
+test('Xianyu en el Mac: sin sesión en su Chrome → no se usa y se avisa',async()=>{
+  const h=macHarness({reply:{finalUrl:'https://www.goofish.com/login',login:true,text:null}});
+  const r=await h.ctx.xianyuTryMac('x',{});
+  assert.equal(r.used,false);assert.equal(r.login,true);
+});

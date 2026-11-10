@@ -25,3 +25,14 @@ export async function macOneMapSnapshot(url,token){
   }
   return result;
 }
+
+// Búsqueda de Xianyu en el Chrome del Mac. Devuelve la respuesta del buscador
+// de Goofish tal cual la vio la página (texto JSON) y lo que hizo la extensión.
+export async function macXianyuSearch(query,{minCny=null,maxCny=null}={},token){
+  if(!token)throw new Error('Puente de Mac no configurado');
+  const result=await call('/xianyu',{token,body:{query,minCny,maxCny},timeoutMs:150_000});
+  if(!result||typeof result.body!=='string')throw new Error('Respuesta del Mac inválida');
+  let payload={};
+  try{payload=JSON.parse(result.body);}catch{payload={error:String(result.body).slice(0,200)};}
+  return {status:result.status,finalUrl:result.finalUrl||'',title:result.title||'',...payload};
+}
