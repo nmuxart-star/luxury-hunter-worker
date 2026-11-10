@@ -323,7 +323,7 @@ test('Xianyu: la pausa tras una verificación se guarda y dura 4 h entre ejecuci
 
 test('Xianyu: la pausa sube de 4 a 8 y a 24 h si la verificación vuelve enseguida, y vuelve a 4 h tras un descanso largo',()=>{
   const store={};
-  const ctx=vm.createContext({Number,Math,Date,String,process:{env:{}},getSetting:(k,f)=>k in store?store[k]:f,saveSetting:(k,v)=>{store[k]=v;}});
+  const ctx=vm.createContext({Number,Math,Date,String,process:{env:{XIANYU_RISK_PAUSE_HOURS:'4,8,24'}},getSetting:(k,f)=>k in store?store[k]:f,saveSetting:(k,v)=>{store[k]=v;}});
   vm.runInContext(`const XIANYU_RISK_PAUSE_MS=4*3600e3;${extract('function xianyuRiskPauseLeftMs(){','function xianyuKnownAccounts(')}`,ctx);
   assert.equal(ctx.xianyuStartRiskPause(),4);
   store.xianyu_risk_pause.until=Date.now()-3600e3;           // acabó hace 1 h y vuelve la verificación

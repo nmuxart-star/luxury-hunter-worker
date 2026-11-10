@@ -1468,7 +1468,7 @@ function xianyuRiskPauseLeftMs(){
 }
 // Si la verificación vuelve poco después de acabar la pausa anterior, la cuenta
 // sigue marcada: descansa más (4 h → 8 h → 24 h) en vez de volver a probar.
-const XIANYU_RISK_LEVELS_H=String(process.env.XIANYU_RISK_PAUSE_HOURS||'4,8,24').split(',').map(Number).filter(n=>n>0);
+const XIANYU_RISK_LEVELS_H=String(process.env.XIANYU_RISK_PAUSE_HOURS||'4').split(',').map(Number).filter(n=>n>0);
 function xianyuStartRiskPause(){
   const prev=getSetting('xianyu_risk_pause',null)||{};
   const levels=XIANYU_RISK_LEVELS_H.length?XIANYU_RISK_LEVELS_H:[4];
