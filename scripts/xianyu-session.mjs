@@ -1,6 +1,7 @@
 // Utilidades compartidas de sesión Xianyu (Goofish) para login y keep-alive.
 // Nunca imprime valores de cookies: solo nombres y fechas de caducidad.
 import fs from 'node:fs';
+import { resolverDesafioEnNube } from './capsolver-bridge.mjs';
 
 // unb identifica la sesión y dura ~3 días; havana_lgc2_77 es el token
 // "recordarme" (~30 días) que permite a Goofish volver a emitir unb al visitar
@@ -52,6 +53,7 @@ export async function visitGoofish(context,{waitMs=6000}={}){
   // Lo que dice el servidor de Goofish sobre la sesión (no solo las cookies):
   // true = sesión reconocida, false = Session过期, null = no se supo.
   let sessionValid=null;
+  
   page.on('response',async r=>{
     const u=r.url();
     if(!/mtop\.taobao\.idlemessage\.pc\.loginuser\.get|mtop\.idle\.web\.user\.page\.nav/.test(u))return;
@@ -60,13 +62,35 @@ export async function visitGoofish(context,{waitMs=6000}={}){
     if(/SESSION_EXPIRED|FAIL_SYS_TOKEN_EMPTY|未登录|FAIL_SYS_ILLEGAL_ACCESS/.test(t))sessionValid=false;
     if(/RGV587|USER_VALIDATE/.test(t))riskControl=true;
   });
+  
   try{
     for(const url of ['https://www.goofish.com/','https://www.goofish.com/personal']){
       await page.goto(url,{waitUntil:'domcontentloaded',timeout:45000}).catch(()=>{});
       await page.waitForTimeout(waitMs);
       const url2=page.url();
-      if(/punish|baxia|captcha|_____tmd_____/i.test(url2))riskControl=true;
-      if(await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false))riskControl=true;
+      
+      const isCaptchaVisible = /punish|baxia|captcha|_____tmd_____/i.test(url2) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
+      
+      if(isCaptchaVisible){
+        riskControl=true;
+        console.log(`[Capsolver] Bloqueo detectado en Goofish (${url2}). Iniciando resolución...`);
+        
+        const payload = {
+          type: "AntiBaxiaTask", 
+          websiteURL: url2
+        };
+        
+        const solucion = await resolverDesafioEnNube(payload);
+        
+        if (solucion) {
+          console.log('[Capsolver] Solución obtenida. El CAPTCHA se ha resuelto.');
+          riskControl=false;
+          await page.reload({waitUntil: 'domcontentloaded'});
+          await page.waitForTimeout(3000);
+        } else {
+          console.log('[Capsolver Error] No se obtuvo solución válida de la API.');
+        }
+      }
     }
   }finally{
     await page.close().catch(()=>{});
