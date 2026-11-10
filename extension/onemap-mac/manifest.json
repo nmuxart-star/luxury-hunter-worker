@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Luxury Hunter Mac local",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Consulta subastas de One Map, busca en Vestiaire y en Xianyu desde el Chrome del Mac para Luxury Hunter.",
   "minimum_chrome_version": "116",
   "permissions": [

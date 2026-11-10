@@ -261,7 +261,10 @@ async function xianyuPrice(tabId,min,max){
       const set=(el,v)=>{el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,String(v));el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
       if(lo)set(inputs[0],lo);
       if(hi)set(inputs[1],hi);
-      (hi?inputs[1]:inputs[0]).blur();
+      // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
+      const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
+      if(!btn)return false;
+      btn.click();
       return true;}});
     return !!r?.result;
   }catch{return false;}
