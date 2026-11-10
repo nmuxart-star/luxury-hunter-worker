@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { randomUUID, createSign } from 'node:crypto';
+import { randomUUID, createSign, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { load as loadHtml } from 'cheerio';
@@ -215,6 +215,16 @@ CREATE TABLE IF NOT EXISTS task_analyses (
   raw_json TEXT,
   updated_at TEXT NOT NULL,
   UNIQUE(task_id, listing_id)
+);
+CREATE TABLE IF NOT EXISTS listing_fingerprints (
+  fp TEXT PRIMARY KEY,
+  listing_id INTEGER NOT NULL,
+  first_seen TEXT NOT NULL,
+  dup_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS listing_fingerprint_dups (
+  listing_id INTEGER PRIMARY KEY,
+  fp TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS notifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5760,6 +5770,8 @@ function pruneOldData(){
     for(const t of ['task_analyses','analyses','search_session_items'])
       n[t]=db.prepare(`DELETE FROM ${t} WHERE listing_id IN (SELECT id FROM prune_ids)`).run().changes;
     n.digest=db.prepare(`DELETE FROM notifications WHERE kind='global-digest' AND sent_at<?`).run(cut).changes;
+    n.fingerprints=db.prepare('DELETE FROM listing_fingerprints WHERE first_seen<?').run(cut).changes;
+    n.dups=db.prepare('DELETE FROM listing_fingerprint_dups WHERE listing_id IN (SELECT id FROM prune_ids)').run().changes;
     n.listings=db.prepare('DELETE FROM listings WHERE id IN (SELECT id FROM prune_ids)').run().changes;
     n.sessions=db.prepare('DELETE FROM search_sessions WHERE started_at<?').run(cut).changes;
     n.orphans=db.prepare('DELETE FROM search_session_items WHERE session_id NOT IN (SELECT id FROM search_sessions)').run().changes;
@@ -6899,6 +6911,43 @@ function limitTaskAlerts(task,picks,{kinds}){
   return out;
 }
 
+// ── ANUNCIOS REPETIDOS DE VARIOS VENDEDORES (regla de Nil, 10-11-2026) ───────
+// Si dos anuncios de Xianyu coinciden en todo el texto (título y descripción),
+// es el mismo producto subido por usuarios distintos: solo se queda el primero.
+// El repetido no pasa por la IA ni por Telegram. Sin IA y sin coste.
+function listingFingerprint(x){
+  const text=[x?.title,x?.description].map(t=>String(t||'')).join(' ')
+    .replace(/感兴趣的话点[“"][^”"]*[”"].*$/u,'')
+    .replace(/[\s\p{P}\p{S}]+/gu,'').toLowerCase();
+  // Un texto demasiado corto («戴妃包») es demasiado genérico para decir que es el mismo.
+  return text.length>=Math.max(6,Number(process.env.DEDUPE_MIN_CHARS||14))?createHash('sha1').update(text).digest('hex'):null;
+}
+function dropRepeatedListings(sessionId,items){
+  if(['0','off','false','no'].includes(String(process.env.DEDUPE_LISTINGS||'').toLowerCase()))return 0;
+  const get=db.prepare('SELECT listing_id FROM listing_fingerprints WHERE fp=?');
+  const put=db.prepare('INSERT OR IGNORE INTO listing_fingerprints(fp,listing_id,first_seen) VALUES(?,?,?)');
+  const seen=db.prepare('INSERT OR IGNORE INTO listing_fingerprint_dups(listing_id,fp) VALUES(?,?)');
+  const bump=db.prepare('UPDATE listing_fingerprints SET dup_count=dup_count+1 WHERE fp=?');
+  const del=db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?');
+  let dropped=0;
+  // Los más antiguos primero: el original es el que se vio antes.
+  for(const x of [...(items||[])].sort((a,b)=>Number(a.id)-Number(b.id))){
+    if(String(x.source||'').toLowerCase()!=='xianyu')continue;
+    const fp=listingFingerprint(x);
+    if(!fp)continue;
+    const row=get.get(fp);
+    if(!row){put.run(fp,Number(x.id),new Date().toISOString());continue;}
+    if(Number(row.listing_id)===Number(x.id))continue;
+    if(seen.run(Number(x.id),fp).changes)bump.run(fp);
+    del.run(sessionId,Number(x.id));
+    dropped++;
+  }
+  return dropped;
+}
+function listingRepeatCount(listingId){
+  try{return Number(db.prepare('SELECT dup_count FROM listing_fingerprints WHERE listing_id=?').get(Number(listingId))?.dup_count)||0;}catch{return 0;}
+}
+
 // ── TODOS LOS ANUNCIOS NUEVOS DE XIANYU A TELEGRAM (regla de Nil, 10-11-2026) ──
 // Cada anuncio nuevo de Xianyu con vendedor de crédito máximo (卖家信用极好) y
 // la etiqueta 验货宝 (test de autenticación) se manda por Telegram, sin
@@ -6924,9 +6973,11 @@ function xianyuFeedText(x){
   const decision=String(x.decision||'').toUpperCase();
   const interesting=['STRONG BUY','BUY','WATCH'].includes(decision);
   const ago=alertAgo(listingPublishedAtMs(x));
+  const repeats=listingRepeatCount(x.id);
   if(interesting){
     // El aviso completo de siempre, con la marca de interesante delante.
-    return instantAlertText(x).replace(/^<b>[^\n]*<\/b>/,`<b>⭐ INTERESANTE · IA: ${htmlEsc(ALERT_DECISION_ES[decision]||decision)}</b>`);
+    const marked=instantAlertText(x).replace(/^<b>[^\n]*<\/b>/,`<b>⭐ INTERESANTE · IA: ${htmlEsc(ALERT_DECISION_ES[decision]||decision)}</b>`);
+    return repeats?marked.replace(/\n/,`\n🔁 Mismo anuncio de ${repeats} vendedor${repeats===1?'':'es'} más (solo te enseño uno)\n`):marked;
   }
   const title=String(x.title||'').replace(/感兴趣的话点.*$/,'').replace(/\s+/g,' ').trim().slice(0,90);
   const reviewed=x.decision&&String(x.decision).toUpperCase()!=='REVIEW'?`\n🤖 IA: ${htmlEsc(ALERT_DECISION_ES[decision]||decision)}${Number.isFinite(Number(x.opportunity_score))&&Number(x.opportunity_score)>0?` · nota ${Math.round(x.opportunity_score)}`:''}`:'';
@@ -6935,6 +6986,7 @@ function xianyuFeedText(x){
     htmlEsc(title),
     `💶 <b>${alertMoney(x)}</b>${ago?` · ${ago}`:''} · Xianyu`,
     `🛡️ 验货宝 · vendedor 信用极好${reviewed}`,
+    repeats?`🔁 Mismo anuncio de ${repeats} vendedor${repeats===1?'':'es'} más (solo te enseño uno)`:'',
     alertLink(x)
   ].filter(Boolean).join('\n').slice(0,1000);
 }
@@ -7431,6 +7483,11 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
       );
     }
 
+    // Repetidos de otros vendedores (mismo título y descripción): solo el primero.
+    {
+      const repeated=dropRepeatedListings(result.sessionId,sessionListings(result.sessionId));
+      if(repeated)console.log(`Task ${taskId}: ${repeated} anuncios repetidos de otros vendedores apartados (sin IA).`);
+    }
     // Ya analizados: siempre fuera, nunca se vuelven a analizar (regla de Nil, 07-11-2026).
     const priceChangedIds=new Set();
     const previousAnalyzedAnywhere={changes:0};

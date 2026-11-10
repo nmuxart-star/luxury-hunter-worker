@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {createHash} from 'node:crypto';
+import {DatabaseSync} from 'node:sqlite';
 import {refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers,MATCH_VERSION} from '../scripts/reference-match.mjs';
 import {compWeight,compStats,weightedQuantile} from '../scripts/vestiaire-bag-match.mjs';
 import {xianyuListingHasVerificationTag} from '../scripts/xianyu-verification.mjs';
@@ -390,7 +392,7 @@ function feedHarness({env={},already=new Set(),feedback={}}={}){
     instantAlertText:x=>`<b>🔥 COMPRA</b> · ${x._task_name}\nLady Dior · 1.000 €\n🔗 ${x.url}`,
     telegramConfigured:()=>true,telegramSend:async(text,photo,opts)=>{sent.push({text,photo,opts});return {sent:true};},
     listingTelegramImages:x=>x.image_url?[x.image_url]:[],alertButtons:id=>[[{callback_data:`ok:${id}`}]],
-    listingFeedback:id=>feedback[id]||null,sleep:async()=>{},
+    listingFeedback:id=>feedback[id]||null,listingRepeatCount:id=>({10:2})[id]||0,sleep:async()=>{},
     db:{prepare:sql=>/SELECT 1 FROM notifications/.test(sql)?{get:id=>already.has(id)?{1:1}:undefined}:{run:(...a)=>marks.push(a)}}});
   vm.runInContext(extract('const FEED_NO_CODES','async function sendInstantAlerts('),ctx);
   return {ctx,sent,marks};
@@ -418,6 +420,7 @@ test('feed Xianyu: envía todos los nuevos, marca los interesantes y no repite',
   assert.match(texts[0],/⭐ INTERESANTE · IA: VIGILAR/);       // los interesantes, primero y marcados
   assert.match(texts[1],/🆕 NUEVO/);assert.doesNotMatch(texts[1],/INTERESANTE/);
   assert.match(texts[1],/验货宝 · vendedor 信用极好/);
+  assert.match(texts[1],/🔁 Mismo anuncio de 2 vendedores más/);       // el 10 tiene 2 repetidos apartados
   assert.doesNotMatch(texts[1],/感兴趣/);                       // sin la coletilla de Xianyu
   assert.equal(h.sent[0].photo,'https://img.example/a.jpg');
   assert.equal(h.marks.length,3);
@@ -428,4 +431,50 @@ test('feed Xianyu: apagado, sin Telegram y tope por ejecución',async()=>{
   const cap=feedHarness({env:{XIANYU_FEED_MAX_PER_RUN:'2'}});
   const r=await cap.ctx.sendXianyuFeed({id:1,task_name:'x'},1,[feedItem(1),feedItem(2),feedItem(3)]);
   assert.equal(r.sent,2);assert.equal(r.pending,1);
+});
+
+// REPETIDOS DE OTROS VENDEDORES
+function dedupeHarness(env={}){
+  const db=new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE listing_fingerprints(fp TEXT PRIMARY KEY,listing_id INTEGER NOT NULL,first_seen TEXT NOT NULL,dup_count INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE listing_fingerprint_dups(listing_id INTEGER PRIMARY KEY,fp TEXT NOT NULL);
+    CREATE TABLE search_session_items(session_id TEXT,listing_id INTEGER,source_query TEXT,PRIMARY KEY(session_id,listing_id));`);
+  const ctx=vm.createContext({String,Number,Math,Date,Set,createHash,db,process:{env}});
+  vm.runInContext(extract('function listingFingerprint(','// ── TODOS LOS ANUNCIOS NUEVOS DE XIANYU A TELEGRAM'),ctx);
+  const inSession=sid=>db.prepare('SELECT listing_id id FROM search_session_items WHERE session_id=? ORDER BY listing_id').all(sid).map(r=>Number(r.id));
+  const add=(sid,items)=>{for(const x of items)db.prepare('INSERT OR IGNORE INTO search_session_items(session_id,listing_id) VALUES(?,?)').run(sid,x.id);};
+  return {ctx,db,inSession,add};
+}
+const ad=(id,title,extra={})=>({id,source:'xianyu',title,description:'',...extra});
+test('repetidos: mismo título y descripción de otro vendedor → solo se queda el primero',()=>{
+  const h=dedupeHarness();
+  const items=[ad(1,'Dior迪奥漆皮戴妃五格黑银 感兴趣的话点“我想要”和我私聊吧～',{seller_name:'a'}),
+    ad(2,'Dior迪奥漆皮戴妃五格黑银，感兴趣的话点“我想要”和我私聊吧～',{seller_name:'b'}),   // mismo texto con otra puntuación
+    ad(3,'Dior迪奥漆皮戴妃五格黑银 全新',{seller_name:'c'}),                                  // otro texto: se queda
+    ad(4,'戴妃包')];                                                                          // demasiado corto: no se compara
+  h.add('s1',items);
+  assert.equal(h.ctx.dropRepeatedListings('s1',items),1);
+  assert.deepEqual(h.inSession('s1'),[1,3,4]);
+  assert.equal(h.ctx.listingRepeatCount(1),1);
+});
+test('repetidos: el original gana aunque llegue después en la lista, y no cuenta dos veces al mismo repetido',()=>{
+  const h=dedupeHarness();
+  const first=[ad(10,'Lady Dior 三格 黑色 金扣 95新 带防尘袋')];
+  h.add('s1',first);h.ctx.dropRepeatedListings('s1',first);
+  const next=[ad(20,'Lady Dior 三格 黑色 金扣 95新 带防尘袋'),ad(10,'Lady Dior 三格 黑色 金扣 95新 带防尘袋')];
+  h.add('s2',next);
+  assert.equal(h.ctx.dropRepeatedListings('s2',next),1);
+  assert.deepEqual(h.inSession('s2'),[10]);
+  h.add('s3',next);h.ctx.dropRepeatedListings('s3',next);   // el mismo repetido otra vez
+  assert.equal(h.ctx.listingRepeatCount(10),1);
+});
+test('repetidos: solo Xianyu y se puede apagar',()=>{
+  const h=dedupeHarness({DEDUPE_LISTINGS:'off'});
+  const items=[ad(1,'Lady Dior 三格 黑色 金扣 95新 带防尘袋'),ad(2,'Lady Dior 三格 黑色 金扣 95新 带防尘袋')];
+  h.add('s',items);
+  assert.equal(h.ctx.dropRepeatedListings('s',items),0);
+  const on=dedupeHarness();
+  const other=[{...items[0],source:'mercari-jp'},{...items[1],source:'mercari-jp'}];
+  on.add('s',other);
+  assert.equal(on.ctx.dropRepeatedListings('s',other),0);
 });
