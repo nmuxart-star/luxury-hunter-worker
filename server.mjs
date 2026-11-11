@@ -7423,6 +7423,9 @@ async function sendNoRefAlerts(task,runId,items){
 const HEALTH_ALERT_COOLDOWN_HOURS={
   'gemini-capacity':6,
   'ai-budget':20,
+  // Verificaciones de Xianyu: Nil las resuelve a mano y necesita el aviso cada vez (11-11-2026).
+  'xianyu-mac-risk':0.25,
+  'xianyu-risk':0.25,
   default:24
 };
 
