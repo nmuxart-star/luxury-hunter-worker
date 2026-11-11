@@ -1689,7 +1689,14 @@ function xianyuLastSearchAt(){
   const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_search'").get();
   return Number(row?.value_json||0)||0;
 }
+// Tope de búsquedas de Xianyu por hora (Mac y nube juntos): XIANYU_MAX_PER_HOUR (30 por defecto, 0 = sin tope).
+function xianyuSearchesLastHour(){
+  const a=getSetting('xianyu_search_log',[]);
+  const since=Date.now()-3600e3;
+  return (Array.isArray(a)?a:[]).filter(t=>Number(t)>since).map(Number);
+}
 function xianyuMarkSearch(){
+  try{saveSetting('xianyu_search_log',[...xianyuSearchesLastHour(),Date.now()].slice(-300));}catch{}
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
 }
@@ -1926,13 +1933,20 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   if(!macOkEarly&&!slotReserved&&minInterval>0&&Date.now()-xianyuLastSearchAt()<minInterval*60e3){
     return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
+  {
+    const cap=Number(process.env.XIANYU_MAX_PER_HOUR??30);
+    if(cap>0&&xianyuSearchesLastHour().length>=cap){
+      console.log(`Xianyu: tope de ${cap} búsquedas por hora alcanzado; se espera para proteger la cuenta.`);
+      return {ok:true,state:'throttled',perQuery:[],kept:0};
+    }
+  }
   // Ritmo de persona (regla 10-11-2026): entre una búsqueda y la siguiente
   // pasan XIANYU_GAP_SEC s (150 ± 60), también si la anterior fue de otra
   // ejecución. Sin Mercari ni One Map las tareas acaban en segundos y las
   // búsquedas salían en ráfaga; era lo que disparaba la verificación.
   const macPeek=!cloudOnly&&xianyuMacMode()!=='off'&&xianyuMacToken()&&xianyuMacHoldLeftMs()===0&&await macOneMapReady(xianyuMacToken()).catch(()=>false);
   {
-    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||45:process.env.XIANYU_GAP_SEC||150))*1e3;
+    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||90:process.env.XIANYU_GAP_SEC||150))*1e3;
     const jitter=gap*0.4*(Math.random()*2-1);
     const wait=xianyuLastSearchAt()+gap+jitter-Date.now();
     if(wait>0)await sleep(Math.min(wait,gap*1.4));
