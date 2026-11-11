@@ -1098,8 +1098,10 @@ function verifyBudgetLeftUsd(){
   if(manualAiStore.getStore())return Infinity;
   let budget=Number(process.env.AI_VERIFY_DAILY_BUDGET_USD||0.8);
   if(!Number.isFinite(budget)||budget<=0)return Infinity;
-  // Con tope mensual, la verificación nunca pasa de la mitad del día.
-  budget=Math.min(budget,aiDailyBudgetUsd()*0.5);
+  // Con tope mensual, la verificación no pasa de AI_VERIFY_SHARE (85 %) del tope del día.
+  // Regla de Nil (11-11-2026): usar el tope diario completo; el resto (cribado y triaje) cuesta ~0,35 $/día.
+  const verifyShare=Math.min(1,Math.max(0.1,Number(process.env.AI_VERIFY_SHARE??0.85)));
+  budget=Math.min(budget,aiDailyBudgetUsd()*verifyShare);
   const spent=Number(getAiSpend()?.byPurpose?.verify?.usd||0);
   return budget*aiPaceShare()-spent;
 }
@@ -6240,10 +6242,10 @@ async function telegramSendListingTo(text,x,chat=null){
   else await telegramSend(text,null,{buttons:alertButtons(x.id),previewUrl:x.url||null,chat});
   return {sent:true};
 }
-async function telegramSendListing(text,x){
+async function telegramSendListing(text,x,{luxe:toLuxe=true}={}){
   if(!telegramConfigured())return {sent:false};
   const r=await telegramSendListingTo(text,x,null);
-  const luxe=telegramLuxeChat();
+  const luxe=toLuxe?telegramLuxeChat():'';
   // Un fallo en el chat Luxe nunca debe afectar al chat principal.
   if(luxe)await telegramSendListingTo(text,x,luxe).catch(e=>console.error('Telegram Luxe:',e.message));
   return r;
@@ -7398,7 +7400,7 @@ async function sendTriageOnlyAlerts(task,runId,items){
   let sent=0;
   for(const x of picks){
     try{
-      await telegramSendListing(triageOnlyText(x),x);
+      await telegramSendListing(triageOnlyText(x),x,{luxe:false}); // sin analizar: solo al chat principal
       mark.run(Number(task.id),Number(x.id),Number(runId)||null,new Date().toISOString());
       sent++;
       await sleep(800);
