@@ -1677,6 +1677,11 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
       await page.goto('https://www.goofish.com/',{waitUntil:'domcontentloaded',timeout:40000});
       await sleep(1500+Math.random()*1500);
       x.warmed=true;
+    }else if(Math.random()<0.33){
+      // Navegación variada (como en el Mac): ~1 de cada 3 veces entra por la portada, mira un momento y luego busca.
+      await page.goto('https://www.goofish.com/',{waitUntil:'domcontentloaded',timeout:40000}).catch(()=>{});
+      await sleep(2500+Math.random()*4500);
+      await xianyuHumanScroll(page);
     }
     
     let first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
@@ -1926,8 +1931,10 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
   if(left>0)return {used:false,hold:true,reason:`verificación pendiente en tu Chrome (quedan ${Math.ceil(left/60e3)} min)`};
   if(!await macOneMapReady(token).catch(()=>false))return {used:false,reason:'el Chrome del Mac no está conectado'};
   try{
-    xianyuNoteIp('mac');
     const res=xianyuMacResultToSearch(await macXianyuSearch(keyword,{minCny,maxCny},token));
+    // Solo cuenta como «última IP usada» si el Mac contestó de verdad; un intento sin respuesta no debe retrasar la entrada de la nube.
+    xianyuNoteIp('mac');
+    try{saveSetting('xianyu_mac_cool',{until:0,fails:0});}catch{}
     if(res.risk&&res.hard){
       await xianyuStartHardBlock('mac');
       return {used:true,res};
@@ -1941,7 +1948,15 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
     return {used:true,res};
   }catch(e){
     // El Mac no contestó (ventana dormida, extensión parada...): 5 min sin insistir, para no gastar turnos ni esperar 150 s cada vez.
-    try{saveSetting('xianyu_mac_cool',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_COOL_MIN||5))*60e3,at:new Date().toISOString()});}catch{}
+    // Descanso creciente si falla seguido: 5, 15, 45 y 60 min (un Mac que abre pestañas sin devolver nada no se reintenta cada 5 min).
+    try{
+      const prev=getSetting('xianyu_mac_cool',null)||{};
+      const fails=(Number(prev.fails)||0)+1;
+      const base=Math.max(1,Number(process.env.XIANYU_MAC_COOL_MIN||5));
+      const mins=Math.min(60,base*Math.pow(3,Math.min(fails-1,3)));
+      saveSetting('xianyu_mac_cool',{until:Date.now()+mins*60e3,fails,at:new Date().toISOString()});
+      console.log(`Xianyu: el Mac falló ${fails} vez/veces seguidas; descanso de ${mins} min.`);
+    }catch{}
     return {used:false,reason:`el Mac no respondió (${String(e.message||e).slice(0,80)})`};
   }
 }
@@ -1967,8 +1982,8 @@ function xianyuSplitTurn(){
 }
 // ── CALENDARIO MAC / NUBE (regla de Nil, 11-11-2026) ────────────────────────────────────────
 // XIANYU_VIA_MAC=calendar. Una sola IP por cuenta a la vez:
-//  · Entre semana (lunes a viernes, hora de Madrid) solo busca el Mac. Si el Mac no está, el bot espera.
-//  · Sábado y domingo (XIANYU_CLOUD_DAYS) el Mac tiene prioridad. Si no está, entra la nube.
+//  · El Mac tiene prioridad siempre que esté encendido y conectado. Si no está, entra la nube (XIANYU_CLOUD_DAYS=all;
+//    con «mon,tue,...» la nube se limita a esos días, hora de Madrid).
 //  · Cada cambio de IP (Mac→nube o nube→Mac) obliga a XIANYU_SWITCH_HOURS (2) horas sin ninguna búsqueda desde
 //    la IP anterior; si la IP anterior vuelve antes, sigue con ella sin cambiar.
 const XIANYU_SWITCH_MS=Math.max(0,Number(process.env.XIANYU_SWITCH_HOURS??2))*3600e3;
@@ -1976,7 +1991,10 @@ function xianyuMadridDay(now=Date.now()){
   return new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Madrid',weekday:'short'}).format(new Date(now)).toLowerCase().slice(0,3);
 }
 function xianyuCloudDay(now=Date.now()){
-  const days=String(process.env.XIANYU_CLOUD_DAYS||'sat,sun').toLowerCase().split(',').map(x=>x.trim().slice(0,3)).filter(Boolean);
+  // all (por defecto desde el 11-11-2026): el Mac manda siempre que esté encendido y la nube entra cualquier día si no está.
+  const raw=String(process.env.XIANYU_CLOUD_DAYS||'all').toLowerCase().trim();
+  if(raw==='all'||raw==='*')return true;
+  const days=raw.split(',').map(x=>x.trim().slice(0,3)).filter(Boolean);
   return days.includes(xianyuMadridDay(now));
 }
 function xianyuCalendarDecide({cloudDay,macReady,macHold,cloudBlocked,last,now=Date.now(),switchMs=XIANYU_SWITCH_MS}){

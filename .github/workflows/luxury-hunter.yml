@@ -92,8 +92,8 @@ jobs:
       RUN_MIN_MINUTES: ${{ vars.RUN_MIN_MINUTES || '30' }}
       # Xianyu desde el Chrome del Mac: prefer (si el Mac no está, usa el servidor) | only (nunca el servidor) | off.
       XIANYU_VIA_MAC: ${{ vars.XIANYU_VIA_MAC || 'calendar' }}
-      # Calendario: la nube solo en estos días (hora de Madrid) y 2 h de transición al cambiar de IP.
-      XIANYU_CLOUD_DAYS: ${{ vars.XIANYU_CLOUD_DAYS || 'sat,sun' }}
+      # Mac si está encendido; si no, la nube. 2 h de transición al cambiar de IP (XIANYU_SWITCH_HOURS).
+      XIANYU_CLOUD_DAYS: ${{ vars.XIANYU_CLOUD_DAYS || 'all' }}
       XIANYU_SWITCH_HOURS: ${{ vars.XIANYU_SWITCH_HOURS || '2' }}
       # Ritmo que se autorregula: empieza a medias y sube con las búsquedas buenas; baja con cada verificación.
       XIANYU_RATE_START: ${{ vars.XIANYU_RATE_START || '0.8' }}
