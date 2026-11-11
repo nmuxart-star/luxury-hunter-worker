@@ -4932,6 +4932,17 @@ function radarRotatePlan(plan,taskId){
     const off=(turn*step)%list.length;
     out[key]=[...list.slice(off),...list.slice(0,off)];
   }
+  // PORTADA DE BOLSOS (regla de Nil, 11-11-2026): cada XIANYU_PORTADA_EVERY (3) pasadas del radar, la búsqueda de
+  // Xianyu es una genérica de bolsos de marca (más nuevos primero; el filtro de 24 h y el de vendedor fiable ya
+  // aplican a todo). Sustituye a una de las búsquedas de la rotación: no añade peticiones.
+  const every=Math.max(0,Number(process.env.XIANYU_PORTADA_EVERY??3));
+  if(every>0&&turn%every===0&&Array.isArray(out.xianyu)&&out.xianyu.length){
+    const qs=String(process.env.XIANYU_PORTADA_QUERIES||'奢侈品包 二手 正品 验货宝|名牌包 二手 正品|大牌包包 个人闲置').split('|').map(x=>x.trim()).filter(Boolean);
+    if(qs.length){
+      const q=qs[Math.floor(turn/every)%qs.length];
+      out.xianyu=[q,...out.xianyu.filter(x=>x!==q)];
+    }
+  }
   return out;
 }
 // Qué va a hacer una tarea (para la pantalla de detalle): fuentes, consultas,
