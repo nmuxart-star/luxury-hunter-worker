@@ -1584,7 +1584,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
   
-// [CAPSOLVER] Funció per detectar i resoldre el mur de Goofish
+  // [CAPSOLVER] Funció per detectar i resoldre el mur de Goofish
   const checkCaptcha = async () => {
     const currentUrl = page.url();
     const isCaptchaVisible = XIANYU_RISK_RE.test(currentUrl) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
@@ -1616,15 +1616,15 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     }
     
     let first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
-    // Silencia el error de timeout si esta promesa queda huérfana (evita caída por unhandledRejection)
+    // Silencia el error de timeout si esta promesa queda huérfana
     first.catch(()=>{});
     
     await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
     
-    // Si salta el CAPTCHA, el resolem i tornem a disparar la cerca
+    // 1er intento de resolución si salta en la carga inicial
     if (await checkCaptcha()) {
       first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:20000});
-      first.catch(()=>{}); // La protegemos también por si falla otra cosa
+      first.catch(()=>{});
       await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
     }
 
@@ -1637,7 +1637,22 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
       if(/login|passport/i.test(page.url()))return {login:true,where};
       return {noResponse:true,where};
     }
+    
     let json=await resp.json().catch(()=>null);
+
+    // NUEVO: 2do intento si la página cargó bien pero la API oculta el bloqueo en el JSON
+    if (xianyuRiskIn(json)) {
+      console.log('[Capsolver] El JSON de la API reporta bloqueo anti-bot. Comprobando CAPTCHA visual...');
+      await sleep(2000); // Dar tiempo a que el script de Xianyu levante el popup (baxia)
+      if (await checkCaptcha()) {
+        first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:20000});
+        first.catch(()=>{});
+        await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
+        try { resp = await first; } catch {}
+        json = await resp.json().catch(()=>null);
+      }
+    }
+
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
     if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
     
