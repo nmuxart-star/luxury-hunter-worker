@@ -99,6 +99,12 @@ jobs:
       XIANYU_MAC_GAP_SEC: ${{ vars.XIANYU_MAC_GAP_SEC || '300' }}
       XIANYU_GAP_SEC: ${{ vars.XIANYU_GAP_SEC || '300' }}
       RUN_GAP_MINUTES: ${{ vars.RUN_GAP_MINUTES || '30' }}
+      # Salidas repartidas: entre una tarea y la siguiente 4,5-8,5 min y, a veces, un descanso largo.
+      LAUNCH_GAP_MIN_SEC: ${{ vars.LAUNCH_GAP_MIN_SEC || '270' }}
+      LAUNCH_GAP_MAX_SEC: ${{ vars.LAUNCH_GAP_MAX_SEC || '510' }}
+      LAUNCH_BREAK_PROB: ${{ vars.LAUNCH_BREAK_PROB || '0.15' }}
+      # Bloqueo de red de Xianyu («tráfico inusual», sin captcha): se para todo Xianyu estas horas.
+      XIANYU_HARD_BLOCK_HOURS: ${{ vars.XIANYU_HARD_BLOCK_HOURS || '4' }}
       XIANYU_RISK_PAUSE_IGNORE_BEFORE: ${{ vars.XIANYU_RISK_PAUSE_IGNORE_BEFORE || '' }}
       CYCLE_MIN_MINUTES: ${{ vars.CYCLE_MIN_MINUTES || '20' }}
       # Avisos inmediatos (email siempre; Telegram si hay secretos).

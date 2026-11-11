@@ -57,3 +57,38 @@ export function planCycle(runnable,{maxWatches=Infinity}={}){
   }
   return {tasks:[...first,...mixed],deferred:watches.slice(keep.length)};
 }
+
+// ORDEN DE SALIDA REPARTIDO (regla de Nil, 11-11-2026)
+// Antes todos los bolsos de 60 min salían a la vez y luego el resto: una ráfaga que se atascaba en la cola de
+// Xianyu. Ahora cada modelo (revisión completa o carril rápido) tiene una URGENCIA = cuánto se ha pasado de su
+// intervalo (1 = justo ahora le toca, 2 = lleva el doble). Sale primero el más urgente; los de 60 min y el Radar
+// pesan un poco más, el carril rápido un poco menos que una revisión completa, y una pizca de azar evita que
+// el orden sea siempre idéntico. Lo que no cabe en una ejecución sube de urgencia y sale en la siguiente.
+export function launchUrgency(item,{now=Date.now(),rand=Math.random,laneMinutes=60}={}){
+  const task=item.task;
+  const interval=Number(task.interval_minutes)||0;
+  let ratio;
+  if(item.mode==='fast'){
+    ratio=item.sinceMin==null?2:Number(item.sinceMin)/Math.max(5,laneMinutes);
+  }else{
+    const last=Date.parse(task.last_run_at||'');
+    ratio=!Number.isFinite(last)||!interval?3:(now-last)/(interval*60000);
+  }
+  ratio=Math.min(4,Math.max(0,ratio));
+  let weight=item.mode==='fast'?0.8:1;
+  if(interval&&interval<=60)weight*=1.3;
+  const tier=Number((String(task.description||'').match(/TIER:\s*(\d)/i)||[])[1])||9;
+  if(isWatchTaskName(task.task_name)&&tier===1)weight*=1.15;
+  return ratio*weight*(0.85+rand()*0.3);
+}
+export function rankLaunches(items,opts={}){
+  return items.map(it=>({...it,urgency:launchUrgency(it,opts)})).sort((a,b)=>b.urgency-a.urgency);
+}
+
+// Pausa antes de la siguiente salida: entre minSec y maxSec, y de vez en cuando (breakProb) un descanso largo
+// de breakMinMin–breakMaxMin minutos, como haría una persona. rand() en [0,1).
+export function launchSpacingMs({minSec=270,maxSec=510,breakProb=0.15,breakMinMin=8,breakMaxMin=18,rand=Math.random}={}){
+  let ms=(minSec+rand()*(maxSec-minSec))*1000;
+  if(rand()<breakProb)ms+=(breakMinMin+rand()*(breakMaxMin-breakMinMin))*60000;
+  return Math.round(ms);
+}

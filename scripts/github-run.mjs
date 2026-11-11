@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import {shouldRunAllTasks,isDue as due,nextDueTask,planCycle} from './github-run-schedule.mjs';
+import {shouldRunAllTasks,isDue as due,nextDueTask,rankLaunches,launchSpacingMs} from './github-run-schedule.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -78,7 +78,6 @@ const RUN_MIN_MINUTES=envInt('RUN_MIN_MINUTES',0,0,300);
 // hasta el cron de GitHub, que llega con horas de retraso.
 const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
 // 0 = sin máximo de relojes por ejecución (solo manda el tiempo).
-const WATCH_MAX_PER_RUN=envInt('WATCH_MAX_PER_RUN',0,0,30);
 // CARRIL RÁPIDO (regla de Nil, 07-11-2026): los modelos que más rotan se
 // buscan solo en Xianyu y Mercari (lo más nuevo primero) en cada ejecución,
 // como mucho cada FAST_LANE_MINUTES (lo decide el servidor), para llegar en
@@ -121,6 +120,28 @@ async function runPool(items,limit,fn,canStart=()=>true){
 }
 let code=0;
 let anyTaskStarted=false;
+// SALIDAS REPARTIDAS (regla de Nil, 11-11-2026): las tareas no arrancan de golpe. Cada salida que va a buscar en
+// Xianyu espera su turno en una puerta única y, tras cada una, hay una pausa irregular (4,5-8,5 min y, de vez en
+// cuando, un descanso largo). Así la búsqueda llega enseguida y nada se amontona esperando en la cola de Xianyu.
+const LAUNCH_GAP_MIN_SEC=envInt('LAUNCH_GAP_MIN_SEC',270,1,3600);
+const LAUNCH_GAP_MAX_SEC=envInt('LAUNCH_GAP_MAX_SEC',510,LAUNCH_GAP_MIN_SEC,7200);
+const LAUNCH_BREAK_PROB=Math.min(1,Math.max(0,Number(process.env.LAUNCH_BREAK_PROB??0.15)));
+let gateTail=Promise.resolve();
+let nextLaunchAt=0;
+let hardBlockedMin=0;
+function launchGate(fn){
+  const turn=gateTail.then(async()=>{
+    const wait=nextLaunchAt-Date.now();
+    if(wait>0)await sleep(wait);
+    return fn();
+  });
+  gateTail=turn.catch(()=>{});
+  return turn;
+}
+const afterLaunch=()=>{nextLaunchAt=Date.now()+launchSpacingMs({minSec:LAUNCH_GAP_MIN_SEC,maxSec:LAUNCH_GAP_MAX_SEC,breakProb:LAUNCH_BREAK_PROB});};
+async function xianyuBlockMinutes(){
+  try{return Number((await api('GET','/api/xianyu/status')).hard_block_min)||0;}catch{return 0;}
+}
 try{
   await waitServer();
   console.log('Luxury Hunter cloud worker ready.');
@@ -193,28 +214,7 @@ try{
         runnable=tasks.filter(t=>due(t));
       }
     }
-    // Primero los modelos con más prioridad (intervalo más corto) y, dentro de
-    // cada grupo, los que llevan más tiempo sin revisarse.
-    // Bolsos de 60 min siempre primero; luego se alternan reloj y bolso de menos
-    // prioridad, por nivel y antigüedad. Sin máximo de relojes (WATCH_MAX_PER_RUN=0).
-    const plan=planCycle(runnable,{maxWatches:WATCH_MAX_PER_RUN||Infinity});
-    runnable=plan.tasks;
-    if(plan.deferred.length)console.log(`Relojes aplazados a la siguiente ejecución: ${plan.deferred.map(t=>t.task_name).join(', ')}.`);
-    // Carril rápido primero (salvo los modelos a los que ya les toca la revisión completa).
-    if(FAST_TASKS.length){
-      const full=new Set(runnable.map(t=>t.id));
-      const fastList=tasks.filter(t=>FAST_TASKS.includes(t.task_name)&&!full.has(t.id));
-      await runPool(fastList,TASK_CONCURRENCY,async task=>{
-        try{
-          const q=await api('POST',`/api/tasks/${task.id}/run`,{fast:true});
-          if(q.skipped)return;
-          anyTaskStarted=true;
-          console.log(`\n=== RÁPIDO ${task.task_name} (${FAST_LABEL}) ===`);
-          const run=await waitRun(q.runId);
-          console.log(`DONE rápido ${task.task_name}: ${run.status}`);
-        }catch(e){console.error(`FAILED rápido ${task.task_name}:`,e?.message||e);}
-      });
-    }
+    // El orden de salida lo decide más abajo rankLaunches (urgencia repartida), no un orden fijo por niveles.
     // Pasada de subastas (regla de Nil, 07-11-2026): en cada ciclo, todos los
     // modelos activos buscan en One Map las subastas que acaban en ≤2 h y
     // tienen alguna puja. Solo One Map por el Chrome del Mac, sin Mercari ni Xianyu.
@@ -233,27 +233,55 @@ try{
       });
     }
     const estimate=taskMinutesEstimate();
-    let started=0;
-    const canStart=task=>{
-      if(!RUN_BUDGET_MINUTES||started===0)return true;
-      return elapsedMinutes()+estimate(task.id)<=RUN_BUDGET_MINUTES;
-    };
-    console.log(`\n##### CICLO ${cycle}: ${runnable.length}/${tasks.length} tareas, concurrencia ${TASK_CONCURRENCY}${RUN_BUDGET_MINUTES?`, máximo ${RUN_BUDGET_MINUTES} min`:''} #####`);
+    let launched=0;
     const taskResults=[];
-    await runPool(runnable,TASK_CONCURRENCY,async task=>{
-      started++;
-      anyTaskStarted=true;
-      console.log(`\n=== RUN ${task.task_name} ===`);
-      try{
-        const q=await api('POST',`/api/tasks/${task.id}/run`,{});
-        const run=await waitRun(q.runId);
-        taskResults.push({task_id:task.id,task_name:task.task_name,status:run.status,run_id:q.runId});
-        console.log(`DONE ${task.task_name}: ${run.status}`);
-      }catch(e){
-        taskResults.push({task_id:task.id,task_name:task.task_name,status:'error',error:e?.message||String(e)});
-        console.error(`FAILED ${task.task_name}:`,e?.message||e);
+    hardBlockedMin=await xianyuBlockMinutes();
+    if(hardBlockedMin>0)console.log(`Xianyu parado por un bloqueo de red: quedan ${hardBlockedMin} min. No se lanza ninguna búsqueda.`);
+    // Revisiones completas que tocan + carril rápido de los demás modelos que también tocan (se consulta, sin lanzar).
+    const items=[];
+    if(!hardBlockedMin){
+      for(const t of runnable)items.push({task:t,mode:'full'});
+      if(FAST_TASKS.length){
+        const full=new Set(runnable.map(t=>t.id));
+        for(const t of tasks.filter(x=>FAST_TASKS.includes(x.task_name)&&!full.has(x.id))){
+          try{
+            const q=await api('POST',`/api/tasks/${t.id}/run`,{fast:true,probe:true});
+            if(q.due)items.push({task:t,mode:'fast',sinceMin:q.since_min});
+          }catch(e){console.error(`Consulta rápida ${t.task_name}:`,e?.message||e);}
+        }
       }
-    },canStart);
+    }
+    const ranked=rankLaunches(items,{laneMinutes:Number(process.env.FAST_LANE_MINUTES)||60});
+    console.log(`\n##### CICLO ${cycle}: ${runnable.length}/${tasks.length} revisiones completas + ${ranked.length-runnable.length} del carril rápido, concurrencia ${TASK_CONCURRENCY}${RUN_BUDGET_MINUTES?`, máximo ${RUN_BUDGET_MINUTES} min`:''} #####`);
+    if(ranked.length)console.log('Orden de salida (más urgente primero): '+ranked.map(x=>`${x.task.task_name}${x.mode==='fast'?' (rápido)':''} ${x.urgency.toFixed(2)}`).join(' · '));
+    await runPool(ranked,TASK_CONCURRENCY,async item=>{
+      const task=item.task,fast=item.mode==='fast';
+      try{
+        const q=await launchGate(async()=>{
+          if(hardBlockedMin>0)return null;
+          if(RUN_BUDGET_MINUTES&&launched>0&&elapsedMinutes()+estimate(task.id)>RUN_BUDGET_MINUTES)return null;
+          hardBlockedMin=await xianyuBlockMinutes();
+          if(hardBlockedMin>0){console.log(`Xianyu se ha bloqueado (quedan ${hardBlockedMin} min): no salen más tareas.`);return null;}
+          const r=await api('POST',`/api/tasks/${task.id}/run`,fast?{fast:true}:{});
+          if(r.skipped)return null;
+          launched++;
+          anyTaskStarted=true;
+          afterLaunch();
+          return r;
+        });
+        if(!q)return;
+        console.log(fast?`\n=== RÁPIDO ${task.task_name} (${FAST_LABEL}) ===`:`\n=== RUN ${task.task_name} ===`);
+        const run=await waitRun(q.runId);
+        if(fast)console.log(`DONE rápido ${task.task_name}: ${run.status}`);
+        else{
+          taskResults.push({task_id:task.id,task_name:task.task_name,status:run.status,run_id:q.runId});
+          console.log(`DONE ${task.task_name}: ${run.status}`);
+        }
+      }catch(e){
+        if(!fast)taskResults.push({task_id:task.id,task_name:task.task_name,status:'error',error:e?.message||String(e)});
+        console.error(`FAILED ${fast?'rápido ':''}${task.task_name}:`,e?.message||e);
+      }
+    });
     if(RUN_BUDGET_MINUTES){
       const done=new Set(taskResults.map(x=>x.task_id));
       const waiting=runnable.filter(t=>!done.has(t.id)).map(t=>t.task_name);
@@ -282,6 +310,10 @@ try{
       console.warn('One or more tasks failed, but the worker continues so state and the 3h digest cadence are preserved.');
     }
 
+    if(hardBlockedMin>0){
+      console.log('Xianyu parado por bloqueo de red: la ejecución termina; la siguiente espera a que acabe la parada.');
+      break;
+    }
     const cycleMinutes=(Date.now()-cycleStartedAt)/60000;
     console.log(`Ciclo ${cycle} completado en ${cycleMinutes.toFixed(1)} min.`);
     if(RUN_MIN_MINUTES&&anyTaskStarted&&!runAllTasks){

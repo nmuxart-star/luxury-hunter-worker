@@ -1511,6 +1511,35 @@ function xianyuRiskStreakNote(){
 function xianyuRiskStreakClear(){
   if(Number((getSetting('xianyu_risk_streak',null)||{}).since))saveSetting('xianyu_risk_streak',{since:0});
 }
+// BLOQUEO POR TIEMPO (regla de Nil, 11-11-2026): a veces Xianyu no pide un captcha que se pueda
+// resolver, sino que bloquea la red con «We have detected unusual traffic from your network». Ahí no hay
+// nada que resolver: se para TODO Xianyu (Mac y nube) XIANYU_HARD_BLOCK_HOURS horas (4), de forma
+// automática, y se avisa por Telegram. XIANYU_RISK_PAUSE_IGNORE_BEFORE también lo quita a mano.
+const XIANYU_HARD_TEXT=/unusual traffic|异常流量|流量异常|网络环境.{0,8}异常/i;
+const xianyuHardText=t=>XIANYU_HARD_TEXT.test(String(t||'').slice(0,4000));
+const XIANYU_HARD_BLOCK_MS=Math.max(1,Number(process.env.XIANYU_HARD_BLOCK_HOURS||4))*3600e3;
+function xianyuHardBlockLeftMs(){
+  const st=getSetting('xianyu_hard_block',null)||{};
+  const ignoreBefore=Date.parse(String(process.env.XIANYU_RISK_PAUSE_IGNORE_BEFORE||'').trim());
+  const startedAt=Date.parse(st.at||'');
+  if(Number.isFinite(ignoreBefore)&&Number.isFinite(startedAt)&&startedAt<=ignoreBefore)return 0;
+  return Math.max(0,(Number(st.until)||0)-Date.now());
+}
+async function xianyuStartHardBlock(where){
+  const already=xianyuHardBlockLeftMs()>0;
+  const until=Date.now()+XIANYU_HARD_BLOCK_MS;
+  saveSetting('xianyu_hard_block',{until,at:new Date().toISOString(),where});
+  const hours=XIANYU_HARD_BLOCK_MS/3600e3;
+  const warning=`Xianyu ha bloqueado la red por «tráfico inusual»: no hay captcha que resolver. Xianyu queda parado ${hours} h (Mac y nube).`;
+  console.log(warning);
+  if(!already&&telegramConfigured()){
+    const hasta=new Date(until).toLocaleTimeString('es-ES',{timeZone:'Europe/Madrid',hour:'2-digit',minute:'2-digit'});
+    const text=`🛑 Xianyu ha bloqueado tu red por «tráfico inusual» (${where==='mac'?'en el Chrome del Mac':'en el servidor'}).\n`+
+      `No es un captcha que se pueda resolver: es un bloqueo por tiempo. El bot deja de buscar en Xianyu ${hours} h, hasta las ${hasta} (hora de Madrid), y se reanuda solo, con calma. No hace falta que hagas nada.`;
+    await telegramSend(htmlEsc(text)).catch(e=>console.error('Aviso de bloqueo por Telegram falló:',e.message));
+  }
+  return warning;
+}
 function xianyuStartRiskPause(){
   const prev=getSetting('xianyu_risk_pause',null)||{};
   const levels=XIANYU_RISK_LEVELS_H.length?XIANYU_RISK_LEVELS_H:[4];
@@ -1611,6 +1640,10 @@ function parseXianyuSearchJson(json){
   return out;
 }
 
+// ¿La página muestra el bloqueo de red por «tráfico inusual» (sin captcha que resolver)?
+async function xianyuPageHard(page){
+  try{return xianyuHardText(await page.evaluate(()=>document.body?document.body.innerText.slice(0,3000):''));}catch{return false;}
+}
 async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile=null}={}){
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
@@ -1630,15 +1663,16 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
       resp=await first;
     }catch{
       const where=`${page.url()} · "${(await page.title().catch(()=>''))||''}"`;
-      if(XIANYU_RISK_RE.test(page.url()))return {risk:true};
+      if(XIANYU_RISK_RE.test(page.url()))return {risk:true,hard:await xianyuPageHard(page)};
       if(/login|passport/i.test(page.url()))return {login:true,where};
+      if(await xianyuPageHard(page))return {risk:true,hard:true};
       return {noResponse:true,where};
     }
     
     let json=await resp.json().catch(()=>null);
 
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
-    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
+    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true,hard:await xianyuPageHard(page)};
     
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
@@ -1657,7 +1691,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         await page.getByText('最新',{exact:true}).first().click({timeout:6000});
         const j2=await (await next).json().catch(()=>null);
         if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
-        if(xianyuRiskIn(j2))return {risk:true};
+        if(xianyuRiskIn(j2))return {risk:true,hard:await xianyuPageHard(page)};
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
@@ -1675,7 +1709,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
           await page.keyboard.press('Tab');
           const j3=await (await next).json().catch(()=>null);
           if(xianyuAuthIn(j3))return {login:true,where:'sesión caducada'};
-          if(xianyuRiskIn(j3))return {risk:true};
+          if(xianyuRiskIn(j3))return {risk:true,hard:await xianyuPageHard(page)};
           if(j3?.data?.resultList){json=j3;priced=true;}
         }
       }catch{}
@@ -1843,6 +1877,7 @@ function xianyuMacResultToSearch(r){
   let json=null;
   try{json=r.text?JSON.parse(r.text):null;}catch{}
   const url=String(r.finalUrl||'');
+  if(r.hard||xianyuHardText(r.text))return {risk:true,hard:true,mac:true};
   if(r.blocked==='risk'||XIANYU_RISK_RE.test(url)||xianyuRiskIn(json))return {risk:true,mac:true};
   if(r.login||/login|passport/i.test(url)||xianyuAuthIn(json))return {login:true,mac:true,where:'el Chrome del Mac no tiene la sesión de Xianyu abierta'};
   if(!json)return {noResponse:true,mac:true,where:r.error||`${url} · "${r.title||''}"`};
@@ -1866,6 +1901,10 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
   if(!await macOneMapReady(token).catch(()=>false))return {used:false,reason:'el Chrome del Mac no está conectado'};
   try{
     const res=xianyuMacResultToSearch(await macXianyuSearch(keyword,{minCny,maxCny},token));
+    if(res.risk&&res.hard){
+      await xianyuStartHardBlock('mac');
+      return {used:true,res};
+    }
     if(res.risk){
       saveSetting('xianyu_mac_hold',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_HOLD_MIN||5))*60e3,at:new Date().toISOString()});
       return {used:true,res:{...res,macRisk:true}};
@@ -1984,6 +2023,11 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       return {ok:true,state:'paused',warning,perQuery,kept};
     }
     if(!mac.used&&mac.reason!=='desactivado'&&!mac.cloud)console.log(`Xianyu: no se busca desde el Mac (${mac.reason}); se usa la cuenta desde el servidor.`);
+    if(mac.used&&mac.res.hard){
+      const warning=`Xianyu parado ${XIANYU_HARD_BLOCK_MS/3600e3} h por bloqueo de red («tráfico inusual»).`;
+      perQuery.push({query:keyword,mac:true,hardBlock:true});
+      return {ok:true,state:'paused',warning,perQuery,kept};
+    }
     if(mac.used&&mac.res.macRisk){
       const warning='Xianyu ha pedido una verificación en tu Chrome del Mac: resuélvela tú en esa ventana (si no la ves, abre https://www.goofish.com/search?q=%E6%AC%A7%E7%B1%B3%E8%8C%83 en Chrome). Mientras tanto las búsquedas van por la nube.';
       perQuery.push({query:keyword,mac:true,macRisk:true});
@@ -2032,6 +2076,11 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       await reportHealthIssue(res.login?'xianyu-login':'xianyu-search',xianyuPausedReason+' Las demás plataformas siguen funcionando con normalidad.').catch(()=>{});
       perQuery.push({query:keyword,login:!!res.login,noResponse:!!res.noResponse,where:res.where||null,accountsExpired:failedLabels});
       break;
+    }
+    if(res.risk&&res.hard){
+      const warning=await xianyuStartHardBlock('cloud');
+      perQuery.push({query:keyword,hardBlock:true});
+      return {ok:true,state:'paused',warning,perQuery,kept};
     }
     if(res.risk){
       const streak=xianyuRiskStreakNote();
@@ -2104,6 +2153,13 @@ function xianyuDirectSessionBlock(){
 async function searchXianyuAlternate(opts){
   const queries=(opts.queries||[]).map(q=>String(q||'').trim()).filter(Boolean);
   if(!queries.length)return {ok:true,mode:'direct',perQuery:[],kept:0};
+  const hardLeft=xianyuHardBlockLeftMs();
+  if(hardLeft>0){
+    const h=Math.floor(hardLeft/3600e3),m=Math.ceil((hardLeft%3600e3)/60e3);
+    const warning=`Xianyu parado por un bloqueo de red («tráfico inusual»): quedan ${h?h+' h ':''}${m} min.`;
+    console.log(warning);
+    return {ok:true,state:'paused',warning,perQuery:[],kept:0,provider:'direct'};
+  }
   const riskLeft=xianyuRiskPauseLeftMs();
   const split=xianyuMacMode()==='split';
   const route=split?await xianyuSplitRoute():null;
@@ -10042,6 +10098,9 @@ const server=http.createServer(async(req,res)=>{
       scheduleCloudConfigSync(`task-delete:${id}`);
       return json(res,200,{ok:true});
     }
+    if(u.pathname==='/api/xianyu/status'&&req.method==='GET'){
+      return json(res,200,{hard_block_min:Math.ceil(xianyuHardBlockLeftMs()/60e3),risk_pause_min:Math.ceil(xianyuRiskPauseLeftMs()/60e3)});
+    }
     const tr=u.pathname.match(/^\/api\/tasks\/(\d+)\/run$/);
     if(tr&&req.method==='POST'){
       const taskId=Number(tr[1]); const task=taskPublic(db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId)); if(!task)return json(res,404,{error:'Tarea no encontrada'});
@@ -10053,7 +10112,10 @@ const server=http.createServer(async(req,res)=>{
         const last=Date.parse((getSetting(key,{})||{})[taskId]||'')||0;
         const every=Math.max(5,Number(fast==='auction'?process.env.AUCTION_LANE_MINUTES||30:process.env.FAST_LANE_MINUTES||20));
         if(Date.now()-last<every*60e3)return json(res,200,{skipped:true,next_in_min:Math.ceil((last+every*60e3-Date.now())/60e3)});
+        // probe: solo pregunta si le toca (sin lanzarla) y cuántos minutos hace de su última pasada rápida.
+        if(rbody?.probe)return json(res,200,{probe:true,due:true,since_min:last?Math.round((Date.now()-last)/60e3):null});
       }
+      if(rbody?.probe)return json(res,200,{probe:true,due:true});
       const rr=db.prepare('INSERT INTO task_runs(task_id,status,started_at) VALUES(?,?,?)').run(taskId,'queued',new Date().toISOString());
       const runId=Number(rr.lastInsertRowid); setImmediate(()=>executeTask(taskId,runId,{fast}).catch(e=>console.error('Task run failed',taskId,e.message)));
       return json(res,202,{runId,status:'queued',fast});

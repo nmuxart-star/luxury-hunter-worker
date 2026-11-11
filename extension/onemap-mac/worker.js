@@ -247,6 +247,25 @@ async function xianyuOverlay(tabId){
 async function xianyuStillBlocked(tabId,tab){
   return GOOFISH_BLOCK.test(tab?.url||'')||await xianyuOverlay(tabId);
 }
+// Bloqueo de red por tiempo: «We have detected unusual traffic from your network». No hay nada que resolver:
+// no se trae la ventana al frente ni se espera; el bot avisa por Telegram y se para 4 h.
+const XIANYU_HARD=/unusual traffic|异常流量|流量异常|网络环境.{0,8}异常/i;
+async function xianyuHardBlock(tabId){
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>(document.body?document.body.innerText:'').slice(0,3000)});
+    return XIANYU_HARD.test(String(r?.result||''));
+  }catch{return false;}
+}
+// Un poco de comportamiento humano al terminar: baja la página a ratos y se queda unos segundos mirando.
+async function xianyuLinger(tabId){
+  try{
+    const steps=1+Math.floor(Math.random()*3);
+    for(let i=0;i<steps;i++){
+      await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[200+Math.floor(Math.random()*700)],func:dy=>window.scrollBy({top:dy,behavior:'smooth'})});
+      await sleep(900+Math.random()*2200);
+    }
+  }catch{}
+}
 async function xianyuResponses(tabId){
   try{
     const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>(window.__lhXY||[]).map(x=>x.text)});
@@ -302,15 +321,17 @@ async function handleXianyu(job,token){
     let tab=await chrome.tabs.get(tabId).catch(()=>null);
     if(!list||GOOFISH_BLOCK.test(tab?.url||'')){
       const blocked=GOOFISH_BLOCK.test(tab?.url||'');
-      await reply({status:blocked?403:502,finalUrl:tab?.url||job.url,title:tab?.title||'',
-        body:JSON.stringify({blocked:blocked?'risk':null,login:/login|passport/i.test(tab?.url||''),text:null})});
-      if(blocked)await handleCaptcha(tabId,t=>GOOFISH_BLOCK.test(t.url||''),'Xianyu');
+      const hard=await xianyuHardBlock(tabId);
+      await reply({status:(blocked||hard)?403:502,finalUrl:tab?.url||job.url,title:tab?.title||'',
+        body:JSON.stringify({blocked:(blocked||hard)?'risk':null,hard,login:/login|passport/i.test(tab?.url||''),text:null})});
+      if(blocked&&!hard)await handleCaptcha(tabId,t=>GOOFISH_BLOCK.test(t.url||''),'Xianyu');
       return;
     }
     let text=list[list.length-1],sorted=false,priced=false;
     if(xianyuRiskText(text)){
-      await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced})});
-      await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
+      const hard=await xianyuHardBlock(tabId);
+      await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced,hard})});
+      if(!hard)await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
       return;
     }
     // Más nuevos primero.
@@ -328,8 +349,11 @@ async function handleXianyu(job,token){
       if(l3){list=l3;text=l3[l3.length-1];priced=true;}
     }
     tab=await chrome.tabs.get(tabId).catch(()=>null);
-    await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced})});
-    if(xianyuRiskText(text)||await xianyuOverlay(tabId)){
+    const risky=xianyuRiskText(text)||await xianyuOverlay(tabId);
+    const hard=risky&&await xianyuHardBlock(tabId);
+    if(!risky)await xianyuLinger(tabId);
+    await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced,hard})});
+    if(risky&&!hard){
       await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
     }
   }catch(error){
