@@ -84,7 +84,7 @@ jobs:
       # Carril rápido: lo más nuevo de cada modelo, cada FAST_LANE_MINUTES.
       # Los modelos con más anuncios nuevos por búsqueda en Xianyu (medido el 08-11-2026) y los que ya estaban.
       FAST_TASKS: ${{ vars.FAST_TASKS || 'Lady Dior,Dior Saddle,Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Gucci Jackie,Celine Triomphe,Loewe Puzzle,Radar oportunidades,Cartier Santos y Tank,Omega Seamaster 300M,Omega Speedmaster,Tudor' }}
-      FAST_LANE_MINUTES: ${{ vars.FAST_LANE_MINUTES || '20' }}
+      FAST_LANE_MINUTES: ${{ vars.FAST_LANE_MINUTES || '60' }}
       LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '0' }}
       # Cada ejecución, como mucho 38 min de tareas (+~6 min de preparación).
       RUN_BUDGET_MINUTES: ${{ vars.RUN_BUDGET_MINUTES || '38' }}
@@ -93,6 +93,12 @@ jobs:
       # Xianyu desde el Chrome del Mac: prefer (si el Mac no está, usa el servidor) | only (nunca el servidor) | off.
       XIANYU_VIA_MAC: ${{ vars.XIANYU_VIA_MAC || 'prefer' }}
       XIANYU_MAC_SHARE: ${{ vars.XIANYU_MAC_SHARE || '50' }}
+      # Ritmo suave para no provocar verificaciones (regla de Nil, 11-11-2026): una búsqueda cada ~5 min,
+      # como mucho 10 por hora y 30 min de pausa mínima entre una ejecución y la siguiente.
+      XIANYU_MAX_PER_HOUR: ${{ vars.XIANYU_MAX_PER_HOUR || '10' }}
+      XIANYU_MAC_GAP_SEC: ${{ vars.XIANYU_MAC_GAP_SEC || '300' }}
+      XIANYU_GAP_SEC: ${{ vars.XIANYU_GAP_SEC || '300' }}
+      RUN_GAP_MINUTES: ${{ vars.RUN_GAP_MINUTES || '30' }}
       XIANYU_RISK_PAUSE_IGNORE_BEFORE: ${{ vars.XIANYU_RISK_PAUSE_IGNORE_BEFORE || '' }}
       CYCLE_MIN_MINUTES: ${{ vars.CYCLE_MIN_MINUTES || '20' }}
       # Avisos inmediatos (email siempre; Telegram si hay secretos).
@@ -177,6 +183,10 @@ jobs:
             exit 0
           fi
           echo "LH_STATE_RESTORED=1" >> "$GITHUB_ENV"
+
+      # Pausa mínima entre ejecuciones (RUN_GAP_MINUTES), antes de abrir ningún navegador.
+      - name: Pause between runs
+        run: node scripts/run-gap.mjs
 
       - name: Install Luxury Hunter dependencies
         run: npm install --no-audit --no-fund
