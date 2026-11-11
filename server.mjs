@@ -1486,6 +1486,19 @@ function xianyuRiskPauseLeftMs(){
 // Si la verificación vuelve poco después de acabar la pausa anterior, la cuenta
 // sigue marcada: descansa más (4 h → 8 h → 24 h) en vez de volver a probar.
 const XIANYU_RISK_LEVELS_H=String(process.env.XIANYU_RISK_PAUSE_HOURS||'4').split(',').map(Number).filter(n=>n>0);
+// Regla de Nil (11-11-2026): la pausa de 4 h solo empieza si la verificación aguanta
+// más de XIANYU_RISK_GRACE_MIN minutos (5). Se mide desde la primera verificación sin
+// ninguna búsqueda buena entre medias; hasta entonces las tareas siguen buscando.
+const XIANYU_RISK_GRACE_MS=Math.max(0,Number(process.env.XIANYU_RISK_GRACE_MIN??5))*60e3;
+function xianyuRiskStreakNote(){
+  const now=Date.now();
+  let since=Number((getSetting('xianyu_risk_streak',null)||{}).since)||0;
+  if(!since){since=now;saveSetting('xianyu_risk_streak',{since});}
+  return {since,lasted:now-since,exceeded:now-since>=XIANYU_RISK_GRACE_MS};
+}
+function xianyuRiskStreakClear(){
+  if(Number((getSetting('xianyu_risk_streak',null)||{}).since))saveSetting('xianyu_risk_streak',{since:0});
+}
 function xianyuStartRiskPause(){
   const prev=getSetting('xianyu_risk_pause',null)||{};
   const levels=XIANYU_RISK_LEVELS_H.length?XIANYU_RISK_LEVELS_H:[4];
@@ -2035,6 +2048,12 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       break;
     }
     if(res.risk){
+      const streak=xianyuRiskStreakNote();
+      if(!streak.exceeded){
+        console.log(`Xianyu: verificación detectada (lleva ${(streak.lasted/60e3).toFixed(1)} min); la pausa de 4 h solo empieza si pasa de ${XIANYU_RISK_GRACE_MS/60e3} min.`);
+        perQuery.push({query:keyword,risk:true,grace:true});
+        break;
+      }
       xianyuPausedAt=Date.now();
       xianyuPauseCode='risk';
       xianyuPauseLen=XIANYU_RISK_PAUSE_MS;
@@ -2051,6 +2070,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       if(result.kept){localKept++;kept++;}
       else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
     }
+    xianyuRiskStreakClear();
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     // Pausa de persona entre búsquedas: las ráfagas son lo que dispara las verificaciones.
     await sleep(2500+Math.random()*2500);
@@ -2119,7 +2139,7 @@ async function searchXianyuAlternate(opts){
     const accountOpts={...opts,slotReserved:true,maxItems:30};
     const res=(!macOk&&xianyuDirectSessionBlock())||await fn({...accountOpts,route});
     const verification=(route!=='mac'&&String(process.env.XIANYU_SESSION_STATUS||'').trim()==='risk_control')||
-      (res.perQuery||[]).some(q=>q?.risk)||(res.state==='paused'&&xianyuPauseCode==='risk');
+      (res.perQuery||[]).some(q=>q?.risk&&!q.grace)||(res.state==='paused'&&xianyuPauseCode==='risk');
     if(verification){
       if(!accountBlocked){
         xianyuBlockAccount('verificación anti-bot');
