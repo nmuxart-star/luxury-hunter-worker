@@ -1819,7 +1819,14 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
 // se avisa a Nil en el ordenador y se espera XIANYU_MAC_HOLD_MIN minutos.
 const xianyuMacMode=()=>{const m=String(process.env.XIANYU_VIA_MAC||'prefer').toLowerCase();return ['prefer','only','off','split'].includes(m)?m:'prefer';};
 const xianyuMacToken=()=>String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
-function xianyuMacHoldLeftMs(){return Math.max(0,(Number((getSetting('xianyu_mac_hold',null)||{}).until)||0)-Date.now());}
+function xianyuMacHoldLeftMs(){
+  const st=getSetting('xianyu_mac_hold',null)||{};
+  // XIANYU_RISK_PAUSE_IGNORE_BEFORE también quita la retención del Mac si Nil ya resolvió la verificación.
+  const ignoreBefore=Date.parse(String(process.env.XIANYU_RISK_PAUSE_IGNORE_BEFORE||'').trim());
+  const startedAt=Date.parse(st.at||'');
+  if(Number.isFinite(ignoreBefore)&&Number.isFinite(startedAt)&&startedAt<=ignoreBefore)return 0;
+  return Math.max(0,(Number(st.until)||0)-Date.now());
+}
 function xianyuMacResultToSearch(r){
   let json=null;
   try{json=r.text?JSON.parse(r.text):null;}catch{}
