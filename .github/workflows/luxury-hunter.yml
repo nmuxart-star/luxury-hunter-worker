@@ -91,7 +91,14 @@ jobs:
       # Cada ejecución dura al menos esto (ciclos repetidos): menos ejecuciones por hora, menos visitas a Xianyu.
       RUN_MIN_MINUTES: ${{ vars.RUN_MIN_MINUTES || '30' }}
       # Xianyu desde el Chrome del Mac: prefer (si el Mac no está, usa el servidor) | only (nunca el servidor) | off.
-      XIANYU_VIA_MAC: ${{ vars.XIANYU_VIA_MAC || 'prefer' }}
+      XIANYU_VIA_MAC: ${{ vars.XIANYU_VIA_MAC || 'calendar' }}
+      # Calendario: la nube solo en estos días (hora de Madrid) y 2 h de transición al cambiar de IP.
+      XIANYU_CLOUD_DAYS: ${{ vars.XIANYU_CLOUD_DAYS || 'sat,sun' }}
+      XIANYU_SWITCH_HOURS: ${{ vars.XIANYU_SWITCH_HOURS || '2' }}
+      # Ritmo que se autorregula: empieza a medias y sube con las búsquedas buenas; baja con cada verificación.
+      XIANYU_RATE_START: ${{ vars.XIANYU_RATE_START || '0.5' }}
+      XIANYU_RATE_MIN: ${{ vars.XIANYU_RATE_MIN || '0.25' }}
+      XIANYU_RATE_MAX: ${{ vars.XIANYU_RATE_MAX || '1.5' }}
       XIANYU_MAC_SHARE: ${{ vars.XIANYU_MAC_SHARE || '50' }}
       # Ritmo suave para no provocar verificaciones (regla de Nil, 11-11-2026): una búsqueda cada ~5 min,
       # como mucho 10 por hora y 30 min de pausa mínima entre una ejecución y la siguiente.
@@ -244,7 +251,12 @@ jobs:
           for STATE in .xianyu/state/*.json; do
             NAME="$(basename "$STATE" .json)"
             STATUS_FILE=".xianyu-tmp/$NAME.status"
-            GITHUB_ENV= XIANYU_STATUS_FILE="$STATUS_FILE" node scripts/xianyu-keepalive.mjs "$STATE" || true
+            # Una sola IP por cuenta: el servidor solo visita Goofish cuando le toca buscar a él (fin de semana, nube activa).
+            if node scripts/xianyu-keepalive-allowed.mjs; then
+              GITHUB_ENV= XIANYU_STATUS_FILE="$STATUS_FILE" node scripts/xianyu-keepalive.mjs "$STATE" || true
+            else
+              echo ok > "$STATUS_FILE"
+            fi
             STATUS="$(cat "$STATUS_FILE" 2>/dev/null || echo error)"
             [ "$STATUS" = ok ] && VALID=$((VALID+1))
             [ "$STATUS" = risk_control ] && RISK=1

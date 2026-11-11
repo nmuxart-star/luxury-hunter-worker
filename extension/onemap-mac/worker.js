@@ -347,9 +347,19 @@ async function handleXianyu(job,token){
   const reply=payload=>bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:job.url,title:'',html:'',...payload});
   try{
     await hookXianyu();
-    opened=await openHidden(job.url);
+    // Navegación variada: ~1 de cada 3 veces entra primero por la portada, mira un momento y luego busca (como una persona),
+    // en vez de ir siempre directo a la URL de la búsqueda.
+    const viaHome=Math.random()<0.33;
+    opened=await openHidden(viaHome?'https://www.goofish.com/':job.url);
     const tabId=opened.tabId;
     await waitLoaded(tabId);
+    if(viaHome){
+      await sleep(2500+Math.random()*4500);
+      await xianyuLinger(tabId);
+      await chrome.tabs.update(tabId,{url:job.url});
+      await sleep(800);
+      await waitLoaded(tabId);
+    }
     let list=await xianyuWaitNew(tabId,0,40_000);
     let tab=await chrome.tabs.get(tabId).catch(()=>null);
     if(!list||GOOFISH_BLOCK.test(tab?.url||'')){

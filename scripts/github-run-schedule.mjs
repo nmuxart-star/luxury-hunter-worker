@@ -77,6 +77,8 @@ export function launchUrgency(item,{now=Date.now(),rand=Math.random,laneMinutes=
   ratio=Math.min(4,Math.max(0,ratio));
   let weight=item.mode==='fast'?0.8:1;
   if(interval&&interval<=60)weight*=1.3;
+  // El Radar (bolsos fuera de la lista de Nil) tiene mucha presencia: sale casi siempre el primero.
+  if(/^radar\b/i.test(String(task.task_name||'')))weight*=1.8;
   const tier=Number((String(task.description||'').match(/TIER:\s*(\d)/i)||[])[1])||9;
   if(isWatchTaskName(task.task_name)&&tier===1)weight*=1.15;
   return ratio*weight*(0.85+rand()*0.3);

@@ -1526,6 +1526,7 @@ function xianyuHardBlockLeftMs(){
   return Math.max(0,(Number(st.until)||0)-Date.now());
 }
 async function xianyuStartHardBlock(where){
+  xianyuNoteVerification('hard',where);
   const already=xianyuHardBlockLeftMs()>0;
   const until=Date.now()+XIANYU_HARD_BLOCK_MS;
   saveSetting('xianyu_hard_block',{until,at:new Date().toISOString(),where});
@@ -1888,7 +1889,7 @@ function saveXianyuCandidate(it,{sessionId,sourceQuery,minEur,maxEur}={}){
 // y la nube (ver más abajo). Si Xianyu pide una
 // verificación en el Mac, no se cae al servidor (marcaría más la cuenta):
 // se avisa a Nil en el ordenador y se espera XIANYU_MAC_HOLD_MIN minutos.
-const xianyuMacMode=()=>{const m=String(process.env.XIANYU_VIA_MAC||'prefer').toLowerCase();return ['prefer','only','off','split'].includes(m)?m:'prefer';};
+const xianyuMacMode=()=>{const m=String(process.env.XIANYU_VIA_MAC||'prefer').toLowerCase();return ['prefer','only','off','split','calendar'].includes(m)?m:'prefer';};
 const xianyuMacToken=()=>String(process.env.ONEMAP_MAC_BRIDGE_TOKEN||'').trim();
 function xianyuMacHoldLeftMs(){
   const st=getSetting('xianyu_mac_hold',null)||{};
@@ -1925,12 +1926,14 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
   if(left>0)return {used:false,hold:true,reason:`verificación pendiente en tu Chrome (quedan ${Math.ceil(left/60e3)} min)`};
   if(!await macOneMapReady(token).catch(()=>false))return {used:false,reason:'el Chrome del Mac no está conectado'};
   try{
+    xianyuNoteIp('mac');
     const res=xianyuMacResultToSearch(await macXianyuSearch(keyword,{minCny,maxCny},token));
     if(res.risk&&res.hard){
       await xianyuStartHardBlock('mac');
       return {used:true,res};
     }
     if(res.risk){
+      xianyuNoteVerification('captcha','mac');
       saveSetting('xianyu_mac_hold',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_HOLD_MIN||5))*60e3,at:new Date().toISOString()});
       return {used:true,res:{...res,macRisk:true}};
     }
@@ -1957,6 +1960,99 @@ function xianyuSplitTurn(){
   saveSetting('xianyu_split',{n:(n+1)%1000000,at:new Date().toISOString()});
   return xianyuSplitPick(n,xianyuSplitShare());
 }
+// ── CALENDARIO MAC / NUBE (regla de Nil, 11-11-2026) ────────────────────────────────────────
+// XIANYU_VIA_MAC=calendar. Una sola IP por cuenta a la vez:
+//  · Entre semana (lunes a viernes, hora de Madrid) solo busca el Mac. Si el Mac no está, el bot espera.
+//  · Sábado y domingo (XIANYU_CLOUD_DAYS) el Mac tiene prioridad. Si no está, entra la nube.
+//  · Cada cambio de IP (Mac→nube o nube→Mac) obliga a XIANYU_SWITCH_HOURS (2) horas sin ninguna búsqueda desde
+//    la IP anterior; si la IP anterior vuelve antes, sigue con ella sin cambiar.
+const XIANYU_SWITCH_MS=Math.max(0,Number(process.env.XIANYU_SWITCH_HOURS??2))*3600e3;
+function xianyuMadridDay(now=Date.now()){
+  return new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Madrid',weekday:'short'}).format(new Date(now)).toLowerCase().slice(0,3);
+}
+function xianyuCloudDay(now=Date.now()){
+  const days=String(process.env.XIANYU_CLOUD_DAYS||'sat,sun').toLowerCase().split(',').map(x=>x.trim().slice(0,3)).filter(Boolean);
+  return days.includes(xianyuMadridDay(now));
+}
+function xianyuCalendarDecide({cloudDay,macReady,macHold,cloudBlocked,last,now=Date.now(),switchMs=XIANYU_SWITCH_MS}){
+  if(macHold)return {route:'wait',note:'verificación pendiente en tu Chrome'};
+  const want=macReady?'mac':(cloudDay?'cloud':null);
+  if(!want)return {route:'none',note:'entre semana solo se busca desde el Mac y el Mac no está conectado'};
+  if(want==='cloud'&&cloudBlocked)return {route:'none',note:'la nube está parada (verificación o sesión)'};
+  if(last?.route&&last.route!==want){
+    const left=Number(last.at)+switchMs-now;
+    if(left>0)return {route:'none',left,note:`cambio de ${last.route==='mac'?'Mac a nube':'nube a Mac'}: transición suave, quedan ${Math.ceil(left/60e3)} min sin buscar`};
+  }
+  return {route:want};
+}
+let xianyuCalendarNote='';
+async function xianyuCalendarRoute(){
+  const token=xianyuMacToken();
+  const macHold=xianyuMacHoldLeftMs()>0;
+  const macReady=!!token&&!macHold&&await macOneMapReady(token).catch(()=>false);
+  const cloudBlocked=xianyuRiskPauseLeftMs()>0||
+    !!(xianyuPausedReason&&Date.now()-xianyuPausedAt<=xianyuPauseLen)||
+    !!xianyuDirectSessionBlock();
+  const d=xianyuCalendarDecide({cloudDay:xianyuCloudDay(),macReady,macHold,cloudBlocked,last:getSetting('xianyu_ip_route',null)});
+  xianyuCalendarNote=d.note||'';
+  return d.route;
+}
+// Apunta desde qué IP se ha tocado Xianyu por última vez (Mac o nube).
+function xianyuNoteIp(route){try{saveSetting('xianyu_ip_route',{route,at:Date.now()});}catch{}}
+
+// ── RITMO QUE SE AUTORREGULA (regla de Nil, 11-11-2026) ─────────────────────────────────────
+// level 1 = el ritmo base (una búsqueda cada XIANYU_GAP_SEC, XIANYU_MAX_PER_HOUR por hora). Empieza en 0.5 y sube
+// 0.1 cada XIANYU_RATE_UP_EVERY (40) búsquedas buenas seguidas, hasta XIANYU_RATE_MAX (1.5). Cada verificación lo baja
+// (×0.6; ×0.5 si es un bloqueo por «tráfico inusual») hasta XIANYU_RATE_MIN (0.25). Se guardan los últimos eventos
+// con las búsquedas de esa hora, para saber de verdad cuál es el límite.
+const XIANYU_RATE_MIN=Number(process.env.XIANYU_RATE_MIN||0.25);
+const XIANYU_RATE_MAX=Number(process.env.XIANYU_RATE_MAX||1.5);
+const XIANYU_RATE_START=Number(process.env.XIANYU_RATE_START||0.5);
+const XIANYU_RATE_UP_EVERY=Math.max(5,Number(process.env.XIANYU_RATE_UP_EVERY||40));
+function xianyuRateState(){
+  let st=getSetting('xianyu_rate',null);
+  if(!st||!Number.isFinite(Number(st.level))){st={level:XIANYU_RATE_START,clean:0,events:[]};try{saveSetting('xianyu_rate',st);}catch{}}
+  return st;
+}
+const xianyuRateLevel=()=>Math.min(XIANYU_RATE_MAX,Math.max(XIANYU_RATE_MIN,Number(xianyuRateState().level)||XIANYU_RATE_START));
+function xianyuRateGood(){
+  const st=xianyuRateState();
+  st.clean=(Number(st.clean)||0)+1;
+  if(st.clean>=XIANYU_RATE_UP_EVERY){st.clean=0;st.level=Math.min(XIANYU_RATE_MAX,Math.round((xianyuRateLevel()+0.1)*100)/100);}
+  try{saveSetting('xianyu_rate',st);}catch{}
+}
+function xianyuNoteVerification(kind,where){
+  const st=xianyuRateState();
+  // La misma verificación sale en varias búsquedas seguidas: dentro de 10 min cuenta como una sola.
+  if(Date.now()-(Number(st.lastEvent)||0)<10*60e3)return;
+  st.level=Math.max(XIANYU_RATE_MIN,Math.round(xianyuRateLevel()*(kind==='hard'?0.5:0.6)*100)/100);
+  st.clean=0;st.lastEvent=Date.now();
+  st.events=[...(Array.isArray(st.events)?st.events:[]),{at:new Date().toISOString(),kind,where,level:st.level,searchesLastHour:xianyuSearchesLastHour().length}].slice(-50);
+  try{saveSetting('xianyu_rate',st);}catch{}
+  console.log(`Xianyu: verificación (${kind}, ${where}); el ritmo baja a ${st.level}.`);
+}
+
+// ── ROTACIÓN POR RENDIMIENTO (regla de Nil, 11-11-2026) ─────────────────────────────────────
+// Factor por modelo = anuncios nuevos de Xianyu por pasada (últimos 7 días) frente a la mediana, entre 0.5 y 2.
+// El que más novedades trae se revisa antes; el que casi nunca trae nada, menos. Con menos de 3 pasadas, 1.
+function taskYieldFactors(){
+  try{
+    const since=new Date(Date.now()-7*86400e3).toISOString();
+    const rows=db.prepare(`SELECT s.task_id AS id, COUNT(DISTINCT s.id) AS sessions,
+        COUNT(DISTINCT CASE WHEN l.source='xianyu' AND l.first_seen>=s.started_at THEN l.id END) AS fresh
+      FROM search_sessions s
+      LEFT JOIN search_session_items i ON i.session_id=s.id
+      LEFT JOIN listings l ON l.id=i.listing_id
+      WHERE s.started_at>? AND s.task_id IS NOT NULL GROUP BY s.task_id`).all(since);
+    const ok=rows.filter(r=>r.sessions>=3);
+    const rates=ok.map(r=>r.fresh/r.sessions).sort((a,b)=>a-b);
+    const median=rates.length?rates[Math.floor(rates.length/2)]:0;
+    const out={};
+    for(const r of ok)out[r.id]=Math.round(Math.min(2,Math.max(0.5,(r.fresh/r.sessions+0.5)/(median+0.5)))*100)/100;
+    return out;
+  }catch{return {};}
+}
+
 // Por dónde sale esta búsqueda: 'mac' | 'cloud' | 'wait' (el Mac espera una verificación) | 'none'.
 // El turno solo se gasta cuando de verdad se puede elegir entre las dos vías.
 function xianyuSplitDecide({macReady,macHold,cloudBlocked,turn}){
@@ -1998,9 +2094,11 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
   {
-    const cap=Number(process.env.XIANYU_MAX_PER_HOUR??10);
+    const level=xianyuRateLevel();
+    const base=Number(process.env.XIANYU_MAX_PER_HOUR??10);
+    const cap=base>0?Math.max(2,Math.round(base*level)):0;
     if(cap>0&&xianyuSearchesLastHour().length>=cap){
-      console.log(`Xianyu: tope de ${cap} búsquedas por hora alcanzado; se espera para proteger la cuenta.`);
+      console.log(`Xianyu: tope de ${cap} búsquedas por hora (ritmo ${level}) alcanzado; se espera para proteger la cuenta.`);
       return {ok:true,state:'throttled',perQuery:[],kept:0};
     }
   }
@@ -2010,7 +2108,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   // búsquedas salían en ráfaga; era lo que disparaba la verificación.
   const macPeek=!cloudOnly&&xianyuMacMode()!=='off'&&xianyuMacToken()&&xianyuMacHoldLeftMs()===0&&await macOneMapReady(xianyuMacToken()).catch(()=>false);
   {
-    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||300:process.env.XIANYU_GAP_SEC||300))*1e3;
+    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||300:process.env.XIANYU_GAP_SEC||300))*1e3/xianyuRateLevel();
     const jitter=gap*0.4*(Math.random()*2-1);
     const wait=xianyuLastSearchAt()+gap+jitter-Date.now();
     if(wait>0)await sleep(Math.min(wait,gap*1.4));
@@ -2063,7 +2161,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       files,preferred:xianyuActiveAccount,failed:xianyuFailedAccounts,
       fixed:accountStrategy==='fixed'?fixed||'missing':null,
       search:async stateFile=>{
-        try{return await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile});}
+        try{xianyuNoteIp('cloud');return await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile});}
         catch(e){return {noResponse:true,where:e.message};}
       }
     });
@@ -2108,6 +2206,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       return {ok:true,state:'paused',warning,perQuery,kept};
     }
     if(res.risk){
+      xianyuNoteVerification('captcha','cloud');
       const streak=xianyuRiskStreakNote();
       if(!streak.exceeded){
         console.log(`Xianyu: verificación detectada (lleva ${(streak.lasted/60e3).toFixed(1)} min); la pausa de 4 h solo empieza si pasa de ${XIANYU_RISK_GRACE_MS/60e3} min.`);
@@ -2131,6 +2230,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
     }
     xianyuRiskStreakClear();
+    xianyuRateGood();
     perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     // Pausa de persona entre búsquedas: las ráfagas son lo que dispara las verificaciones.
     await sleep(2500+Math.random()*2500);
@@ -2186,14 +2286,17 @@ async function searchXianyuAlternate(opts){
     return {ok:true,state:'paused',warning,perQuery:[],kept:0,provider:'direct'};
   }
   const riskLeft=xianyuRiskPauseLeftMs();
-  const split=xianyuMacMode()==='split';
-  const route=split?await xianyuSplitRoute():null;
+  const calendar=xianyuMacMode()==='calendar';
+  const split=xianyuMacMode()==='split'||calendar;
+  const route=calendar?await xianyuCalendarRoute():split?await xianyuSplitRoute():null;
   if(split&&(route==='wait'||route==='none')){
     const left=xianyuMacHoldLeftMs();
-    const warning=route==='wait'
-      ?`Xianyu desde el Mac: verificación pendiente en tu Chrome (quedan ${Math.ceil(left/60e3)} min).`
-      :(xianyuPausedReason||'Xianyu no está disponible ni en el Mac ni en la nube.');
-    console.log(`Xianyu (reparto ${xianyuSplitShare()} % Mac): ${warning}`);
+    const warning=calendar&&xianyuCalendarNote
+      ?`Xianyu en espera: ${xianyuCalendarNote}.`
+      :route==='wait'
+        ?`Xianyu desde el Mac: verificación pendiente en tu Chrome (quedan ${Math.ceil(left/60e3)} min).`
+        :(xianyuPausedReason||'Xianyu no está disponible ni en el Mac ni en la nube.');
+    console.log(calendar?`Xianyu (calendario Mac/nube): ${warning}`:`Xianyu (reparto ${xianyuSplitShare()} % Mac): ${warning}`);
     return {ok:true,state:'paused',warning,perQuery:[],kept:0,provider:'direct'};
   }
   const macOk=split?route==='mac':(riskLeft>0||xianyuDirectSessionBlock()?await xianyuMacUsable():false);
@@ -10124,7 +10227,9 @@ const server=http.createServer(async(req,res)=>{
       return json(res,200,{ok:true});
     }
     if(u.pathname==='/api/xianyu/status'&&req.method==='GET'){
-      return json(res,200,{hard_block_min:Math.ceil(xianyuHardBlockLeftMs()/60e3),risk_pause_min:Math.ceil(xianyuRiskPauseLeftMs()/60e3)});
+      const st=xianyuRateState();
+      return json(res,200,{hard_block_min:Math.ceil(xianyuHardBlockLeftMs()/60e3),risk_pause_min:Math.ceil(xianyuRiskPauseLeftMs()/60e3),
+        rate:xianyuRateLevel(),rate_events:(st.events||[]).slice(-10),ip_route:getSetting('xianyu_ip_route',null),yield_factor:taskYieldFactors()});
     }
     const tr=u.pathname.match(/^\/api\/tasks\/(\d+)\/run$/);
     if(tr&&req.method==='POST'){

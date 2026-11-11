@@ -138,9 +138,27 @@ function launchGate(fn){
   gateTail=turn.catch(()=>{});
   return turn;
 }
-const afterLaunch=()=>{nextLaunchAt=Date.now()+launchSpacingMs({minSec:LAUNCH_GAP_MIN_SEC,maxSec:LAUNCH_GAP_MAX_SEC,breakProb:LAUNCH_BREAK_PROB});};
+// Ritmo que se autorregula (server.mjs): con nivel 0.5 las salidas van el doble de espaciadas; con 1.5, un tercio menos.
+let rateLevel=1;
+const afterLaunch=()=>{nextLaunchAt=Date.now()+Math.round(launchSpacingMs({minSec:LAUNCH_GAP_MIN_SEC,maxSec:LAUNCH_GAP_MAX_SEC,breakProb:LAUNCH_BREAK_PROB})/Math.max(0.2,rateLevel));};
+// Estado de Xianyu según el servidor: minutos de parada, ritmo y factor de rendimiento de cada modelo.
+let yieldFactor={};
+// Rotación por rendimiento: el modelo que trae más anuncios nuevos tiene un intervalo más corto (hasta la mitad) y el que
+// casi nunca trae nada, más largo (hasta el doble). El Radar tiene su propio intervalo y no se ajusta.
+function adjustTasks(list){
+  return list.map(t=>{
+    const f=Number(yieldFactor[t.id]);
+    if(!f||!t.interval_minutes||/^radar\b/i.test(String(t.task_name||'')))return t;
+    return {...t,interval_minutes:Math.max(15,Math.round(Number(t.interval_minutes)/f))};
+  });
+}
 async function xianyuBlockMinutes(){
-  try{return Number((await api('GET','/api/xianyu/status')).hard_block_min)||0;}catch{return 0;}
+  try{
+    const st=await api('GET','/api/xianyu/status');
+    if(Number.isFinite(Number(st.rate))&&Number(st.rate)>0)rateLevel=Number(st.rate);
+    yieldFactor=st.yield_factor||{};
+    return Number(st.hard_block_min)||0;
+  }catch{return 0;}
 }
 try{
   await waitServer();
@@ -171,11 +189,11 @@ try{
   const existing=(await api('GET','/api/tasks')).tasks||[];
   // Intervalos que mandan sobre los de la configuración cifrada (regla de Nil, 11-11-2026: el Radar de
   // oportunidades tiene la máxima prioridad, como los modelos de 60 min). Formato: "Nombre=minutos,Otro=minutos".
-  const intervalOverrides=Object.fromEntries(String(process.env.TASK_INTERVAL_OVERRIDES??'Radar oportunidades=60')
+  const intervalOverrides=Object.fromEntries(String(process.env.TASK_INTERVAL_OVERRIDES??'Radar oportunidades=30')
     .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Number(v)]));
   for(const t0 of cfg.tasks||[]){
     const t=intervalOverrides[t0.task_name]?{...t0,interval_minutes:intervalOverrides[t0.task_name]}:t0;
-    if(t!==t0)console.log(`Intervalo de ${t.task_name}: ${t0.interval_minutes} → ${t.interval_minutes} min (prioridad máxima).`);
+    if(t!==t0)console.log(`Intervalo de ${t.task_name}: ${t0.interval_minutes} → ${t.interval_minutes} min (prioridad máxima, mucha presencia).`);
     const old=existing.find(x=>x.task_name===t.task_name);
     if(old) await api('PATCH',`/api/tasks/${old.id}`,t);
     else await api('POST','/api/tasks',t);
@@ -198,7 +216,8 @@ try{
     cycle++;
     const cycleStartedAt=Date.now();
     if(cycle>1)budgetStartedAt=cycleStartedAt;
-    let tasks=(await api('GET','/api/tasks')).tasks||[];
+    await xianyuBlockMinutes();
+    let tasks=adjustTasks((await api('GET','/api/tasks')).tasks||[]);
     // Las ejecuciones encadenadas respetan interval_minutes de cada modelo.
     // Solo un lanzamiento manual real fuerza todas las tareas activas.
     let runnable=runAllTasks
@@ -210,7 +229,7 @@ try{
         console.log(`Todavía no toca ningún modelo; espero ${Math.ceil(next.ms/60000)} min hasta ${next.task.task_name} para no cortar la cadena.`);
         await sleep(next.ms+5000);
         budgetStartedAt=Date.now();
-        tasks=(await api('GET','/api/tasks')).tasks||[];
+        tasks=adjustTasks((await api('GET','/api/tasks')).tasks||[]);
         runnable=tasks.filter(t=>due(t));
       }
     }
