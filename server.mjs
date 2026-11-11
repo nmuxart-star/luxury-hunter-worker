@@ -1491,10 +1491,16 @@ const XIANYU_RISK_LEVELS_H=String(process.env.XIANYU_RISK_PAUSE_HOURS||'4').spli
 const XIANYU_RISK_GRACE_MS=Math.max(0,Number(process.env.XIANYU_RISK_GRACE_MIN??5))*60e3;
 function xianyuRiskStreakNote(){
   const now=Date.now();
-  let since=Number((getSetting('xianyu_risk_streak',null)||{}).since)||0;
+  const st=getSetting('xianyu_risk_streak',null)||{};
+  let since=Number(st.since)||0;
+  const last=Number(st.last)||since;
   const ignoreBefore=Date.parse(String(process.env.XIANYU_RISK_PAUSE_IGNORE_BEFORE||'').trim());
   if(Number.isFinite(ignoreBefore)&&since&&since<=ignoreBefore)since=0;   // racha anterior al reinicio manual
-  if(!since){since=now;saveSetting('xianyu_risk_streak',{since});}
+  // Una racha es la misma verificación que sigue saliendo búsqueda tras búsqueda (~150 s entre
+  // ellas). Si la última fue hace más de 10 min, es una verificación nueva: empieza de cero.
+  if(since&&now-last>10*60e3)since=0;
+  if(!since)since=now;
+  saveSetting('xianyu_risk_streak',{since,last:now});
   return {since,lasted:now-since,exceeded:now-since>=XIANYU_RISK_GRACE_MS};
 }
 function xianyuRiskStreakClear(){
