@@ -235,7 +235,7 @@ const XIANYU_RISK_JSON=/RGV587|FAIL_SYS_USER_VALIDATE|FAIL_SYS_ILLEGAL_ACCESS/;
 const xianyuRiskText=t=>XIANYU_RISK_JSON.test(String(t||'').slice(0,3000));
 async function xianyuOverlay(tabId){
   try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>{
+    const [r]=await execMain({target:{tabId},world:'MAIN',func:()=>{
       // offsetParent vale null en elementos de posición fija (la ventana de verificación lo es):
       // se mira si ocupa espacio y no está oculta.
       const vis=el=>{if(!el)return false;const st=getComputedStyle(el);
@@ -252,7 +252,7 @@ async function xianyuStillBlocked(tabId,tab){
 const XIANYU_HARD=/unusual traffic|异常流量|流量异常|网络环境.{0,8}异常/i;
 async function xianyuHardBlock(tabId){
   try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>(document.body?document.body.innerText:'').slice(0,3000)});
+    const [r]=await execMain({target:{tabId},world:'MAIN',func:()=>(document.body?document.body.innerText:'').slice(0,3000)});
     return XIANYU_HARD.test(String(r?.result||''));
   }catch{return false;}
 }
@@ -261,14 +261,14 @@ async function xianyuLinger(tabId){
   try{
     const steps=1+Math.floor(Math.random()*3);
     for(let i=0;i<steps;i++){
-      await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[200+Math.floor(Math.random()*700)],func:dy=>window.scrollBy({top:dy,behavior:'smooth'})});
+      await execMain({target:{tabId},world:'MAIN',args:[200+Math.floor(Math.random()*700)],func:dy=>window.scrollBy({top:dy,behavior:'smooth'})});
       await sleep(900+Math.random()*2200);
     }
   }catch{}
 }
 async function xianyuResponses(tabId){
   try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>(window.__lhXY||[]).map(x=>x.text)});
+    const [r]=await execMain({target:{tabId},world:'MAIN',func:()=>(window.__lhXY||[]).map(x=>x.text)});
     return r?.result||[];
   }catch{return [];}
 }
@@ -288,9 +288,15 @@ async function xianyuWaitNew(tabId,have,ms){
 // IMPORTANTE: todas las esperas se hacen AQUÍ (en el service worker) y no dentro de la página. La pestaña de trabajo
 // está minimizada y Chrome frena los temporizadores de las páginas ocultas (hasta 1 por minuto pasados 5 min), de modo
 // que una espera de 150 ms dentro de la página podía tardar un minuto y la búsqueda se agotaba (error 504).
+// Último paso de la búsqueda (migas de pan): si algo se cuelga, el error dice dónde.
+let lhCrumb='';
+const crumb=s=>{lhCrumb=s;console.log('[LH]',s);};
+// Ninguna llamada a la página puede quedarse esperando para siempre: a los 10 s se da por fallida.
+const withTimeout=(promise,ms,label)=>Promise.race([promise,new Promise((_,rej)=>setTimeout(()=>rej(new Error('tiempo agotado: '+label)),ms))]);
+const execMain=opts=>withTimeout(chrome.scripting.executeScript(opts),10_000,lhCrumb||'executeScript');
 const pageStep=async(tabId,args,func)=>{
-  try{const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args,func});return r?.result;}
-  catch{return undefined;}
+  try{const [r]=await withTimeout(chrome.scripting.executeScript({target:{tabId},world:'MAIN',args,func}),10_000,lhCrumb||'pageStep');return r?.result;}
+  catch(e){console.log('[LH] pageStep falló en',lhCrumb,e?.message);return undefined;}
 };
 async function xianyuClick(tabId,text){
   const where=await pageStep(tabId,[text],t=>{
@@ -361,20 +367,25 @@ async function handleXianyu(job,token){
   let opened;
   const reply=payload=>bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:job.url,title:'',html:'',...payload});
   try{
+    crumb('hook');
     await hookXianyu();
     // Navegación variada: ~1 de cada 3 veces entra primero por la portada, mira un momento y luego busca (como una persona),
     // en vez de ir siempre directo a la URL de la búsqueda.
     const viaHome=Math.random()<0.33;
+    crumb('abrir ventana');
     opened=await openHidden(viaHome?'https://www.goofish.com/':job.url);
     const tabId=opened.tabId;
+    crumb('esperar carga');
     await waitLoaded(tabId);
     if(viaHome){
+      crumb('portada');
       await sleep(2500+Math.random()*4500);
       await xianyuLinger(tabId);
       await chrome.tabs.update(tabId,{url:job.url});
       await sleep(800);
       await waitLoaded(tabId);
     }
+    crumb('esperar resultados');
     let list=await xianyuWaitNew(tabId,0,40_000);
     let tab=await chrome.tabs.get(tabId).catch(()=>null);
     if(!list||GOOFISH_BLOCK.test(tab?.url||'')){
@@ -392,6 +403,7 @@ async function handleXianyu(job,token){
       if(!hard)await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
       return;
     }
+    crumb('ordenar');
     // Más nuevos primero.
     await sleep(900+Math.random()*900);
     if(await xianyuClick(tabId,'新发布')){
@@ -401,12 +413,14 @@ async function handleXianyu(job,token){
         if(l2){list=l2;text=l2[l2.length-1];sorted=true;}
       }
     }
+    crumb('precio');
     // Rango de precio de la tarea.
     if((job.minCny||job.maxCny)&&await xianyuPrice(tabId,job.minCny,job.maxCny)){
       const l3=await xianyuWaitNew(tabId,list.length,15_000);
       if(l3){list=l3;text=l3[l3.length-1];priced=true;}
     }
     tab=await chrome.tabs.get(tabId).catch(()=>null);
+    crumb('final');
     const risky=xianyuRiskText(text)||await xianyuOverlay(tabId);
     const hard=risky&&await xianyuHardBlock(tabId);
     if(!risky)await xianyuLinger(tabId);
@@ -424,10 +438,10 @@ async function handleXianyu(job,token){
 async function handle(job,token){
   if(job.kind==='vestiaire')return handleVestiaire(job,token);
   if(job.kind==='xianyu'){
-    // Una búsqueda nunca puede dejar la extensión colgada: a los 125 s se contesta con error y se sigue.
+    // Una búsqueda nunca puede dejar la extensión colgada: a los 90 s se contesta con error y se sigue.
     const reply=payload=>bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:job.url,title:'',html:'',...payload}).catch(()=>{});
     let timer;
-    const guard=new Promise(resolve=>{timer=setTimeout(()=>{reply({status:504,body:JSON.stringify({error:'La búsqueda tardó más de 125 s en la ventana de trabajo'})});resolve();},125_000);});
+    const guard=new Promise(resolve=>{timer=setTimeout(()=>{reply({status:504,body:JSON.stringify({error:'La búsqueda se colgó en el paso: '+(lhCrumb||'?')})});resolve();},90_000);});
     try{await Promise.race([handleXianyu(job,token),guard]);}finally{clearTimeout(timer);}
     return;
   }
