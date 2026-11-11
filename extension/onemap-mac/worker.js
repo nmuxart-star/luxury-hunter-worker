@@ -285,62 +285,77 @@ async function xianyuWaitNew(tabId,have,ms){
 }
 // Gestos humanos (regla de Nil, 11-11-2026): el ratón pasa por encima, duda un momento y el clic tarda lo que tarda
 // un dedo en apretar y soltar; el precio se escribe cifra a cifra con pausas irregulares.
+// IMPORTANTE: todas las esperas se hacen AQUÍ (en el service worker) y no dentro de la página. La pestaña de trabajo
+// está minimizada y Chrome frena los temporizadores de las páginas ocultas (hasta 1 por minuto pasados 5 min), de modo
+// que una espera de 150 ms dentro de la página podía tardar un minuto y la búsqueda se agotaba (error 504).
+const pageStep=async(tabId,args,func)=>{
+  try{const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args,func});return r?.result;}
+  catch{return undefined;}
+};
 async function xianyuClick(tabId,text){
-  try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[text],func:async t=>{
-      const wait=ms=>new Promise(r=>setTimeout(r,ms));
-      const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
-      if(!el)return false;
-      const b=el.getBoundingClientRect();
-      const pt={bubbles:true,cancelable:true,view:window,clientX:b.left+b.width*(0.3+Math.random()*0.4),clientY:b.top+b.height*(0.3+Math.random()*0.4)};
-      el.dispatchEvent(new MouseEvent('mouseover',pt));el.dispatchEvent(new MouseEvent('mouseenter',pt));el.dispatchEvent(new MouseEvent('mousemove',pt));
-      await wait(400+Math.random()*400);
-      el.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));
-      await wait(50+Math.random()*100);
-      el.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
-      el.click();
-      return true;}});
-    return !!r?.result;
-  }catch{return false;}
+  const where=await pageStep(tabId,[text],t=>{
+    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
+    if(!el)return null;
+    const b=el.getBoundingClientRect();
+    const x=b.left+b.width*(0.3+Math.random()*0.4),y=b.top+b.height*(0.3+Math.random()*0.4);
+    const pt={bubbles:true,cancelable:true,view:window,clientX:x,clientY:y};
+    el.dispatchEvent(new MouseEvent('mouseover',pt));el.dispatchEvent(new MouseEvent('mouseenter',pt));el.dispatchEvent(new MouseEvent('mousemove',pt));
+    return {x,y};});
+  if(!where)return false;
+  await sleep(400+Math.random()*400);
+  await pageStep(tabId,[text,where.x,where.y,'down'],(t,x,y,ph)=>{
+    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
+    if(el)el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,button:0,buttons:1}));});
+  await sleep(50+Math.random()*100);
+  return !!(await pageStep(tabId,[text,where.x,where.y],(t,x,y)=>{
+    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
+    if(!el)return false;
+    el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,button:0}));
+    el.click();return true;}));
 }
 async function xianyuPrice(tabId,min,max){
-  try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[min,max],func:async(lo,hi)=>{
-      const wait=ms=>new Promise(r=>setTimeout(r,ms));
-      const box=document.querySelector('div[class*="search-price-input-container"]');
-      if(!box)return false;
-      const inputs=[...box.querySelectorAll('input')];
-      if(inputs.length<2)return false;
-      const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
-      // Escribe cifra a cifra (100-250 ms entre cifras) con el mismo evento «input» que una pulsación real.
-      const type=async(el,v)=>{
-        el.focus();await wait(200+Math.random()*300);
-        d.set.call(el,'');el.dispatchEvent(new Event('input',{bubbles:true}));
-        let cur='';
-        for(const ch of String(v)){
-          cur+=ch;
-          el.dispatchEvent(new KeyboardEvent('keydown',{key:ch,bubbles:true}));
-          d.set.call(el,cur);el.dispatchEvent(new Event('input',{bubbles:true}));
-          el.dispatchEvent(new KeyboardEvent('keyup',{key:ch,bubbles:true}));
-          await wait(100+Math.random()*150);
-        }
-        el.dispatchEvent(new Event('change',{bubbles:true}));
-        await wait(500+Math.random()*500);
-      };
-      if(lo)await type(inputs[0],lo);
-      if(hi)await type(inputs[1],hi);
-      // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
-      const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
-      if(!btn)return false;
-      const bb=btn.getBoundingClientRect();
-      const pt={bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2};
-      btn.dispatchEvent(new MouseEvent('mouseover',pt));await wait(300+Math.random()*300);
-      btn.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));await wait(50+Math.random()*100);
-      btn.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
-      btn.click();
-      return true;}});
-    return !!r?.result;
-  }catch{return false;}
+  const ready=await pageStep(tabId,[],()=>{
+    const box=document.querySelector('div[class*="search-price-input-container"]');
+    return !!box&&box.querySelectorAll('input').length>=2&&!!(box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]'));});
+  if(!ready)return false;
+  // Escribe cifra a cifra (100-250 ms entre cifras) con el mismo evento «input» que una pulsación real.
+  const typeInto=async(idx,value)=>{
+    await pageStep(tabId,[idx],i=>{
+      const el=document.querySelector('div[class*="search-price-input-container"]').querySelectorAll('input')[i];
+      el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,'');el.dispatchEvent(new Event('input',{bubbles:true}));});
+    await sleep(200+Math.random()*300);
+    let cur='';
+    for(const ch of String(value)){
+      cur+=ch;
+      await pageStep(tabId,[idx,ch,cur],(i,c,v)=>{
+        const el=document.querySelector('div[class*="search-price-input-container"]').querySelectorAll('input')[i];
+        const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+        el.dispatchEvent(new KeyboardEvent('keydown',{key:c,bubbles:true}));
+        d.set.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));
+        el.dispatchEvent(new KeyboardEvent('keyup',{key:c,bubbles:true}));});
+      await sleep(100+Math.random()*150);
+    }
+    await pageStep(tabId,[idx],i=>{document.querySelector('div[class*="search-price-input-container"]').querySelectorAll('input')[i].dispatchEvent(new Event('change',{bubbles:true}));});
+    await sleep(500+Math.random()*500);
+  };
+  if(min)await typeInto(0,min);
+  if(max)await typeInto(1,max);
+  // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
+  await pageStep(tabId,[],()=>{
+    const box=document.querySelector('div[class*="search-price-input-container"]');
+    const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
+    const bb=btn.getBoundingClientRect();
+    btn.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2}));});
+  await sleep(300+Math.random()*300);
+  return !!(await pageStep(tabId,[],()=>{
+    const box=document.querySelector('div[class*="search-price-input-container"]');
+    const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
+    if(!btn)return false;
+    const bb=btn.getBoundingClientRect();
+    const pt={bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2};
+    btn.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));
+    btn.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
+    btn.click();return true;}));
 }
 async function handleXianyu(job,token){
   let opened;
@@ -408,7 +423,14 @@ async function handleXianyu(job,token){
 
 async function handle(job,token){
   if(job.kind==='vestiaire')return handleVestiaire(job,token);
-  if(job.kind==='xianyu')return handleXianyu(job,token);
+  if(job.kind==='xianyu'){
+    // Una búsqueda nunca puede dejar la extensión colgada: a los 125 s se contesta con error y se sigue.
+    const reply=payload=>bridge(`/result/${job.id}`,token,'POST',{url:job.url,finalUrl:job.url,title:'',html:'',...payload}).catch(()=>{});
+    let timer;
+    const guard=new Promise(resolve=>{timer=setTimeout(()=>{reply({status:504,body:JSON.stringify({error:'La búsqueda tardó más de 125 s en la ventana de trabajo'})});resolve();},125_000);});
+    try{await Promise.race([handleXianyu(job,token),guard]);}finally{clearTimeout(timer);}
+    return;
+  }
   const search=job.url.includes('/yahoo-auctions/search/');
   let opened;
   try{
@@ -438,7 +460,9 @@ async function poll(){
     for(let i=0;i<30;i++){
       const {job}=await bridge('/next',bridgeToken);
       if(!job)break;
-      await handle(job,bridgeToken);
+      // Mientras dura la búsqueda se sigue avisando al puente de que la extensión está viva (si no, a los 75 s parecía caída).
+      const hb=setInterval(()=>bridge('/heartbeat',bridgeToken,'POST').catch(()=>{}),25_000);
+      try{await handle(job,bridgeToken);}finally{clearInterval(hb);}
     }
   }catch(error){
     console.warn('Luxury Hunter One Map:',error.message);

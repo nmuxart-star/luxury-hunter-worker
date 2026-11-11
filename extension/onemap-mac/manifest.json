@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Luxury Hunter Mac local",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "description": "Consulta subastas de One Map, busca en Vestiaire y en Xianyu, y envía a Luxury Hunter Inbox el anuncio de la pestaña abierta.",
   "minimum_chrome_version": "116",
   "permissions": [
