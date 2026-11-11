@@ -295,34 +295,68 @@ const crumb=s=>{lhCrumb=s;console.log('[LH]',s);};
 const withTimeout=(promise,ms,label)=>Promise.race([promise,new Promise((_,rej)=>setTimeout(()=>rej(new Error('tiempo agotado: '+label)),ms))]);
 const execMain=opts=>withTimeout(chrome.scripting.executeScript(opts),10_000,lhCrumb||'executeScript');
 const pageStep=async(tabId,args,func)=>{
-  try{const [r]=await withTimeout(chrome.scripting.executeScript({target:{tabId},world:'MAIN',args,func}),10_000,lhCrumb||'pageStep');return r?.result;}
+  try{const [r]=await withTimeout(chrome.scripting.executeScript({target:{tabId},world:'MAIN',args,func}),20_000,lhCrumb||'pageStep');return r?.result;}
   catch(e){console.log('[LH] pageStep falló en',lhCrumb,e?.message);return undefined;}
 };
-async function xianyuClick(tabId,text){
-  try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[text],func:t=>{
-      const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
-      if(!el)return false;el.click();return true;}});
-    return !!r?.result;
-  }catch{return false;}
+// GESTOS HUMANOS (regla de Nil, 11-11-2026): el ratón pasa por encima, duda un momento y el clic tarda lo que tarda un
+// dedo; el precio se escribe cifra a cifra. Cada gesto es UNA sola llamada a la página y las pausas se hacen dentro
+// con una espera activa (spin): los temporizadores de una ventana minimizada los frena Chrome y las llamadas
+// repetidas a una página oculta van lentas, y eso colgaba la búsqueda. Si la búsqueda va justa de tiempo (human=false)
+// se hace el mismo gesto al instante.
+async function xianyuClick(tabId,text,human=true){
+  const r=await pageStep(tabId,[text,human],(t,h)=>{
+    const spin=ms=>{const e=performance.now()+ms;while(performance.now()<e){}};
+    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
+    if(!el)return false;
+    if(h){
+      const b=el.getBoundingClientRect();
+      const pt={bubbles:true,cancelable:true,view:window,clientX:b.left+b.width*(0.3+Math.random()*0.4),clientY:b.top+b.height*(0.3+Math.random()*0.4)};
+      el.dispatchEvent(new MouseEvent('mouseover',pt));el.dispatchEvent(new MouseEvent('mouseenter',pt));el.dispatchEvent(new MouseEvent('mousemove',pt));
+      spin(400+Math.random()*400);
+      el.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));
+      spin(50+Math.random()*100);
+      el.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
+    }
+    el.click();return true;});
+  return !!r;
 }
-async function xianyuPrice(tabId,min,max){
-  try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[min,max],func:(lo,hi)=>{
-      const box=document.querySelector('div[class*="search-price-input-container"]');
-      if(!box)return false;
-      const inputs=[...box.querySelectorAll('input')];
-      if(inputs.length<2)return false;
-      const set=(el,v)=>{el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,String(v));el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
-      if(lo)set(inputs[0],lo);
-      if(hi)set(inputs[1],hi);
-      // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
-      const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
-      if(!btn)return false;
-      btn.click();
-      return true;}});
-    return !!r?.result;
-  }catch{return false;}
+async function xianyuPrice(tabId,min,max,human=true){
+  const r=await pageStep(tabId,[min,max,human],(lo,hi,h)=>{
+    const spin=ms=>{const e=performance.now()+ms;while(performance.now()<e){}};
+    const box=document.querySelector('div[class*="search-price-input-container"]');
+    if(!box)return false;
+    const inputs=[...box.querySelectorAll('input')];
+    if(inputs.length<2)return false;
+    const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
+    if(!btn)return false;
+    const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+    const type=(el,v)=>{
+      el.focus();
+      if(!h){d.set.call(el,String(v));el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return;}
+      spin(200+Math.random()*300);
+      d.set.call(el,'');el.dispatchEvent(new Event('input',{bubbles:true}));
+      let cur='';
+      for(const ch of String(v)){
+        cur+=ch;
+        el.dispatchEvent(new KeyboardEvent('keydown',{key:ch,bubbles:true}));
+        d.set.call(el,cur);el.dispatchEvent(new Event('input',{bubbles:true}));
+        el.dispatchEvent(new KeyboardEvent('keyup',{key:ch,bubbles:true}));
+        spin(100+Math.random()*150);
+      }
+      el.dispatchEvent(new Event('change',{bubbles:true}));
+      spin(500+Math.random()*500);
+    };
+    if(lo)type(inputs[0],lo);
+    if(hi)type(inputs[1],hi);
+    if(h){
+      const bb=btn.getBoundingClientRect();
+      const pt={bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2};
+      btn.dispatchEvent(new MouseEvent('mouseover',pt));spin(300+Math.random()*300);
+      btn.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));spin(50+Math.random()*100);
+      btn.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
+    }
+    btn.click();return true;});
+  return !!r;
 }
 async function handleXianyu(job,token){
   let opened;
@@ -330,11 +364,31 @@ async function handleXianyu(job,token){
   try{
     crumb('hook');
     await hookXianyu();
+    // Presupuesto de tiempo: los gestos humanos solo se hacen mientras la búsqueda va holgada (45 s); si no, al instante.
+    const t0=Date.now();
+    const human=()=>Date.now()-t0<45_000;
+    // Navegación variada: ~1 de cada 3 veces entra primero por la portada, mira un momento y luego busca.
+    const viaHome=Math.random()<0.33;
     crumb('abrir ventana');
-    opened=await openHidden(job.url);
+    opened=await openHidden(viaHome?'https://www.goofish.com/':job.url);
     const tabId=opened.tabId;
     crumb('esperar carga');
     await waitLoaded(tabId);
+    if(viaHome){
+      crumb('portada');
+      await sleep(2500+Math.random()*3500);
+      await xianyuLinger(tabId);
+      await chrome.tabs.update(tabId,{url:job.url});
+      await sleep(800);
+      await waitLoaded(tabId);
+    }
+    // Si el script que copia las respuestas no llegó a tiempo a esta página (carrera al registrarlo), se recarga una vez.
+    if(!(await pageStep(tabId,[],()=>!!window.__lhXYHook))){
+      crumb('recargar (sin script)');
+      await chrome.tabs.reload(tabId).catch(()=>{});
+      await sleep(800);
+      await waitLoaded(tabId);
+    }
     crumb('esperar resultados');
     let list=await xianyuWaitNew(tabId,0,40_000);
     let tab=await chrome.tabs.get(tabId).catch(()=>null);
@@ -356,16 +410,16 @@ async function handleXianyu(job,token){
     crumb('ordenar');
     // Más nuevos primero.
     await sleep(900+Math.random()*900);
-    if(await xianyuClick(tabId,'新发布')){
+    if(await xianyuClick(tabId,'新发布',human())){
       await sleep(700+Math.random()*700);
-      if(await xianyuClick(tabId,'最新')){
+      if(await xianyuClick(tabId,'最新',human())){
         const l2=await xianyuWaitNew(tabId,list.length,15_000);
         if(l2){list=l2;text=l2[l2.length-1];sorted=true;}
       }
     }
     crumb('precio');
     // Rango de precio de la tarea.
-    if((job.minCny||job.maxCny)&&await xianyuPrice(tabId,job.minCny,job.maxCny)){
+    if((job.minCny||job.maxCny)&&await xianyuPrice(tabId,job.minCny,job.maxCny,human())){
       const l3=await xianyuWaitNew(tabId,list.length,15_000);
       if(l3){list=l3;text=l3[l3.length-1];priced=true;}
     }
@@ -373,6 +427,7 @@ async function handleXianyu(job,token){
     crumb('final');
     const risky=xianyuRiskText(text)||await xianyuOverlay(tabId);
     const hard=risky&&await xianyuHardBlock(tabId);
+    if(!risky&&human())await xianyuLinger(tabId);
     await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced,hard})});
     if(risky&&!hard){
       await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
