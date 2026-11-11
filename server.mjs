@@ -873,6 +873,9 @@ const manualAiStore=new AsyncLocalStorage();
 // Subastas en curso: acaban a una hora fija, así que su análisis no espera al
 // reparto por horas del presupuesto (puede adelantar hasta un 25 % del día).
 const auctionAiStore=new AsyncLocalStorage();
+// Anuncios con una rentabilidad esperada enorme según la hoja (regla de Nil, 11-11-2026): se analizan
+// sin esperar al reparto por horas. El tope del día sigue valiendo.
+const priorityAiStore=new AsyncLocalStorage();
 // REPARTO BOLSOS / RELOJES (regla de Nil, 07-11-2026): el presupuesto de IA
 // del día se divide AI_WATCH_SHARE (35 %) para relojes y el resto (65 %) para
 // bolsos (Nil, 07-11-2026).
@@ -1055,7 +1058,7 @@ function assertAiBudget(purpose=''){
     }
     return;
   }
-  const advanceShare=auctionAiStore.getStore()?Math.max(0,Math.min(1,Number(process.env.AUCTION_AI_ADVANCE_SHARE??0.25))):0;
+  const advanceShare=priorityAiStore.getStore()?1:auctionAiStore.getStore()?Math.max(0,Math.min(1,Number(process.env.AUCTION_AI_ADVANCE_SHARE??0.25))):0;
   const cat=aiCategoryStore.getStore();
   if(cat){
     const label=cat==='watch'?'relojes':'bolsos';
@@ -1103,7 +1106,7 @@ function verifyBudgetLeftUsd(){
   const verifyShare=Math.min(1,Math.max(0.1,Number(process.env.AI_VERIFY_SHARE??0.85)));
   budget=Math.min(budget,aiDailyBudgetUsd()*verifyShare);
   const spent=Number(getAiSpend()?.byPurpose?.verify?.usd||0);
-  return budget*aiPaceShare()-spent;
+  return budget*(priorityAiStore.getStore()?1:aiPaceShare())-spent;
 }
 
 function openaiInputFromParts(parts,detail='auto'){
@@ -5964,15 +5967,42 @@ function taskMedianAskingEur(taskId){
   return percentile(values,0.5);
 }
 
-function prioritizeForAnalysis(taskId,items){
+// Rentabilidad esperada SIN IA con la base de Nil: se vende al cuartil bajo (p25) de las referencias
+// del modelo (misma regla que el filtro de «caro») y se resta comisión, coste puesto e IVA del margen.
+// Sirve para analizar primero lo que más puede dar. Devuelve null si no hay referencias suficientes.
+function sheetProfitEstimate(item,task){
+  try{
+    if(!task?.task_name||listingAuction(item))return null;
+    const info=baseReferenceRows(task,item);
+    const values=(info.rows||[]).map(r=>refValueForGate(r)).filter(v=>v>0).sort((a,b)=>a-b);
+    if(values.length<5)return null;
+    const resale=percentile(values,0.25);
+    const fee=resalePlatform(task.task_name).fee/100;
+    const landed=Number(importEconomics(item).importedTotalEur)||0;
+    if(!(landed>0)||!(resale>0))return null;
+    const net=resale-landed-resale*fee-Math.max(0,resale-landed)*21/121;
+    return {resale:Math.round(resale),landed:Math.round(landed),net:Math.round(net),marginPct:Math.round(net/landed*100)};
+  }catch{return null;}
+}
+// «Barbaridad» de rentabilidad: beneficio esperado o margen por encima de estos umbrales.
+const AI_PRIORITY_NET_EUR=Number(process.env.AI_PRIORITY_NET_EUR??500);
+const AI_PRIORITY_MARGIN_PCT=Number(process.env.AI_PRIORITY_MARGIN_PCT??100);
+const sheetNetOf=x=>Number.isFinite(x?._sheetProfit?.net)?x._sheetProfit.net:-1e9;
+
+function prioritizeForAnalysis(taskId,items,task=null){
   const median=taskMedianAskingEur(taskId);
   const ranked=items.map(item=>{
     const price=Number(item.price_eur);
     const ratio=median&&price>0?price/median:null;
+    const est=task?sheetProfitEstimate(item,task):null;
+    item._sheetProfit=est;
+    item._aiPriority=!!est&&(est.net>=AI_PRIORITY_NET_EUR||est.marginPct>=AI_PRIORITY_MARGIN_PCT);
     return {item,ratio};
   });
+  // Primero lo que verificar, luego lo más rentable según la hoja y, a igualdad, lo más barato.
   ranked.sort((a,b)=>
     Number(!!b.item._needsVerification)-Number(!!a.item._needsVerification) ||
+    sheetNetOf(b.item)-sheetNetOf(a.item) ||
     (a.ratio??9)-(b.ratio??9)
   );
   return {median,items:ranked.map(r=>{
@@ -6974,6 +7004,39 @@ function alertLink(x){
   const web=x.source==='xianyu'&&id?`https://www.goofish.com/item?id=${id}`:x.url;
   return `📱 <a href="${htmlEsc(app)}">Abrir el anuncio</a>${app!==web?`  ·  <a href="${htmlEsc(web)}">web</a>`:''}`;
 }
+// PRECIO OBJETIVO (regla de Nil, 11-11-2026): a cuánto habría que bajar el anuncio para sacarle la
+// máxima rentabilidad, y hasta dónde se puede pagar. El beneficio al nuevo precio se calcula con
+// lo que se ahorra en coste puesto. Tope de descuento realista: TARGET_MAX_DISCOUNT_PCT (30 %).
+function targetPricePlan(x,v){
+  if(listingAuction(x)?.live)return null; // las subastas llevan su puja máxima
+  const sale=Number(v?.final?.resale_mean_eur)>0?Number(v.final.resale_mean_eur):Number(x.resale_low_eur)>0?Number(x.resale_low_eur):null;
+  const ask=Number(x.price_eur);
+  if(!(sale>0)||!(ask>0))return null;
+  const landedAt=p=>Number(importEconomics({...x,price_eur:p}).importedTotalEur)||0;
+  const landed0=landedAt(ask);
+  const clean0=Number.isFinite(Number(v?.final?.net_profit_clean_eur))?Number(v.final.net_profit_clean_eur):Number(x.net_profit_low_eur);
+  if(!(landed0>0)||!Number.isFinite(clean0))return null;
+  const profitAt=p=>clean0+(landed0-landedAt(p));
+  const marginAt=p=>{const l=landedAt(p);return l>0?profitAt(p)/l*100:0;};
+  // Objetivo = el precio más bajo realista (rentabilidad máxima): el mayor descuento que se puede pedir sin
+  // que el vendedor lo tome por una oferta absurda. TARGET_MAX_DISCOUNT_PCT (30 % por defecto).
+  const down5=p=>Math.max(1,Math.floor(p/5)*5);
+  const maxDisc=Math.min(0.9,Math.max(0.05,Number(process.env.TARGET_MAX_DISCOUNT_PCT||30)/100));
+  const target=Math.max(1,Math.floor(ask*(1-maxDisc)/5)*5);
+  // Techo: lo más alto que aún cumple beneficio y margen mínimos (los de siempre).
+  const minProfit=Number(x.notify_min_profit_eur)||200,minMargin=Number(process.env.MIN_CLEAN_MARGIN_PCT||20);
+  const ok=p=>profitAt(p)>=minProfit&&marginAt(p)>=minMargin;
+  let ceiling=null;
+  if(ok(1)){if(ok(ask))ceiling=ask;else{let lo=1,hi=ask;for(let i=0;i<30;i++){const mid=(lo+hi)/2;if(ok(mid))lo=mid;else hi=mid;}ceiling=down5(lo);}}
+  return {ask,target,discountPct:Math.round((1-target/ask)*100),profitTarget:Math.round(profitAt(target)),marginTarget:Math.round(marginAt(target)),ceiling,already:false};
+}
+function targetPriceLines(x,v){
+  let t=null;try{t=targetPricePlan(x,v);}catch{}
+  if(!t)return '';
+  const head=`🎯 Precio ideal: <b>${eur0(t.target)}</b> (−${t.discountPct} %) → beneficio ≈ <b>${eur0(t.profitTarget)}</b> (${t.marginTarget} %)`;
+  const ceil=t.ceiling!=null?`⛔ Techo: no pagues más de ${eur0(t.ceiling)}${t.ceiling>=t.ask?' (el precio actual ya vale)':''}`:'⛔ Ni bajando mucho llega a tu beneficio mínimo';
+  return [head,ceil].filter(Boolean).join('\n');
+}
 function instantAlertText(x,{soft=false}={}){
   let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
   const source=String(x.source||'');
@@ -6999,6 +7062,7 @@ function instantAlertText(x,{soft=false}={}){
       ?`❔ No hay ninguna igual en tu base: sin precio de venta · coste puesto ${eur0(x.landed_cost_eur)}`
       :sale?`📈 Venta orientativa <b>${eur0(sale)}</b>${n?` · ${n} igual${n===1?'':'es'}${soldN?` (${soldN} vendida${soldN===1?'':'s'})`:''}`:''}`:'',
     !norefs&&sale?`✅ Beneficio limpio <b>${eur0(clean)}</b>${margin!=null?` (${margin} %)`:''} · coste puesto ${eur0(x.landed_cost_eur)}`:'',
+    !norefs&&sale&&!auc?targetPriceLines(x,v):'',
     alertQuality(x,v),
     norefs?'':alertRefs(v),
     o?`💬 Ofrece <b>¥${o.openCny}</b> · tu máximo ¥${o.maxCny} (${eur0(o.profitMax)} limpios)`:'',
@@ -7743,7 +7807,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
 
       // Lo más barato respecto a la mediana de la tarea se analiza primero,
       // así una buena oferta no espera detrás de anuncios caros.
-      const prioritized=prioritizeForAnalysis(taskId,pendingItems);
+      const prioritized=prioritizeForAnalysis(taskId,pendingItems,task);
       pendingItems=prioritized.items.filter(x=>{
         const auc=listingAuction(x);
         if(!auc?.live||auctionInWindow(x))return true;
@@ -7773,8 +7837,11 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           }
           pendingItems=pendingItems.filter(x=>x._needsVerification||keep.has(x.id));
           // Dentro de lo que pasa el triaje, primero la mejor puntuación.
+          // (11-11-2026) La rentabilidad esperada según la hoja va por delante de la puntuación del triaje.
           pendingItems.sort((a,b)=>
             Number(!!b._needsVerification)-Number(!!a._needsVerification) ||
+            Number(!!b._aiPriority)-Number(!!a._aiPriority) ||
+            sheetNetOf(b)-sheetNetOf(a) ||
             (b._triageScore??-1)-(a._triageScore??-1) ||
             (a._priceVsTaskMedian??9)-(b._priceVsTaskMedian??9)
           );
@@ -7946,12 +8013,12 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           };
 
           try{
-            await auctionAiStore.run(!!listingAuction(item)?.live,()=>analyzeWithGemini(
+            await priorityAiStore.run(!!item._aiPriority,()=>auctionAiStore.run(!!listingAuction(item)?.live,()=>analyzeWithGemini(
               item.id,
               taskId,
               task.analyze_images,
               itemProgress
-            ));
+            )));
 
             succeeded++;
             await sleep(250);
