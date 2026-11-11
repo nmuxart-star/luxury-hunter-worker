@@ -1493,6 +1493,8 @@ const XIANYU_RISK_GRACE_MS=Math.max(0,Number(process.env.XIANYU_RISK_GRACE_MIN??
 function xianyuRiskStreakNote(){
   const now=Date.now();
   let since=Number((getSetting('xianyu_risk_streak',null)||{}).since)||0;
+  const ignoreBefore=Date.parse(String(process.env.XIANYU_RISK_PAUSE_IGNORE_BEFORE||'').trim());
+  if(Number.isFinite(ignoreBefore)&&since&&since<=ignoreBefore)since=0;   // racha anterior al reinicio manual
   if(!since){since=now;saveSetting('xianyu_risk_streak',{since});}
   return {since,lasted:now-since,exceeded:now-since>=XIANYU_RISK_GRACE_MS};
 }
