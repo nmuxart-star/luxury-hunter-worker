@@ -6198,6 +6198,7 @@ const AI_PRIORITY_NET_EUR=Number(process.env.AI_PRIORITY_NET_EUR??500);
 const AI_PRIORITY_MARGIN_PCT=Number(process.env.AI_PRIORITY_MARGIN_PCT??100);
 const sheetNetOf=x=>Number.isFinite(x?._sheetProfit?.net)?x._sheetProfit.net:-1e9;
 
+const XIANYU_RECENT_HOURS=Math.max(0.25,Number(process.env.XIANYU_RECENT_HOURS||3));
 function prioritizeForAnalysis(taskId,items,task=null){
   const median=taskMedianAskingEur(taskId);
   const ranked=items.map(item=>{
@@ -6206,11 +6207,17 @@ function prioritizeForAnalysis(taskId,items,task=null){
     const est=task?sheetProfitEstimate(item,task):null;
     item._sheetProfit=est;
     item._aiPriority=!!est&&(est.net>=AI_PRIORITY_NET_EUR||est.marginPct>=AI_PRIORITY_MARGIN_PCT);
+    // FILTRO DE RECIENTES (regla de Nil, 11-11-2026): publicado hace menos de XIANYU_RECENT_HOURS (3) horas.
+    const pubMs=listingPublishedAtMs(item);
+    item._recent=Number.isFinite(pubMs)&&pubMs>0&&Date.now()-pubMs<=XIANYU_RECENT_HOURS*3600e3;
     return {item,ratio};
   });
-  // Primero lo que verificar, luego lo más rentable según la hoja y, a igualdad, lo más barato.
+  // Primero lo que verificar, luego lo muy rentable según la hoja (más beneficio primero). El resto: primero los
+  // recién publicados y, dentro de cada grupo, lo más rentable según la hoja y, a igualdad, lo más barato.
   ranked.sort((a,b)=>
     Number(!!b.item._needsVerification)-Number(!!a.item._needsVerification) ||
+    Number(!!b.item._aiPriority)-Number(!!a.item._aiPriority) ||
+    (a.item._aiPriority?0:Number(!!b.item._recent)-Number(!!a.item._recent)) ||
     sheetNetOf(b.item)-sheetNetOf(a.item) ||
     (a.ratio??9)-(b.ratio??9)
   );

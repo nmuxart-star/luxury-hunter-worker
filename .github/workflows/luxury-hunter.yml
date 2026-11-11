@@ -112,6 +112,9 @@ jobs:
       LAUNCH_BREAK_PROB: ${{ vars.LAUNCH_BREAK_PROB || '0.15' }}
       # Bloqueo de red de Xianyu («tráfico inusual», sin captcha): se para todo Xianyu estas horas.
       XIANYU_HARD_BLOCK_HOURS: ${{ vars.XIANYU_HARD_BLOCK_HOURS || '4' }}
+      # Recientes: se analizan antes los publicados hace menos de XIANYU_RECENT_HOURS h; y nada de más de XIANYU_SEARCH_MAX_AGE_HOURS h.
+      XIANYU_RECENT_HOURS: ${{ vars.XIANYU_RECENT_HOURS || '3' }}
+      XIANYU_SEARCH_MAX_AGE_HOURS: ${{ vars.XIANYU_SEARCH_MAX_AGE_HOURS || '24' }}
       XIANYU_RISK_PAUSE_IGNORE_BEFORE: ${{ vars.XIANYU_RISK_PAUSE_IGNORE_BEFORE || '' }}
       CYCLE_MIN_MINUTES: ${{ vars.CYCLE_MIN_MINUTES || '20' }}
       # Avisos inmediatos (email siempre; Telegram si hay secretos).
