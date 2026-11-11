@@ -7189,6 +7189,80 @@ function xianyuFeedText(x){
     alertLink(x)
   ].filter(Boolean).join('\n');
 }
+// DESCUBRIMIENTO (regla de Nil, 11-11-2026): anuncios de Xianyu que NO son de los modelos fijados (el triaje los
+// descarta por «no es el producto buscado») pero que pueden ser una buena reventa aunque no haya referencias.
+// Solo vendedores fiables (信用极好 + 验货宝), publicados en las últimas 24 h y sin réplicas/accesorios/pieles
+// exóticas. Una sola llamada barata (solo texto) por lote; lo que supera la nota va SOLO al chat Luxe.
+async function discoverXianyuOpportunities(task,runId,items){
+  if(['0','false','off','no'].includes(String(process.env.AI_DISCOVERY||'').toLowerCase()))return {sent:0,reason:'disabled'};
+  const luxe=telegramLuxeChat();
+  if(!telegramConfigured()||!luxe)return {sent:0,reason:'no-luxe-chat'};
+  const maxAgeMs=Math.max(1,Number(process.env.AI_DISCOVERY_MAX_AGE_H||24))*3600e3;
+  const minScore=Number(process.env.AI_DISCOVERY_MIN_SCORE||80);
+  const maxJudge=Math.max(1,Number(process.env.AI_DISCOVERY_MAX_JUDGE||60));
+  const maxSend=Math.max(1,Number(process.env.AI_DISCOVERY_MAX_PER_RUN||6));
+  const seen=db.prepare(`SELECT 1 FROM notifications WHERE listing_id=? AND kind IN ('discovery','discovery-seen','instant','soft','auction','norefs') LIMIT 1`);
+  const cands=(items||[]).filter(x=>{
+    if(String(x.source||'').toLowerCase()!=='xianyu')return false;
+    if(!xianyuFeedEligible(x))return false;
+    if(deterministicPrescreen(x,task))return false;
+    const pub=listingPublishedAtMs(x);
+    if(!Number.isFinite(pub)||Date.now()-pub>maxAgeMs)return false;
+    if(listingFeedback(x.id)==='not_interested')return false;
+    return !seen.get(Number(x.id));
+  }).sort((a,b)=>listingPublishedAtMs(b)-listingPublishedAtMs(a)).slice(0,maxJudge);
+  if(!cands.length)return {sent:0,judged:0};
+  const key=aiApiKey();const model=aiTriageModel();
+  const scores=new Map();
+  for(const batch of chunks(cands,30)){
+    const lines=batch.map((x,i)=>({i,title:String(x.title||'').slice(0,180),description:String(x.description||'').replace(/\s+/g,' ').slice(0,260),price_eur:Math.round(Number(x.price_eur)||0)}));
+    const prompt=`You are the DISCOVERY filter of Luxury Hunter. Nil resells second-hand luxury bags and watches in Western Europe. These Xianyu listings did NOT match his fixed model tasks, but some may still be a very good resale opportunity.
+Pick listings that are: a recognisable luxury brand AND an identifiable model with strong European resale demand (e.g. Hermès, Chanel, Louis Vuitton, Dior, Gucci, Prada, Miu Miu, Fendi, Celine, Loewe, Bottega Veneta, Saint Laurent, Balenciaga, Rolex, Omega, Cartier, Patek Philippe, Audemars Piguet, IWC, Panerai, Tudor, Grand Seiko, Tag Heuer, Breitling), complete item in genuine second-hand condition, asking price plausible for an authentic piece.
+Score 0-100 "interesting_potential". Give 0 to: replicas or replica wording, accessories/parts only, damaged beyond resale, unidentifiable items, genuine exotic leather (crocodile, python, ostrich, lizard, stingray). Do NOT invent facts; use only the text (titles may be Chinese).
+LISTINGS (JSON): ${JSON.stringify(lines)}
+Return ONLY JSON: {"items":[{"i":0,"score":0,"brand":"","model":"","reason_es":"motivo breve en español"}]} with one entry per listing.`;
+    try{
+      const {data}=await geminiJsonRequest({key,model,parts:[{text:prompt}],googleSearch:false,purpose:'triage'});
+      for(const row of Array.isArray(data?.items)?data.items:[]){
+        const it=batch[Number(row?.i)];
+        if(it)scores.set(it.id,{score:clampNum(row.score),brand:String(row.brand||'').slice(0,40),model:String(row.model||'').slice(0,60),reason:String(row.reason_es||'').slice(0,240)});
+      }
+    }catch(e){console.error('Descubrimiento (IA):',e.message);break;}
+  }
+  const mark=db.prepare(`INSERT OR IGNORE INTO notifications(task_id,listing_id,run_id,kind,sent_to,sent_at) VALUES(?,?,?,?,'telegram',?)`);
+  const now=()=>new Date().toISOString();
+  const picks=[];
+  for(const x of cands){
+    const t=scores.get(x.id);
+    if(!t)continue;
+    mark.run(Number(task.id),Number(x.id),Number(runId)||null,'discovery-seen',now());
+    if(t.score>=minScore)picks.push({x,t});
+  }
+  picks.sort((a,b)=>b.t.score-a.t.score);
+  let sent=0;
+  for(const {x,t} of picks.slice(0,maxSend)){
+    const ago=alertAgo(listingPublishedAtMs(x));
+    const title=String(x.title||'').replace(/感兴趣的话点.*$/,'').replace(/\s+/g,' ').trim().slice(0,90);
+    const text=[
+      `<b>🔭 DESCUBIERTO · sin referencias</b> · ${htmlEsc(x._task_name||task.task_name||'')}`,
+      `<b>${htmlEsc([t.brand,t.model].filter(Boolean).join(' ')||title)}</b>`,
+      htmlEsc(title),
+      `💶 <b>${alertMoney(x)}</b>${ago?` · ${ago}`:''} · Xianyu`,
+      `🛡️ 验货宝 · vendedor 信用极好`,
+      `🤖 ${htmlEsc(t.reason||'Marca y modelo con demanda en Europa.')} (potencial ${t.score}/100)`,
+      '⚠️ Sin referencias en tu base: revisa el precio de venta a mano.',
+      alertLink(x)
+    ].filter(Boolean).join('\n');
+    try{
+      await telegramSendListingTo(text,x,luxe);
+      mark.run(Number(task.id),Number(x.id),Number(runId)||null,'discovery',now());
+      sent++;
+      await sleep(1200);
+    }catch(e){console.error('Aviso de descubrimiento:',e.message);}
+  }
+  if(sent||cands.length)console.log(`Task ${task.id}: descubrimiento → ${cands.length} revisados, ${picks.length} con potencial, ${sent} enviados a Luxe.`);
+  return {sent,judged:scores.size,candidates:cands.length};
+}
 async function sendXianyuFeed(task,runId,items){
   if(['0','false','off','no'].includes(String(process.env.XIANYU_FEED||'').toLowerCase()))return {sent:0,reason:'disabled'};
   if(!telegramConfigured())return {sent:0,reason:'no-telegram'};
@@ -7824,6 +7898,7 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           const triage=await auctionAiStore.run(toTriage.some(x=>listingAuction(x)?.live),()=>triageWithAi(task,toTriage));
           let kept=0,rejected=0,unscored=0;
           const keep=new Set();
+          const triageRejected=[];
           for(const item of toTriage){
             const t=triage.scores.get(item.id);
             if(!t){unscored++;keep.add(item.id);continue;}
@@ -7831,9 +7906,14 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
             if(t.score>=triage.minScore){kept++;keep.add(item.id);}
             else{
               rejected++;
+              triageRejected.push({...item,_task_name:task.task_name});
               storeTriageReject(taskId,item,t);
               db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,item.id);
             }
+          }
+          // Lo que no es de este modelo puede ser buena reventa igualmente: se revisa aparte (solo Luxe).
+          if(triageRejected.length){
+            result.status.discovery=await discoverXianyuOpportunities(task,Number(runId),triageRejected).catch(e=>({sent:0,error:e.message}));
           }
           pendingItems=pendingItems.filter(x=>x._needsVerification||keep.has(x.id));
           // Dentro de lo que pasa el triaje, primero la mejor puntuación.
