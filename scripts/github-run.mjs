@@ -148,7 +148,13 @@ try{
     await api('POST','/api/health/report',{key:'xianyu-risk',clear:true}).catch(()=>{});
   }
   const existing=(await api('GET','/api/tasks')).tasks||[];
-  for(const t of cfg.tasks||[]){
+  // Intervalos que mandan sobre los de la configuración cifrada (regla de Nil, 11-11-2026: el Radar de
+  // oportunidades tiene la máxima prioridad, como los modelos de 60 min). Formato: "Nombre=minutos,Otro=minutos".
+  const intervalOverrides=Object.fromEntries(String(process.env.TASK_INTERVAL_OVERRIDES??'Radar oportunidades=60')
+    .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Number(v)]));
+  for(const t0 of cfg.tasks||[]){
+    const t=intervalOverrides[t0.task_name]?{...t0,interval_minutes:intervalOverrides[t0.task_name]}:t0;
+    if(t!==t0)console.log(`Intervalo de ${t.task_name}: ${t0.interval_minutes} → ${t.interval_minutes} min (prioridad máxima).`);
     const old=existing.find(x=>x.task_name===t.task_name);
     if(old) await api('PATCH',`/api/tasks/${old.id}`,t);
     else await api('POST','/api/tasks',t);
