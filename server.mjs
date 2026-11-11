@@ -5163,6 +5163,55 @@ function effectivePlan(basePlan, taskOrBody={}) {
 // ejecución empieza la lista por los siguientes modelos de cada web, porque
 // solo se usan las primeras búsquedas (1 en Xianyu, 2 en Japón, 2 en Corea).
 const RADAR_STEP={xianyu:2,japan:2,bunjang:2};
+// ── RADAR: PRIORIDAD POR LIKES, ROTACIÓN Y REPRESENTACIÓN (regla de Nil, 12-11-2026) ─────────────────────────────
+// Cada búsqueda de la lista rotativa del Radar es un modelo (ej. «圣罗兰 niki»). Con las fichas de la pestaña «Radar oportunidades»
+// de la hoja se puntúa cada modelo: interés (likes), rotación (lo vendido) y representación (cuántas fichas hay). El Radar busca
+// más a menudo los que más puntúan, sin dejar de pasar por los demás.
+const RADAR_BRANDS=[['普拉达','prada'],['香奈儿','chanel'],['迪奥','dior'],['爱马仕','hermes'],['lv','louisvuitton'],['celine','celine'],['罗意威','loewe'],
+  ['芬迪','fendi'],['圣罗兰','saintlaurent'],['戈雅','goyard'],['葆蝶家','bottega'],['古驰','gucci'],['miumiu','miumiu'],['蔻依','chloe']];
+const RADAR_MODEL_ALIAS={'22bag':'22','box':'classic'};
+const radarNorm=x=>String(x||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]/g,'');
+function radarQueryKey(q){
+  const t=String(q||'').toLowerCase();
+  const b=RADAR_BRANDS.find(([k])=>t.includes(k));
+  const words=(t.match(/[a-z0-9]+/g)||[]).filter(w=>!['lv','celine','miumiu','bag'].includes(w)||/^22bag$/.test(w));
+  const joined=words.join('');
+  return {brand:b?b[1]:null,model:RADAR_MODEL_ALIAS[joined]||joined};
+}
+function radarScoreModels(fichas,queries){
+  const pct=(vals,v)=>{const a=[...vals].sort((x,y)=>x-y);if(a.length<2)return 0.5;let lo=a.findIndex(x=>x>=v-1e-9);if(lo<0)lo=a.length-1;return lo/(a.length-1);};
+  const stats=queries.map(q=>{
+    const k=radarQueryKey(q);
+    const rows=(fichas||[]).filter(f=>k.model&&radarNorm(f.size).includes(k.model)&&(!k.brand||radarNorm(f.brand).includes(k.brand)));
+    const likes=rows.map(f=>Number(f.likes)).filter(Number.isFinite).sort((a,b)=>a-b);
+    const median=likes.length?likes[Math.floor(likes.length/2)]:0;
+    const mean=likes.length?likes.reduce((a,b)=>a+b,0)/likes.length:0;
+    const n=rows.length,sold=rows.filter(f=>f.sold).length;
+    return {q,n,sold,likes:0.5*median+0.5*mean,ratio:(sold+1)/(n+10)};
+  });
+  const have=stats.filter(x=>x.n>0);
+  const out=new Map();
+  for(const x of stats){
+    if(!x.n){out.set(x.q,{...x,score:0.35});continue;}
+    const likesR=pct(have.map(y=>y.likes),x.likes);
+    const rotR=0.5*pct(have.map(y=>y.ratio),x.ratio)+0.5*pct(have.map(y=>y.sold),x.sold);
+    const repR=pct(have.map(y=>y.n),x.n);
+    // Interés y rotación mandan (40 % cada uno); la representación suma el 20 %.
+    out.set(x.q,{...x,score:0.4*likesR+0.4*rotR+0.2*repR});
+  }
+  return out;
+}
+// Ordena la lista del Radar: primero la búsqueda más «urgente» = tiempo desde la última vez × peso del modelo (0,3–2,2).
+function radarPrioritize(queries,fichas,now=Date.now(),last={}){
+  const scores=radarScoreModels(fichas,queries);
+  const rated=queries.map(q=>{
+    const sc=scores.get(q)?.score??0.35;
+    const w=0.2+3*sc*sc;   // peso 0,3–2,2: el mejor sale ~7 veces más que el peor, y ninguno deja de salir
+    const since=Math.max(1,(now-(Number(last[q])||0))/3600e3);
+    return {q,w,urgency:since*w,score:sc};
+  }).sort((a,b)=>b.urgency-a.urgency);
+  return {order:rated.map(x=>x.q),rated};
+}
 function radarRotatePlan(plan,taskId){
   if(!taskId)return plan;
   const task=db.prepare('SELECT task_name FROM tasks WHERE id=?').get(taskId);
@@ -5175,6 +5224,19 @@ function radarRotatePlan(plan,taskId){
     const off=(turn*step)%list.length;
     out[key]=[...list.slice(off),...list.slice(0,off)];
   }
+  // Prioridad por likes / rotación / representación según la hoja (si no se pudo leer, queda la rotación de arriba).
+  try{
+    const fichas=Object.entries(vestiaireSheetCache?.tasks||{}).find(([k])=>/^radar/i.test(k))?.[1]?.fichas;
+    const list=Array.isArray(plan.xianyu)?plan.xianyu:[];
+    if(fichas?.length&&list.length>1){
+      const last=getSetting('radar_query_last',{})||{};
+      const {order,rated}=radarPrioritize(list,fichas,Date.now(),last);
+      out.xianyu=order;
+      last[order[0]]=Date.now();
+      saveSetting('radar_query_last',last);
+      console.log(`Radar: busca primero «${order[0]}» (puntuación ${rated.find(r=>r.q===order[0]).score.toFixed(2)}; siguientes: ${order.slice(1,4).join(' · ')}).`);
+    }
+  }catch(e){console.warn('Radar: prioridad por hoja no disponible:',e.message);}
   // PORTADA DE BOLSOS (regla de Nil, 11-11-2026): cada XIANYU_PORTADA_EVERY (3) pasadas del radar, la búsqueda de
   // Xianyu es una genérica de bolsos de marca (más nuevos primero; el filtro de 24 h y el de vendedor fiable ya
   // aplican a todo). Sustituye a una de las búsquedas de la rotación: no añade peticiones.
