@@ -299,69 +299,30 @@ const pageStep=async(tabId,args,func)=>{
   catch(e){console.log('[LH] pageStep falló en',lhCrumb,e?.message);return undefined;}
 };
 async function xianyuClick(tabId,text){
-  const where=await pageStep(tabId,[text],t=>{
-    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
-    if(!el)return null;
-    const b=el.getBoundingClientRect();
-    const x=b.left+b.width*(0.3+Math.random()*0.4),y=b.top+b.height*(0.3+Math.random()*0.4);
-    const pt={bubbles:true,cancelable:true,view:window,clientX:x,clientY:y};
-    el.dispatchEvent(new MouseEvent('mouseover',pt));el.dispatchEvent(new MouseEvent('mouseenter',pt));el.dispatchEvent(new MouseEvent('mousemove',pt));
-    return {x,y};});
-  if(!where)return false;
-  await sleep(400+Math.random()*400);
-  await pageStep(tabId,[text,where.x,where.y,'down'],(t,x,y,ph)=>{
-    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
-    if(el)el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,button:0,buttons:1}));});
-  await sleep(50+Math.random()*100);
-  return !!(await pageStep(tabId,[text,where.x,where.y],(t,x,y)=>{
-    const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
-    if(!el)return false;
-    el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,button:0}));
-    el.click();return true;}));
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[text],func:t=>{
+      const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
+      if(!el)return false;el.click();return true;}});
+    return !!r?.result;
+  }catch{return false;}
 }
 async function xianyuPrice(tabId,min,max){
-  const ready=await pageStep(tabId,[],()=>{
-    const box=document.querySelector('div[class*="search-price-input-container"]');
-    return !!box&&box.querySelectorAll('input').length>=2&&!!(box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]'));});
-  if(!ready)return false;
-  // Escribe cifra a cifra (100-250 ms entre cifras) con el mismo evento «input» que una pulsación real.
-  const typeInto=async(idx,value)=>{
-    await pageStep(tabId,[idx],i=>{
-      const el=document.querySelector('div[class*="search-price-input-container"]').querySelectorAll('input')[i];
-      el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,'');el.dispatchEvent(new Event('input',{bubbles:true}));});
-    await sleep(200+Math.random()*300);
-    let cur='';
-    for(const ch of String(value)){
-      cur+=ch;
-      await pageStep(tabId,[idx,ch,cur],(i,c,v)=>{
-        const el=document.querySelector('div[class*="search-price-input-container"]').querySelectorAll('input')[i];
-        const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
-        el.dispatchEvent(new KeyboardEvent('keydown',{key:c,bubbles:true}));
-        d.set.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));
-        el.dispatchEvent(new KeyboardEvent('keyup',{key:c,bubbles:true}));});
-      await sleep(100+Math.random()*150);
-    }
-    await pageStep(tabId,[idx],i=>{document.querySelector('div[class*="search-price-input-container"]').querySelectorAll('input')[i].dispatchEvent(new Event('change',{bubbles:true}));});
-    await sleep(500+Math.random()*500);
-  };
-  if(min)await typeInto(0,min);
-  if(max)await typeInto(1,max);
-  // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
-  await pageStep(tabId,[],()=>{
-    const box=document.querySelector('div[class*="search-price-input-container"]');
-    const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
-    const bb=btn.getBoundingClientRect();
-    btn.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2}));});
-  await sleep(300+Math.random()*300);
-  return !!(await pageStep(tabId,[],()=>{
-    const box=document.querySelector('div[class*="search-price-input-container"]');
-    const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
-    if(!btn)return false;
-    const bb=btn.getBoundingClientRect();
-    const pt={bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2};
-    btn.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));
-    btn.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
-    btn.click();return true;}));
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[min,max],func:(lo,hi)=>{
+      const box=document.querySelector('div[class*="search-price-input-container"]');
+      if(!box)return false;
+      const inputs=[...box.querySelectorAll('input')];
+      if(inputs.length<2)return false;
+      const set=(el,v)=>{el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,String(v));el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
+      if(lo)set(inputs[0],lo);
+      if(hi)set(inputs[1],hi);
+      // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
+      const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
+      if(!btn)return false;
+      btn.click();
+      return true;}});
+    return !!r?.result;
+  }catch{return false;}
 }
 async function handleXianyu(job,token){
   let opened;
@@ -369,22 +330,11 @@ async function handleXianyu(job,token){
   try{
     crumb('hook');
     await hookXianyu();
-    // Navegación variada: ~1 de cada 3 veces entra primero por la portada, mira un momento y luego busca (como una persona),
-    // en vez de ir siempre directo a la URL de la búsqueda.
-    const viaHome=Math.random()<0.33;
     crumb('abrir ventana');
-    opened=await openHidden(viaHome?'https://www.goofish.com/':job.url);
+    opened=await openHidden(job.url);
     const tabId=opened.tabId;
     crumb('esperar carga');
     await waitLoaded(tabId);
-    if(viaHome){
-      crumb('portada');
-      await sleep(2500+Math.random()*4500);
-      await xianyuLinger(tabId);
-      await chrome.tabs.update(tabId,{url:job.url});
-      await sleep(800);
-      await waitLoaded(tabId);
-    }
     crumb('esperar resultados');
     let list=await xianyuWaitNew(tabId,0,40_000);
     let tab=await chrome.tabs.get(tabId).catch(()=>null);
@@ -423,7 +373,6 @@ async function handleXianyu(job,token){
     crumb('final');
     const risky=xianyuRiskText(text)||await xianyuOverlay(tabId);
     const hard=risky&&await xianyuHardBlock(tabId);
-    if(!risky)await xianyuLinger(tabId);
     await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced,hard})});
     if(risky&&!hard){
       await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
