@@ -89,8 +89,9 @@ export function rankLaunches(items,opts={}){
 
 // Pausa antes de la siguiente salida: entre minSec y maxSec, y de vez en cuando (breakProb) un descanso largo
 // de breakMinMin–breakMaxMin minutos, como haría una persona. rand() en [0,1).
-export function launchSpacingMs({minSec=270,maxSec=510,breakProb=0.15,breakMinMin=8,breakMaxMin=18,rand=Math.random}={}){
-  let ms=(minSec+rand()*(maxSec-minSec))*1000;
+// scale (ritmo autorregulado) solo alarga o acorta la pausa normal; el descanso largo no se multiplica.
+export function launchSpacingMs({minSec=270,maxSec=510,breakProb=0.15,breakMinMin=8,breakMaxMin=18,scale=1,rand=Math.random}={}){
+  let ms=(minSec+rand()*(maxSec-minSec))*1000/Math.max(0.2,scale);
   if(rand()<breakProb)ms+=(breakMinMin+rand()*(breakMaxMin-breakMinMin))*60000;
   return Math.round(ms);
 }

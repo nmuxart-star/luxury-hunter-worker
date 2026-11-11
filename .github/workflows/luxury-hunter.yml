@@ -96,7 +96,7 @@ jobs:
       XIANYU_CLOUD_DAYS: ${{ vars.XIANYU_CLOUD_DAYS || 'sat,sun' }}
       XIANYU_SWITCH_HOURS: ${{ vars.XIANYU_SWITCH_HOURS || '2' }}
       # Ritmo que se autorregula: empieza a medias y sube con las búsquedas buenas; baja con cada verificación.
-      XIANYU_RATE_START: ${{ vars.XIANYU_RATE_START || '0.5' }}
+      XIANYU_RATE_START: ${{ vars.XIANYU_RATE_START || '0.8' }}
       XIANYU_RATE_MIN: ${{ vars.XIANYU_RATE_MIN || '0.25' }}
       XIANYU_RATE_MAX: ${{ vars.XIANYU_RATE_MAX || '1.5' }}
       XIANYU_MAC_SHARE: ${{ vars.XIANYU_MAC_SHARE || '50' }}
@@ -105,7 +105,7 @@ jobs:
       XIANYU_MAX_PER_HOUR: ${{ vars.XIANYU_MAX_PER_HOUR || '10' }}
       XIANYU_MAC_GAP_SEC: ${{ vars.XIANYU_MAC_GAP_SEC || '300' }}
       XIANYU_GAP_SEC: ${{ vars.XIANYU_GAP_SEC || '300' }}
-      RUN_GAP_MINUTES: ${{ vars.RUN_GAP_MINUTES || '30' }}
+      RUN_GAP_MINUTES: ${{ vars.RUN_GAP_MINUTES || '10' }}
       # Salidas repartidas: entre una tarea y la siguiente 4,5-8,5 min y, a veces, un descanso largo.
       LAUNCH_GAP_MIN_SEC: ${{ vars.LAUNCH_GAP_MIN_SEC || '270' }}
       LAUNCH_GAP_MAX_SEC: ${{ vars.LAUNCH_GAP_MAX_SEC || '510' }}
@@ -199,6 +199,13 @@ jobs:
             exit 0
           fi
           echo "LH_STATE_RESTORED=1" >> "$GITHUB_ENV"
+
+      # Si GitHub falló al guardar el estado de la ejecución anterior, la copia del propio servidor es más reciente.
+      - name: Prefer the freshest saved state
+        shell: bash
+        run: |
+          mkdir -p data
+          node scripts/pick-state-db.mjs "$HOME/.lh-state/luxury-hunter.sqlite3" data/luxury-hunter.sqlite3 data/luxury-hunter.sqlite3 || true
 
       # Pausa mínima entre ejecuciones (RUN_GAP_MINUTES), antes de abrir ningún navegador.
       - name: Pause between runs
@@ -318,6 +325,9 @@ jobs:
         run: |
           mkdir -p lh-upload
           cp data/luxury-hunter.sqlite3 lh-upload/
+          # Copia en el propio servidor, por si GitHub falla al guardar el artefacto.
+          mkdir -p "$HOME/.lh-state"
+          cp data/luxury-hunter.sqlite3 "$HOME/.lh-state/luxury-hunter.sqlite3.tmp" && mv -f "$HOME/.lh-state/luxury-hunter.sqlite3.tmp" "$HOME/.lh-state/luxury-hunter.sqlite3" || true
           # Si esta ejecución no renovó la sesión de Xianyu, conserva la anterior.
           if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
             cp .state/xianyu-state.enc lh-upload/
@@ -335,7 +345,24 @@ jobs:
           fi
 
       - name: Save persistent state
+        id: save_state
         if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxury-hunter-state
+          path: lh-upload/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
+
+      # GitHub a veces falla al crear el artefacto (caídas): un segundo intento tras una pausa.
+      - name: Wait before retrying the state upload
+        if: always() && steps.save_state.outcome == 'failure'
+        run: sleep 90
+
+      - name: Save persistent state (retry)
+        if: always() && steps.save_state.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: luxury-hunter-state
@@ -350,4 +377,10 @@ jobs:
         if: always() && vars.SELF_CHAIN == 'true' && steps.run_due_tasks.outputs.started == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run luxury-hunter.yml --ref "${GITHUB_REF_NAME}" -f auto_chain=true || echo "Could not chain next run"
+        run: |
+          for i in 1 2 3 4; do
+            gh workflow run luxury-hunter.yml --ref "${GITHUB_REF_NAME}" -f auto_chain=true && exit 0
+            echo "No se pudo encadenar (intento $i de 4); reintento..."
+            sleep $((i*30))
+          done
+          echo "No se pudo encadenar la siguiente ejecución; el vigilante la lanzará."

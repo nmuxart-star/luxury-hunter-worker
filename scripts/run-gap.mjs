@@ -1,14 +1,14 @@
 // Pausa obligatoria entre una ejecución del bot y la siguiente (regla de Nil, 11-11-2026,
 // para que Xianyu deje de pedir verificaciones). Se ejecuta ANTES de abrir ningún navegador,
 // así que durante la pausa no se hace ninguna visita a Goofish.
-// RUN_GAP_MINUTES (30 por defecto, 0 = sin pausa): minutos mínimos desde la última actividad
+// RUN_GAP_MINUTES (10 por defecto, 0 = sin pausa): minutos mínimos desde la última actividad
 // registrada del bot. Un lanzamiento manual que fuerza todo (workflow_dispatch sin auto_chain)
 // no espera: lo ha pedido Nil a propósito.
 import fs from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 
-const gapMin=Number(process.env.RUN_GAP_MINUTES??30);
+const gapMin=Number(process.env.RUN_GAP_MINUTES??10);
 const manual=process.env.GITHUB_EVENT_NAME==='workflow_dispatch'&&process.env.LH_AUTO_CHAIN!=='1';
 if(!(gapMin>0)){console.log('Pausa entre ejecuciones: desactivada.');process.exit(0);}
 if(manual){console.log('Pausa entre ejecuciones: lanzamiento manual, no se espera.');process.exit(0);}

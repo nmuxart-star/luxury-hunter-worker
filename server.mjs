@@ -1939,8 +1939,13 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
     }
     if(res.login)return {used:false,reason:res.where,login:true};
     return {used:true,res};
-  }catch(e){return {used:false,reason:`el Mac no respondió (${String(e.message||e).slice(0,80)})`};}
+  }catch(e){
+    // El Mac no contestó (ventana dormida, extensión parada...): 5 min sin insistir, para no gastar turnos ni esperar 150 s cada vez.
+    try{saveSetting('xianyu_mac_cool',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_COOL_MIN||5))*60e3,at:new Date().toISOString()});}catch{}
+    return {used:false,reason:`el Mac no respondió (${String(e.message||e).slice(0,80)})`};
+  }
 }
+const xianyuMacCoolLeftMs=()=>Math.max(0,(Number((getSetting('xianyu_mac_cool',null)||{}).until)||0)-Date.now());
 
 // ── Reparto Mac / nube (regla de Nil, 10-11-2026) ───────────────────────────
 // Con XIANYU_VIA_MAC=split, mientras el ordenador está encendido y conectado,
@@ -1989,13 +1994,35 @@ let xianyuCalendarNote='';
 async function xianyuCalendarRoute(){
   const token=xianyuMacToken();
   const macHold=xianyuMacHoldLeftMs()>0;
-  const macReady=!!token&&!macHold&&await macOneMapReady(token).catch(()=>false);
+  const macCool=xianyuMacCoolLeftMs()>0;
+  const macReady=!!token&&!macHold&&!macCool&&await macOneMapReady(token).catch(()=>false);
   const cloudBlocked=xianyuRiskPauseLeftMs()>0||
     !!(xianyuPausedReason&&Date.now()-xianyuPausedAt<=xianyuPauseLen)||
     !!xianyuDirectSessionBlock();
   const d=xianyuCalendarDecide({cloudDay:xianyuCloudDay(),macReady,macHold,cloudBlocked,last:getSetting('xianyu_ip_route',null)});
   xianyuCalendarNote=d.note||'';
   return d.route;
+}
+// ¿Se puede buscar ahora mismo? El lanzador lo consulta antes de sacar una tarea, para no gastar el turno de un modelo
+// cuando el Mac no está, hay una transición de IP, una parada o se ha llegado al tope por hora.
+async function xianyuAvailability(){
+  const hard=xianyuHardBlockLeftMs();
+  if(hard>0)return {ok:false,reason:'bloqueo de red («tráfico inusual»)',waitMin:Math.ceil(hard/60e3),hard:true};
+  if(xianyuMacMode()==='calendar'){
+    const route=await xianyuCalendarRoute();
+    if(route==='none'||route==='wait'){
+      const left=route==='wait'?xianyuMacHoldLeftMs():xianyuMacCoolLeftMs();
+      return {ok:false,reason:xianyuCalendarNote||'sin vía de búsqueda disponible',waitMin:Math.max(1,Math.min(10,Math.ceil((left||5*60e3)/60e3)))};
+    }
+  }
+  const base=Number(process.env.XIANYU_MAX_PER_HOUR??10);
+  const cap=base>0?Math.max(2,Math.round(base*xianyuRateLevel())):0;
+  const recent=xianyuSearchesLastHour();
+  if(cap>0&&recent.length>=cap){
+    const oldest=Math.min(...recent);
+    return {ok:false,reason:`tope de ${cap} búsquedas por hora`,waitMin:Math.max(1,Math.ceil((oldest+3600e3-Date.now())/60e3))};
+  }
+  return {ok:true};
 }
 // Apunta desde qué IP se ha tocado Xianyu por última vez (Mac o nube).
 function xianyuNoteIp(route){try{saveSetting('xianyu_ip_route',{route,at:Date.now()});}catch{}}
@@ -2007,7 +2034,7 @@ function xianyuNoteIp(route){try{saveSetting('xianyu_ip_route',{route,at:Date.no
 // con las búsquedas de esa hora, para saber de verdad cuál es el límite.
 const XIANYU_RATE_MIN=Number(process.env.XIANYU_RATE_MIN||0.25);
 const XIANYU_RATE_MAX=Number(process.env.XIANYU_RATE_MAX||1.5);
-const XIANYU_RATE_START=Number(process.env.XIANYU_RATE_START||0.5);
+const XIANYU_RATE_START=Number(process.env.XIANYU_RATE_START||0.8);
 const XIANYU_RATE_UP_EVERY=Math.max(5,Number(process.env.XIANYU_RATE_UP_EVERY||40));
 function xianyuRateState(){
   let st=getSetting('xianyu_rate',null);
@@ -8536,8 +8563,14 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
     );
 
     db.prepare('UPDATE task_runs SET session_id=?,status=?,source_status_json=?,finished_at=? WHERE id=?').run(result.sessionId,'finished',JSON.stringify({...result.status,email:emailResult}),finished,Number(runId));
+    // Si Xianyu era la única plataforma y no llegó a buscar (Mac sin responder, espera, tope por hora...), el modelo no cuenta
+    // como revisado: seguirá tocándole en la siguiente salida en vez de esperar todo su intervalo.
+    const xs=result.status?.xianyu;
+    const notSearched=ACTIVE_SOURCES.length===1&&ACTIVE_SOURCES[0]==='xianyu'&&xs&&(xs.state==='paused'||xs.state==='throttled');
+    if(notSearched)console.log(`Task ${taskId}: Xianyu no llegó a buscar (${xs.state}); el modelo no cuenta como revisado.`);
     // El carril rápido no cuenta como la revisión completa del modelo.
-    if(!fast)db.prepare('UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?').run(finished,finished,taskId);
+    if(notSearched){/* sin cambios */}
+    else if(!fast)db.prepare('UPDATE tasks SET last_run_at=?,updated_at=? WHERE id=?').run(finished,finished,taskId);
     else{const key=fast==='auction'?'auction_lane_last':'fast_lane_last';const m=getSetting(key,{})||{};m[taskId]=finished;saveSetting(key,m);}
     return {runId,sessionId:result.sessionId,count:finalItems.length,status:result.status,email:emailResult,fast};
   }catch(e){
@@ -10235,7 +10268,8 @@ const server=http.createServer(async(req,res)=>{
     }
     if(u.pathname==='/api/xianyu/status'&&req.method==='GET'){
       const st=xianyuRateState();
-      return json(res,200,{hard_block_min:Math.ceil(xianyuHardBlockLeftMs()/60e3),risk_pause_min:Math.ceil(xianyuRiskPauseLeftMs()/60e3),
+      const av=await xianyuAvailability().catch(e=>({ok:true,error:String(e.message||e)}));
+      return json(res,200,{available:!!av.ok,unavailable_reason:av.reason||null,wait_min:av.waitMin||0,last_search_ago_sec:xianyuLastSearchAt()?Math.round((Date.now()-xianyuLastSearchAt())/1000):null,hard_block_min:Math.ceil(xianyuHardBlockLeftMs()/60e3),risk_pause_min:Math.ceil(xianyuRiskPauseLeftMs()/60e3),
         rate:xianyuRateLevel(),rate_events:(st.events||[]).slice(-10),ip_route:getSetting('xianyu_ip_route',null),yield_factor:taskYieldFactors()});
     }
     const tr=u.pathname.match(/^\/api\/tasks\/(\d+)\/run$/);

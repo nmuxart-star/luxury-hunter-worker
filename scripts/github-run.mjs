@@ -131,8 +131,12 @@ let nextLaunchAt=0;
 let hardBlockedMin=0;
 function launchGate(fn){
   const turn=gateTail.then(async()=>{
-    const wait=nextLaunchAt-Date.now();
-    if(wait>0)await sleep(wait);
+    // Se vuelve a mirar cada 2 s: si una tarea anterior acaba sin haber buscado, la pausa se acorta sobre la marcha.
+    for(;;){
+      const wait=nextLaunchAt-Date.now();
+      if(wait<=0)break;
+      await sleep(Math.min(wait,2000));
+    }
     return fn();
   });
   gateTail=turn.catch(()=>{});
@@ -140,9 +144,26 @@ function launchGate(fn){
 }
 // Ritmo que se autorregula (server.mjs): con nivel 0.5 las salidas van el doble de espaciadas; con 1.5, un tercio menos.
 let rateLevel=1;
-const afterLaunch=()=>{nextLaunchAt=Date.now()+Math.round(launchSpacingMs({minSec:LAUNCH_GAP_MIN_SEC,maxSec:LAUNCH_GAP_MAX_SEC,breakProb:LAUNCH_BREAK_PROB})/Math.max(0.2,rateLevel));};
+const afterLaunch=()=>{nextLaunchAt=Date.now()+launchSpacingMs({minSec:LAUNCH_GAP_MIN_SEC,maxSec:LAUNCH_GAP_MAX_SEC,breakProb:LAUNCH_BREAK_PROB,scale:rateLevel});};
+let xianyuStatus={};
+let firstStatus=true;
 // Estado de Xianyu según el servidor: minutos de parada, ritmo y factor de rendimiento de cada modelo.
 let yieldFactor={};
+// Espera (como mucho maxMin) a que se pueda buscar: Mac conectado, transición de IP terminada, por debajo del tope por hora.
+// Devuelve 'ok' | 'blocked' (bloqueo de red) | 'unavailable'. Mientras espera no se gasta ningún turno.
+async function awaitAvailable(maxMin){
+  const until=Date.now()+maxMin*60e3;
+  let said=false;
+  while(true){
+    const blocked=await xianyuBlockMinutes();
+    if(blocked>0)return 'blocked';
+    if(xianyuStatus.available!==false)return 'ok';
+    const waitMin=Math.max(1,Math.min(5,Number(xianyuStatus.wait_min)||2));
+    if(Date.now()+waitMin*60e3>until)return 'unavailable';
+    if(!said){console.log(`Xianyu no disponible ahora (${xianyuStatus.unavailable_reason||'espera'}); espero sin gastar turnos.`);said=true;}
+    await sleep(waitMin*60e3);
+  }
+}
 // Rotación por rendimiento: el modelo que trae más anuncios nuevos tiene un intervalo más corto (hasta la mitad) y el que
 // casi nunca trae nada, más largo (hasta el doble). El Radar tiene su propio intervalo y no se ajusta.
 function adjustTasks(list){
@@ -155,8 +176,17 @@ function adjustTasks(list){
 async function xianyuBlockMinutes(){
   try{
     const st=await api('GET','/api/xianyu/status');
+    xianyuStatus=st;
     if(Number.isFinite(Number(st.rate))&&Number(st.rate)>0)rateLevel=Number(st.rate);
     yieldFactor=st.yield_factor||{};
+    // La primera salida de una ejecución cuenta desde la última búsqueda real (aunque fuera de la ejecución anterior).
+    if(firstStatus){
+      firstStatus=false;
+      if(Number.isFinite(Number(st.last_search_ago_sec))){
+        const base=LAUNCH_GAP_MIN_SEC*1000/Math.max(0.2,rateLevel);
+        nextLaunchAt=Math.max(nextLaunchAt,Date.now()+Math.max(0,base-Number(st.last_search_ago_sec)*1000));
+      }
+    }
     return Number(st.hard_block_min)||0;
   }catch{return 0;}
 }
@@ -253,6 +283,7 @@ try{
     }
     const estimate=taskMinutesEstimate();
     let launched=0;
+    let stopLaunching=false;
     const taskResults=[];
     hardBlockedMin=await xianyuBlockMinutes();
     if(hardBlockedMin>0)console.log(`Xianyu parado por un bloqueo de red: quedan ${hardBlockedMin} min. No se lanza ninguna búsqueda.`);
@@ -277,10 +308,13 @@ try{
       const task=item.task,fast=item.mode==='fast';
       try{
         const q=await launchGate(async()=>{
-          if(hardBlockedMin>0)return null;
+          if(hardBlockedMin>0||stopLaunching)return null;
           if(RUN_BUDGET_MINUTES&&launched>0&&elapsedMinutes()+estimate(task.id)>RUN_BUDGET_MINUTES)return null;
-          hardBlockedMin=await xianyuBlockMinutes();
-          if(hardBlockedMin>0){console.log(`Xianyu se ha bloqueado (quedan ${hardBlockedMin} min): no salen más tareas.`);return null;}
+          // Antes de gastar el turno de un modelo, comprobar que Xianyu puede buscar (Mac conectado, sin transición de IP,
+          // sin tope por hora). Si no, se espera sin gastar nada; si no se arregla, la ejecución acaba y reintenta luego.
+          const av=await awaitAvailable(RUN_BUDGET_MINUTES?Math.max(2,Math.min(30,RUN_BUDGET_MINUTES-elapsedMinutes())):30);
+          if(av==='blocked'){hardBlockedMin=Number(xianyuStatus.hard_block_min)||1;console.log(`Xianyu se ha bloqueado (quedan ${hardBlockedMin} min): no salen más tareas.`);return null;}
+          if(av==='unavailable'){stopLaunching=true;console.log(`Xianyu sigue sin poder buscar (${xianyuStatus.unavailable_reason||'espera'}): no salen más tareas en esta ejecución; ningún modelo se da por revisado.`);return null;}
           const r=await api('POST',`/api/tasks/${task.id}/run`,fast?{fast:true}:{});
           if(r.skipped)return null;
           launched++;
@@ -291,6 +325,11 @@ try{
         if(!q)return;
         console.log(fast?`\n=== RÁPIDO ${task.task_name} (${FAST_LABEL}) ===`:`\n=== RUN ${task.task_name} ===`);
         const run=await waitRun(q.runId);
+        // Si Xianyu no llegó a buscar, no hay que esperar la pausa de una búsqueda que no ocurrió.
+        try{
+          const xs=JSON.parse(run.source_status_json||'{}').xianyu;
+          if(xs&&(xs.state==='paused'||xs.state==='throttled'))nextLaunchAt=Math.min(nextLaunchAt,Date.now()+3000);
+        }catch{}
         if(fast)console.log(`DONE rápido ${task.task_name}: ${run.status}`);
         else{
           taskResults.push({task_id:task.id,task_name:task.task_name,status:run.status,run_id:q.runId});
@@ -331,6 +370,10 @@ try{
 
     if(hardBlockedMin>0){
       console.log('Xianyu parado por bloqueo de red: la ejecución termina; la siguiente espera a que acabe la parada.');
+      break;
+    }
+    if(stopLaunching){
+      console.log('Xianyu no ha podido buscar en esta ejecución; termina y se reintenta en la siguiente (los modelos siguen pendientes).');
       break;
     }
     const cycleMinutes=(Date.now()-cycleStartedAt)/60000;
