@@ -1689,7 +1689,7 @@ function xianyuLastSearchAt(){
   const row=db.prepare("SELECT value_json FROM app_settings WHERE key='xianyu_last_search'").get();
   return Number(row?.value_json||0)||0;
 }
-// Tope de búsquedas de Xianyu por hora (Mac y nube juntos): XIANYU_MAX_PER_HOUR (30 por defecto, 0 = sin tope).
+// Tope de búsquedas de Xianyu por hora (Mac y nube juntos): XIANYU_MAX_PER_HOUR (20 por defecto, 0 = sin tope).
 function xianyuSearchesLastHour(){
   const a=getSetting('xianyu_search_log',[]);
   const since=Date.now()-3600e3;
@@ -1934,7 +1934,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     return {ok:true,state:'throttled',perQuery:[],kept:0};
   }
   {
-    const cap=Number(process.env.XIANYU_MAX_PER_HOUR??30);
+    const cap=Number(process.env.XIANYU_MAX_PER_HOUR??20);
     if(cap>0&&xianyuSearchesLastHour().length>=cap){
       console.log(`Xianyu: tope de ${cap} búsquedas por hora alcanzado; se espera para proteger la cuenta.`);
       return {ok:true,state:'throttled',perQuery:[],kept:0};
@@ -1946,7 +1946,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
   // búsquedas salían en ráfaga; era lo que disparaba la verificación.
   const macPeek=!cloudOnly&&xianyuMacMode()!=='off'&&xianyuMacToken()&&xianyuMacHoldLeftMs()===0&&await macOneMapReady(xianyuMacToken()).catch(()=>false);
   {
-    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||90:process.env.XIANYU_GAP_SEC||150))*1e3;
+    const gap=Math.max(5,Number(macPeek?process.env.XIANYU_MAC_GAP_SEC||120:process.env.XIANYU_GAP_SEC||150))*1e3;
     const jitter=gap*0.4*(Math.random()*2-1);
     const wait=xianyuLastSearchAt()+gap+jitter-Date.now();
     if(wait>0)await sleep(Math.min(wait,gap*1.4));
