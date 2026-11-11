@@ -58,13 +58,15 @@ async function handleCaptcha(tabId,stillBlocked=tab=>BOT_CHECK.test(tab.title||'
   captchaWaiting=true;
   notifyCaptcha(site);
   await showJobWindow();
-  const until=Date.now()+20*60_000;let lastNote=Date.now();
+  const until=Date.now()+20*60_000;let lastNote=Date.now();let clearStreak=0;
   try{
     while(Date.now()<until){
       await sleep(3000);
       const tab=await chrome.tabs.get(tabId).catch(()=>null);
       if(!tab)break;
-      if(!(await stillBlocked(tab))&&tab.status==='complete'){
+      const blockedNow=await stillBlocked(tab);
+      clearStreak=blockedNow?0:clearStreak+1;
+      if(clearStreak>=2&&tab.status==='complete'){
         await chrome.notifications.clear(NOTE_ID).catch(()=>{});
         break;
       }
@@ -234,8 +236,11 @@ const xianyuRiskText=t=>XIANYU_RISK_JSON.test(String(t||'').slice(0,3000));
 async function xianyuOverlay(tabId){
   try{
     const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>{
-      const el=document.querySelector('div.baxia-dialog-mask,[class*="baxia-dialog"]');
-      return !!(el&&el.offsetParent!==null);}});
+      // offsetParent vale null en elementos de posición fija (la ventana de verificación lo es):
+      // se mira si ocupa espacio y no está oculta.
+      const vis=el=>{if(!el)return false;const st=getComputedStyle(el);
+        return el.getClientRects().length>0&&st.display!=='none'&&st.visibility!=='hidden'&&Number(st.opacity)!==0;};
+      return [...document.querySelectorAll('div.baxia-dialog-mask,[class*="baxia-dialog"],iframe[src*="punish"],iframe[src*="captcha"]')].some(vis);}});
     return !!r?.result;
   }catch{return false;}
 }
