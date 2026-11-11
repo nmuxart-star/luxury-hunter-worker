@@ -45,10 +45,10 @@ const isBotCheck=r=>BOT_CHECK.test(String(r?.title||'')+' '+String(r?.body||'').
 // minimizar. Mientras tanto no se hace ninguna petición más.
 let captchaWaiting=false;
 const NOTE_ID='lh-onemap-captcha';
-const ICON='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR4nO3PQQ0AIBDAMMC/50MGL0JaBVu2zOwOHGsHrAVYC7AWYC3AWoC1AGsB1gKsBVgLsBZgLcBagLUAawHWAqwFWAuwFmAtwFqAtQ/6BQHqXl7IAAAAAElFTkSuQmCC';
+const ICON='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAcklEQVR42u3bMQEAIAwDwbjAFnKQgyj80BkL9IZfMt6erJnbuQAAAOAZzh5fBwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHQC8BwFAKBVBcObxuzn2EitAAAAAElFTkSuQmCC';
 function notifyCaptcha(site='One Map'){
   try{chrome.notifications.create(NOTE_ID,{type:'basic',iconUrl:ICON,title:`${site} pide verificación`,
-    message:site==='Xianyu'?'Pulsa aquí y resuelve el control de seguridad de Xianyu (deslizador). El bot espera.':'Pulsa aquí y resuelve «Confirme que es humano». El bot espera.',priority:2,requireInteraction:true});}catch{}
+    message:site==='Xianyu'?'Pulsa aquí y resuelve el control de seguridad de Xianyu (deslizador). El bot espera.':'Pulsa aquí y resuelve «Confirme que es humano». El bot espera.',priority:2,requireInteraction:true})?.catch?.(()=>{});}catch{}
 }
 async function showJobWindow(){
   if(jobWindow)await chrome.windows.update(jobWindow.id,{state:'normal',focused:true}).catch(()=>{});
