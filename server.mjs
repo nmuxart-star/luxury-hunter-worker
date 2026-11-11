@@ -17,7 +17,6 @@ import {descTokens,descIndex,descScore,refSheetDoubt} from './scripts/ref-retrie
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {macOneMapReady,macOneMapSnapshot,macXianyuSearch} from './scripts/onemap-mac-client.mjs';
-import { resolverDesafioEnNube } from './scripts/capsolver-bridge.mjs';
 // Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
 const VESTIAIRE_LIVE_REALIZATION=0.90;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1604,40 +1603,15 @@ function parseXianyuSearchJson(json){
 async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile=null}={}){
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
-  
-  // [CAPSOLVER] Escudo global anti-bloqueos
-  const resolverMuro = async (motivo) => {
-    console.log(`[Capsolver] Bloqueo detectado en: ${motivo}. Iniciando resolución...`);
-    const solucion = await resolverDesafioEnNube({ type: "AntiBaxiaTask", websiteURL: page.url() });
-    if (solucion) {
-      console.log('[Capsolver] Solución obtenida. Refrescando página...');
-      await page.reload({waitUntil: 'domcontentloaded'});
-      await sleep(3000);
-      const sigueBloqueada = XIANYU_RISK_RE.test(page.url()) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
-      if (!sigueBloqueada) {
-        console.log('[Capsolver] ¡Éxito! Cuenta liberada. Saltando al siguiente modelo de la cola...');
-        return true;
-      }
-      console.log('[Capsolver Error] La página sigue bloqueada tras aplicar la solución.');
-    } else {
-      console.log('[Capsolver Error] No se obtuvo solución válida de la API.');
-    }
-    return false;
-  };
-
   try{
     if(!x.warmed){
       await page.goto('https://www.goofish.com/',{waitUntil:'domcontentloaded',timeout:40000});
       await sleep(1500+Math.random()*1500);
-      if (XIANYU_RISK_RE.test(page.url()) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false)) {
-         if (!(await resolverMuro('carga inicial'))) return {risk: true};
-      }
       x.warmed=true;
     }
     
     let first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
     first.catch(()=>{});
-    
     await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
 
     let resp;
@@ -1645,10 +1619,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
       resp=await first;
     }catch{
       const where=`${page.url()} · "${(await page.title().catch(()=>''))||''}"`;
-      if(XIANYU_RISK_RE.test(page.url())) {
-         if (await resolverMuro('timeout de búsqueda')) return {risk: false, items: []};
-         return {risk:true};
-      }
+      if(XIANYU_RISK_RE.test(page.url()))return {risk:true};
       if(/login|passport/i.test(page.url()))return {login:true,where};
       return {noResponse:true,where};
     }
@@ -1656,10 +1627,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     let json=await resp.json().catch(()=>null);
 
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
-    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json)){
-       if (await resolverMuro('búsqueda principal')) return {risk: false, items: []};
-       return {risk:true};
-    }
+    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
     
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
@@ -1678,10 +1646,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         await page.getByText('最新',{exact:true}).first().click({timeout:6000});
         const j2=await (await next).json().catch(()=>null);
         if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
-        if(xianyuRiskIn(j2)){
-           if (await resolverMuro('ordenar por nuevos')) return {risk: false, items: []};
-           return {risk:true};
-        }
+        if(xianyuRiskIn(j2))return {risk:true};
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
@@ -1699,10 +1664,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
           await page.keyboard.press('Tab');
           const j3=await (await next).json().catch(()=>null);
           if(xianyuAuthIn(j3))return {login:true,where:'sesión caducada'};
-          if(xianyuRiskIn(j3)){
-             if (await resolverMuro('filtrar precio')) return {risk: false, items: []};
-             return {risk:true};
-          }
+          if(xianyuRiskIn(j3))return {risk:true};
           if(j3?.data?.resultList){json=j3;priced=true;}
         }
       }catch{}
