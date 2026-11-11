@@ -1640,6 +1640,30 @@ function parseXianyuSearchJson(json){
   return out;
 }
 
+// Gestos humanos en la búsqueda desde el servidor (regla de Nil, 11-11-2026).
+async function xianyuHumanScroll(page){
+  try{
+    await page.mouse.move(300+Math.random()*500,250+Math.random()*250,{steps:8});
+    await page.mouse.wheel(0,300+Math.random()*400);
+    await sleep(600+Math.random()*500);
+    await page.mouse.wheel(0,-(100+Math.random()*200));
+    await sleep(400+Math.random()*300);
+  }catch{}
+}
+// Mueve el ratón encima, duda como quien lee y hace clic con retraso al soltar.
+async function xianyuHumanClick(locator){
+  await locator.hover({timeout:6000});
+  await sleep(400+Math.random()*400);
+  await locator.click({delay:50+Math.random()*100,timeout:6000});
+}
+// Escribe el número tecla a tecla (100-250 ms entre teclas) en vez de pegarlo de golpe.
+async function xianyuHumanType(locator,value){
+  await locator.focus();
+  await sleep(200+Math.random()*300);
+  await locator.fill('');
+  await locator.pressSequentially(String(value),{delay:100+Math.random()*150});
+  await sleep(500+Math.random()*500);
+}
 // ¿La página muestra el bloqueo de red por «tráfico inusual» (sin captcha que resolver)?
 async function xianyuPageHard(page){
   try{return xianyuHardText(await page.evaluate(()=>document.body?document.body.innerText.slice(0,3000):''));}catch{return false;}
@@ -1673,6 +1697,7 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
 
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
     if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true,hard:await xianyuPageHard(page)};
+    await xianyuHumanScroll(page);
     
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
@@ -1684,11 +1709,11 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
           else await page.keyboard.press('Escape');
           await sleep(600);
         }
-        await page.getByText('新发布',{exact:true}).first().click({timeout:6000});
+        await xianyuHumanClick(page.getByText('新发布',{exact:true}).first());
         await sleep(800+Math.random()*700);
         const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
         next.catch(()=>{}); 
-        await page.getByText('最新',{exact:true}).first().click({timeout:6000});
+        await xianyuHumanClick(page.getByText('最新',{exact:true}).first());
         const j2=await (await next).json().catch(()=>null);
         if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
         if(xianyuRiskIn(j2))return {risk:true,hard:await xianyuPageHard(page)};
@@ -1702,8 +1727,8 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         const box=page.locator('div[class*="search-price-input-container"]').first();
         if(await box.isVisible({timeout:3000}).catch(()=>false)){
           const inputs=box.getByPlaceholder('¥');
-          if(minCny){await inputs.nth(0).fill(String(minCny));await sleep(700+Math.random()*800);}
-          if(maxCny){await inputs.nth(1).fill(String(maxCny));await sleep(700+Math.random()*800);}
+          if(minCny)await xianyuHumanType(inputs.nth(0),minCny);
+          if(maxCny)await xianyuHumanType(inputs.nth(1),maxCny);
           const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
           next.catch(()=>{});
           await page.keyboard.press('Tab');

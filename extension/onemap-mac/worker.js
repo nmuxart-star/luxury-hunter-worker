@@ -283,27 +283,60 @@ async function xianyuWaitNew(tabId,have,ms){
   }
   return null;
 }
+// Gestos humanos (regla de Nil, 11-11-2026): el ratón pasa por encima, duda un momento y el clic tarda lo que tarda
+// un dedo en apretar y soltar; el precio se escribe cifra a cifra con pausas irregulares.
 async function xianyuClick(tabId,text){
   try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[text],func:t=>{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[text],func:async t=>{
+      const wait=ms=>new Promise(r=>setTimeout(r,ms));
       const el=[...document.querySelectorAll('div,span,a,li,button')].find(e=>e.children.length===0&&e.textContent.trim()===t);
-      if(!el)return false;el.click();return true;}});
+      if(!el)return false;
+      const b=el.getBoundingClientRect();
+      const pt={bubbles:true,cancelable:true,view:window,clientX:b.left+b.width*(0.3+Math.random()*0.4),clientY:b.top+b.height*(0.3+Math.random()*0.4)};
+      el.dispatchEvent(new MouseEvent('mouseover',pt));el.dispatchEvent(new MouseEvent('mouseenter',pt));el.dispatchEvent(new MouseEvent('mousemove',pt));
+      await wait(400+Math.random()*400);
+      el.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));
+      await wait(50+Math.random()*100);
+      el.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
+      el.click();
+      return true;}});
     return !!r?.result;
   }catch{return false;}
 }
 async function xianyuPrice(tabId,min,max){
   try{
-    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[min,max],func:(lo,hi)=>{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',args:[min,max],func:async(lo,hi)=>{
+      const wait=ms=>new Promise(r=>setTimeout(r,ms));
       const box=document.querySelector('div[class*="search-price-input-container"]');
       if(!box)return false;
       const inputs=[...box.querySelectorAll('input')];
       if(inputs.length<2)return false;
-      const set=(el,v)=>{el.focus();const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(el,String(v));el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
-      if(lo)set(inputs[0],lo);
-      if(hi)set(inputs[1],hi);
+      const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+      // Escribe cifra a cifra (100-250 ms entre cifras) con el mismo evento «input» que una pulsación real.
+      const type=async(el,v)=>{
+        el.focus();await wait(200+Math.random()*300);
+        d.set.call(el,'');el.dispatchEvent(new Event('input',{bubbles:true}));
+        let cur='';
+        for(const ch of String(v)){
+          cur+=ch;
+          el.dispatchEvent(new KeyboardEvent('keydown',{key:ch,bubbles:true}));
+          d.set.call(el,cur);el.dispatchEvent(new Event('input',{bubbles:true}));
+          el.dispatchEvent(new KeyboardEvent('keyup',{key:ch,bubbles:true}));
+          await wait(100+Math.random()*150);
+        }
+        el.dispatchEvent(new Event('change',{bubbles:true}));
+        await wait(500+Math.random()*500);
+      };
+      if(lo)await type(inputs[0],lo);
+      if(hi)await type(inputs[1],hi);
       // La web aplica el rango al pulsar su botón de confirmar (probado el 10-11-2026).
       const btn=box.querySelector('button')||document.querySelector('button[class*="search-price-confirm-button"]');
       if(!btn)return false;
+      const bb=btn.getBoundingClientRect();
+      const pt={bubbles:true,cancelable:true,view:window,clientX:bb.left+bb.width/2,clientY:bb.top+bb.height/2};
+      btn.dispatchEvent(new MouseEvent('mouseover',pt));await wait(300+Math.random()*300);
+      btn.dispatchEvent(new MouseEvent('mousedown',{...pt,button:0,buttons:1}));await wait(50+Math.random()*100);
+      btn.dispatchEvent(new MouseEvent('mouseup',{...pt,button:0}));
       btn.click();
       return true;}});
     return !!r?.result;
