@@ -1959,7 +1959,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     }
     if(!mac.used&&mac.reason!=='desactivado'&&!mac.cloud)console.log(`Xianyu: no se busca desde el Mac (${mac.reason}); se usa la cuenta desde el servidor.`);
     if(mac.used&&mac.res.macRisk){
-      const warning='Xianyu ha pedido una verificación en tu Chrome del Mac: te he avisado en el ordenador. No se usa el servidor mientras tanto.';
+      const warning='Xianyu ha pedido una verificación en tu Chrome del Mac: resuélvela tú en esa ventana (si no la ves, abre https://www.goofish.com/search?q=%E6%AC%A7%E7%B1%B3%E8%8C%83 en Chrome). Mientras tanto las búsquedas van por la nube.';
       perQuery.push({query:keyword,mac:true,macRisk:true});
       await reportHealthIssue('xianyu-mac-risk',warning).catch(()=>{});
       return {ok:true,state:'paused',warning,perQuery,kept};
