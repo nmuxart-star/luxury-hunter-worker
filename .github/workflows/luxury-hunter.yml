@@ -105,6 +105,7 @@ jobs:
       GLOBAL_EMAIL_TO: ${{ secrets.GLOBAL_EMAIL_TO }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_CHAT_ID_LUXE: ${{ vars.TELEGRAM_CHAT_ID_LUXE || '' }}
       XIANYU_MODE: ${{ vars.XIANYU_MODE }}
       FORCE_DIGEST: ${{ inputs.force_digest && '1' || '' }}
       LH_AUTO_CHAIN: ${{ inputs.auto_chain && '1' || '' }}

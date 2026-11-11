@@ -6095,6 +6095,11 @@ function alertRecipient(){
   ).trim();
 }
 
+// Segundo chat opcional (TELEGRAM_CHAT_ID_LUXE): recibe SOLO los anuncios que la IA ha dado por
+// interesantes (avisos instantáneos, subastas, sin referencias, triaje). El chat principal sigue
+// recibiendo todo, incluido el flujo completo de anuncios. Sin la variable, no cambia nada.
+const telegramLuxeChat=()=>String(process.env.TELEGRAM_CHAT_ID_LUXE||'').trim();
+const telegramIsNilChat=id=>{const v=String(id);return v===String(process.env.TELEGRAM_CHAT_ID)||(!!telegramLuxeChat()&&v===telegramLuxeChat());};
 function telegramConfigured(){
   return !!(process.env.TELEGRAM_BOT_TOKEN&&process.env.TELEGRAM_CHAT_ID);
 }
@@ -6112,9 +6117,9 @@ async function telegramApi(method,body={},timeoutMs=20000){
   return data;
 }
 
-async function telegramSend(text,photoUrl=null,{buttons=null,previewUrl=null,noPreview=false}={}){
+async function telegramSend(text,photoUrl=null,{buttons=null,previewUrl=null,noPreview=false,chat=null}={}){
   if(!telegramConfigured())return {sent:false,reason:'telegram-not-configured'};
-  const chat_id=process.env.TELEGRAM_CHAT_ID;
+  const chat_id=chat||process.env.TELEGRAM_CHAT_ID;
   const extra=buttons?{reply_markup:{inline_keyboard:buttons}}:{};
   if(photoUrl&&text.length<=1024){
     try{
@@ -6182,8 +6187,8 @@ function listingTelegramImages(x,max=4){
 
 // Álbum de fotos (hasta 10). Si Telegram no puede descargar alguna URL
 // (protección de la web), se descargan aquí y se suben.
-async function telegramSendAlbum(images,caption=''){
-  const chat_id=process.env.TELEGRAM_CHAT_ID;
+async function telegramSendAlbum(images,caption='',chat=null){
+  const chat_id=chat||process.env.TELEGRAM_CHAT_ID;
   const list=(images||[]).slice(0,10);
   if(!list.length)return {sent:false};
   if(list.length===1){
@@ -6222,19 +6227,26 @@ async function telegramSendAlbum(images,caption=''){
 
 // Aviso con fotos: álbum con el texto + mensaje corto con los botones
 // (Telegram no permite botones en un álbum).
-async function telegramSendListing(text,x){
-  if(!telegramConfigured())return {sent:false};
+async function telegramSendListingTo(text,x,chat=null){
   const images=listingTelegramImages(x,4);
   let album={sent:false};
   // Telegram pliega los pies de foto largos: las fotos llevan solo el
   // titular y el aviso completo va justo después, entero y con los botones.
   const caption=text.split('\n').slice(0,4).join('\n').slice(0,1000);
   if(images.length){
-    album=await telegramSendAlbum(images,caption).catch(()=>({sent:false}));
+    album=await telegramSendAlbum(images,caption,chat).catch(()=>({sent:false}));
   }
-  if(album.sent)await telegramSend(text,null,{buttons:alertButtons(x.id),noPreview:true});
-  else await telegramSend(text,null,{buttons:alertButtons(x.id),previewUrl:x.url||null});
+  if(album.sent)await telegramSend(text,null,{buttons:alertButtons(x.id),noPreview:true,chat});
+  else await telegramSend(text,null,{buttons:alertButtons(x.id),previewUrl:x.url||null,chat});
   return {sent:true};
+}
+async function telegramSendListing(text,x){
+  if(!telegramConfigured())return {sent:false};
+  const r=await telegramSendListingTo(text,x,null);
+  const luxe=telegramLuxeChat();
+  // Un fallo en el chat Luxe nunca debe afectar al chat principal.
+  if(luxe)await telegramSendListingTo(text,x,luxe).catch(e=>console.error('Telegram Luxe:',e.message));
+  return r;
 }
 
 function listingFeedback(listingId){
@@ -6700,7 +6712,7 @@ async function pollTelegramUpdates(){
       const cq=u.callback_query;
       if(!cq)continue;
       // Solo el chat de Nil puede valorar anuncios.
-      if(String(cq.message?.chat?.id||cq.from?.id)!==String(process.env.TELEGRAM_CHAT_ID))continue;
+      if(!telegramIsNilChat(cq.message?.chat?.id||cq.from?.id))continue;
       const m=String(cq.data||'').match(/^(ok|no):(\d+)$/);
       if(!m){await telegramApi('answerCallbackQuery',{callback_query_id:cq.id}).catch(()=>{});continue;}
       const action=m[1]==='ok'?'interested':'not_interested';
