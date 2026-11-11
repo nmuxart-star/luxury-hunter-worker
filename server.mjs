@@ -1473,8 +1473,14 @@ let xianyuPauseLen=XIANYU_PAUSE_MS;
 // La pausa tras una verificación tiene que sobrevivir a la ejecución: en la
 // nube cada ejecución es un proceso nuevo y, sin guardarla, el bot volvía a
 // llamar a la puerta de la cuenta marcada unas 9 veces por hora.
+// XIANYU_RISK_PAUSE_IGNORE_BEFORE="AAAA-MM-DDTHH:MM:SSZ" → ignora las pausas empezadas
+// antes de esa fecha (para quitar una pausa a mano). Una verificación nueva vuelve a pausar.
 function xianyuRiskPauseLeftMs(){
-  const until=Number((getSetting('xianyu_risk_pause',null)||{}).until)||0;
+  const st=getSetting('xianyu_risk_pause',null)||{};
+  const ignoreBefore=Date.parse(String(process.env.XIANYU_RISK_PAUSE_IGNORE_BEFORE||'').trim());
+  const startedAt=Date.parse(st.at||'');
+  if(Number.isFinite(ignoreBefore)&&Number.isFinite(startedAt)&&startedAt<=ignoreBefore)return 0;
+  const until=Number(st.until)||0;
   return Math.max(0,until-Date.now());
 }
 // Si la verificación vuelve poco después de acabar la pausa anterior, la cuenta
