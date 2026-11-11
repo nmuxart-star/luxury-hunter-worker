@@ -64,7 +64,7 @@ async function handleCaptcha(tabId,stillBlocked=tab=>BOT_CHECK.test(tab.title||'
       await sleep(3000);
       const tab=await chrome.tabs.get(tabId).catch(()=>null);
       if(!tab)break;
-      if(!stillBlocked(tab)&&tab.status==='complete'){
+      if(!(await stillBlocked(tab))&&tab.status==='complete'){
         await chrome.notifications.clear(NOTE_ID).catch(()=>{});
         break;
       }
@@ -226,6 +226,22 @@ async function hookXianyu(){
   try{await chrome.scripting.registerContentScripts([{id:'lh-xianyu-hook',matches:['https://www.goofish.com/*'],js:['xianyu-hook.js'],world:'MAIN',runAt:'document_start',persistAcrossSessions:true}]);}
   catch(e){console.warn('Luxury Hunter Xianyu: no se pudo registrar el script',e.message);}
 }
+// Goofish puede pedir la verificación SIN cambiar de dirección: la API de búsqueda
+// contesta con RGV587/USER_VALIDATE y la ventana de «baxia» sale encima de la página.
+// En ese caso la ventana de trabajo (minimizada) hay que traerla al frente.
+const XIANYU_RISK_JSON=/RGV587|FAIL_SYS_USER_VALIDATE|FAIL_SYS_ILLEGAL_ACCESS/;
+const xianyuRiskText=t=>XIANYU_RISK_JSON.test(String(t||'').slice(0,3000));
+async function xianyuOverlay(tabId){
+  try{
+    const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>{
+      const el=document.querySelector('div.baxia-dialog-mask,[class*="baxia-dialog"]');
+      return !!(el&&el.offsetParent!==null);}});
+    return !!r?.result;
+  }catch{return false;}
+}
+async function xianyuStillBlocked(tabId,tab){
+  return GOOFISH_BLOCK.test(tab?.url||'')||await xianyuOverlay(tabId);
+}
 async function xianyuResponses(tabId){
   try{
     const [r]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>(window.__lhXY||[]).map(x=>x.text)});
@@ -287,6 +303,11 @@ async function handleXianyu(job,token){
       return;
     }
     let text=list[list.length-1],sorted=false,priced=false;
+    if(xianyuRiskText(text)){
+      await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced})});
+      await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
+      return;
+    }
     // Más nuevos primero.
     await sleep(900+Math.random()*900);
     if(await xianyuClick(tabId,'新发布')){
@@ -303,6 +324,9 @@ async function handleXianyu(job,token){
     }
     tab=await chrome.tabs.get(tabId).catch(()=>null);
     await reply({status:200,finalUrl:tab?.url||job.url,title:tab?.title||'',body:JSON.stringify({text,sorted,priced})});
+    if(xianyuRiskText(text)||await xianyuOverlay(tabId)){
+      await handleCaptcha(tabId,t=>xianyuStillBlocked(tabId,t),'Xianyu');
+    }
   }catch(error){
     await reply({status:502,body:JSON.stringify({error:String(error?.message||error)})}).catch(()=>{});
   }finally{
