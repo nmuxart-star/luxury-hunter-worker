@@ -1855,7 +1855,7 @@ async function xianyuTryMac(keyword,{minCny,maxCny}){
   try{
     const res=xianyuMacResultToSearch(await macXianyuSearch(keyword,{minCny,maxCny},token));
     if(res.risk){
-      saveSetting('xianyu_mac_hold',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_HOLD_MIN||10))*60e3,at:new Date().toISOString()});
+      saveSetting('xianyu_mac_hold',{until:Date.now()+Math.max(1,Number(process.env.XIANYU_MAC_HOLD_MIN||5))*60e3,at:new Date().toISOString()});
       return {used:true,res:{...res,macRisk:true}};
     }
     if(res.login)return {used:false,reason:res.where,login:true};
