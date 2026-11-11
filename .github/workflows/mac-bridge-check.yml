@@ -1,0 +1,25 @@
+name: Check Mac bridge from the server
+
+# Diagnóstico mínimo: ¿ve el servidor el puente del Mac por el túnel SSH y
+# está la extensión de Chrome conectada? No imprime el token ni hace búsquedas.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ vars.LH_RUNNER }}
+    timeout-minutes: 5
+    env:
+      ONEMAP_MAC_BRIDGE_TOKEN: ${{ secrets.ONEMAP_MAC_BRIDGE_TOKEN }}
+    steps:
+      - name: Tunnel listener and bridge health
+        shell: bash
+        run: |
+          echo "--- ¿escucha algo en 127.0.0.1:8210 del servidor?"
+          (ss -ltn 2>/dev/null | grep -E '[:.]8210\b') || echo "NADA escucha en el 8210: el túnel SSH del Mac no está abierto."
+          echo "--- /health (con token, sin imprimirlo)"
+          if [ -z "${ONEMAP_MAC_BRIDGE_TOKEN:-}" ]; then echo "Falta el secreto ONEMAP_MAC_BRIDGE_TOKEN"; exit 0; fi
+          curl -s -m 10 -w "\nHTTP %{http_code}\n" -H "Authorization: Bearer ${ONEMAP_MAC_BRIDGE_TOKEN}" http://127.0.0.1:8210/health || echo "No se pudo conectar con el puente"
