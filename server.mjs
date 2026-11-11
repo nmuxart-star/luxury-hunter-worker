@@ -1603,25 +1603,22 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
   
-  // [CAPSOLVER] Funció per detectar i resoldre el mur de Goofish
-  const checkCaptcha = async () => {
-    const currentUrl = page.url();
-    const isCaptchaVisible = XIANYU_RISK_RE.test(currentUrl) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
-    if (isCaptchaVisible) {
-      console.log('[Capsolver] Bloqueo detectado en búsqueda Xianyu. Iniciando resolución...');
-      const solucion = await resolverDesafioEnNube({ type: "AntiBaxiaTask", websiteURL: currentUrl });
-      if (solucion) {
-        console.log('[Capsolver] Solución obtenida. Recargando la búsqueda...');
-        await page.reload({waitUntil: 'domcontentloaded'});
-        await page.waitForTimeout(3000);
-        const sigueBloqueada = XIANYU_RISK_RE.test(page.url()) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
-        if (!sigueBloqueada) {
-          console.log('[Capsolver] ¡Éxito! Muro anti-bot superado en la búsqueda.');
-          return true;
-        } else {
-          console.log('[Capsolver Error] La página sigue bloqueada.');
-        }
+  // [CAPSOLVER] Escudo global anti-bloqueos
+  const resolverMuro = async (motivo) => {
+    console.log(`[Capsolver] Bloqueo detectado en: ${motivo}. Iniciando resolución...`);
+    const solucion = await resolverDesafioEnNube({ type: "AntiBaxiaTask", websiteURL: page.url() });
+    if (solucion) {
+      console.log('[Capsolver] Solución obtenida. Refrescando página...');
+      await page.reload({waitUntil: 'domcontentloaded'});
+      await sleep(3000);
+      const sigueBloqueada = XIANYU_RISK_RE.test(page.url()) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false);
+      if (!sigueBloqueada) {
+        console.log('[Capsolver] ¡Éxito! Cuenta liberada. Saltando al siguiente modelo de la cola...');
+        return true;
       }
+      console.log('[Capsolver Error] La página sigue bloqueada tras aplicar la solución.');
+    } else {
+      console.log('[Capsolver Error] No se obtuvo solución válida de la API.');
     }
     return false;
   };
@@ -1630,50 +1627,37 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
     if(!x.warmed){
       await page.goto('https://www.goofish.com/',{waitUntil:'domcontentloaded',timeout:40000});
       await sleep(1500+Math.random()*1500);
-      await checkCaptcha(); // Comprovar si ens bloqueja a l'entrada
+      if (XIANYU_RISK_RE.test(page.url()) || await page.locator('div.baxia-dialog-mask').isVisible().catch(()=>false)) {
+         if (!(await resolverMuro('carga inicial'))) return {risk: true};
+      }
       x.warmed=true;
     }
     
     let first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:40000});
-    // Silencia el error de timeout si esta promesa queda huérfana
     first.catch(()=>{});
     
     await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
-    
-    // 1er intento de resolución si salta en la carga inicial
-    if (await checkCaptcha()) {
-      first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:20000});
-      first.catch(()=>{});
-      await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
-    }
 
     let resp;
     try{
       resp=await first;
     }catch{
       const where=`${page.url()} · "${(await page.title().catch(()=>''))||''}"`;
-      if(XIANYU_RISK_RE.test(page.url()))return {risk:true};
+      if(XIANYU_RISK_RE.test(page.url())) {
+         if (await resolverMuro('timeout de búsqueda')) return {risk: false, items: []};
+         return {risk:true};
+      }
       if(/login|passport/i.test(page.url()))return {login:true,where};
       return {noResponse:true,where};
     }
     
     let json=await resp.json().catch(()=>null);
 
-    // NUEVO: 2do intento si la página cargó bien pero la API oculta el bloqueo en el JSON
-    if (xianyuRiskIn(json)) {
-      console.log('[Capsolver] El JSON de la API reporta bloqueo anti-bot. Comprobando CAPTCHA visual...');
-      await sleep(2000); // Dar tiempo a que el script de Xianyu levante el popup (baxia)
-      if (await checkCaptcha()) {
-        first=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:20000});
-        first.catch(()=>{});
-        await page.goto(`https://www.goofish.com/search?q=${encodeURIComponent(keyword)}`,{waitUntil:'domcontentloaded',timeout:40000});
-        try { resp = await first; } catch {}
-        json = await resp.json().catch(()=>null);
-      }
-    }
-
     if(xianyuAuthIn(json))return {login:true,where:'sesión caducada'};
-    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json))return {risk:true};
+    if(XIANYU_RISK_RE.test(page.url())||xianyuRiskIn(json)){
+       if (await resolverMuro('búsqueda principal')) return {risk: false, items: []};
+       return {risk:true};
+    }
     
     let sorted=false;
     if(String(process.env.XIANYU_SORT_NEWEST||'1')!=='0'){
@@ -1688,11 +1672,14 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         await page.getByText('新发布',{exact:true}).first().click({timeout:6000});
         await sleep(800+Math.random()*700);
         const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
-        next.catch(()=>{}); // Protección extra
+        next.catch(()=>{}); 
         await page.getByText('最新',{exact:true}).first().click({timeout:6000});
         const j2=await (await next).json().catch(()=>null);
         if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
-        if(xianyuRiskIn(j2))return {risk:true};
+        if(xianyuRiskIn(j2)){
+           if (await resolverMuro('ordenar por nuevos')) return {risk: false, items: []};
+           return {risk:true};
+        }
         if(j2?.data?.resultList?.length){json=j2;sorted=true;}
       }catch{}
     }
@@ -1706,11 +1693,14 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
           if(minCny){await inputs.nth(0).fill(String(minCny));await sleep(700+Math.random()*800);}
           if(maxCny){await inputs.nth(1).fill(String(maxCny));await sleep(700+Math.random()*800);}
           const next=page.waitForResponse(r=>r.url().includes(XIANYU_SEARCH_API)&&r.request().method()==='POST',{timeout:15000});
-          next.catch(()=>{}); // Protección extra
+          next.catch(()=>{});
           await page.keyboard.press('Tab');
           const j3=await (await next).json().catch(()=>null);
           if(xianyuAuthIn(j3))return {login:true,where:'sesión caducada'};
-          if(xianyuRiskIn(j3))return {risk:true};
+          if(xianyuRiskIn(j3)){
+             if (await resolverMuro('filtrar precio')) return {risk: false, items: []};
+             return {risk:true};
+          }
           if(j3?.data?.resultList){json=j3;priced=true;}
         }
       }catch{}
