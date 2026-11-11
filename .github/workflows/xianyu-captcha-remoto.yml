@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           set +x
-          PW="$(LC_ALL=C tr -dc 'a-km-zA-HJ-NP-Z2-9' </dev/urandom | head -c 8)"
+          PW="$(openssl rand -hex 4)"
           echo "::add-mask::$PW"
           CF="$(command -v cloudflared || echo "$RUNNER_TEMP/cloudflared")"
           DISPLAY_NUM=97
