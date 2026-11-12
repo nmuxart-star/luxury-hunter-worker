@@ -401,15 +401,22 @@ try{
   code=1; console.error(e?.stack||e);
 }finally{
   if(process.env.GITHUB_OUTPUT){
-    try{fs.appendFileSync(process.env.GITHUB_OUTPUT,`started=${anyTaskStarted?'true':'false'}\n`);}
+    // Una ejecución que no pudo lanzar nada (Mac en transición, parada...) también encadena la siguiente: antes se quedaba
+    // el bot parado horas porque el cron de GitHub no es fiable. Para no encadenar en bucle, dura como mínimo 5 min.
+    try{
+      const ranSec=(Date.now()-workerStartedAt)/1000;
+      if(!anyTaskStarted&&ranSec<300)await sleep((300-ranSec)*1000);
+      fs.appendFileSync(process.env.GITHUB_OUTPUT,`started=true\n`);
+    }
     catch(e){console.error('Could not report task-start status:',e.message);}
   }
   if(child.exitCode===null && child.signalCode===null){
     child.kill('SIGTERM');
 
+    // Margen largo para que el servidor cierre la base de datos (un corte a la fuerza a media escritura la estropeaba).
     await Promise.race([
       new Promise(resolve=>child.once('exit',resolve)),
-      sleep(5000)
+      sleep(30000)
     ]);
   }
 

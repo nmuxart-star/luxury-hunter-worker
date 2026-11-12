@@ -207,6 +207,29 @@ jobs:
           mkdir -p data
           node scripts/pick-state-db.mjs "$HOME/.lh-state/luxury-hunter.sqlite3" data/luxury-hunter.sqlite3 data/luxury-hunter.sqlite3 || true
 
+      # Si la base de datos está estropeada (índices rotos por un corte a medias), se repara; si no tiene arreglo, se usa
+      # el artefacto más reciente que esté sano.
+      - name: Ensure a healthy database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          [ -f data/luxury-hunter.sqlite3 ] || { echo "Sin base de datos previa: se empieza de cero."; exit 0; }
+          if node scripts/repair-db.mjs data/luxury-hunter.sqlite3; then exit 0; fi
+          echo "::warning::La base de datos no se pudo reparar; busco el artefacto sano más reciente."
+          rm -f data/luxury-hunter.sqlite3 "$HOME/.lh-state/luxury-hunter.sqlite3"
+          for PREV in $(gh run list --workflow luxury-hunter.yml --limit 40 --json databaseId -q '.[].databaseId' 2>/dev/null || true); do
+            [ "$PREV" = "${GITHUB_RUN_ID:-}" ] && continue
+            rm -rf .state-try && mkdir -p .state-try
+            if gh run download "$PREV" -n luxury-hunter-state -D .state-try >/dev/null 2>&1 && [ -f .state-try/luxury-hunter.sqlite3 ] && node scripts/repair-db.mjs .state-try/luxury-hunter.sqlite3; then
+              cp .state-try/luxury-hunter.sqlite3 data/luxury-hunter.sqlite3
+              echo "Estado recuperado del run $PREV"
+              break
+            fi
+          done
+          rm -rf .state-try
+          [ -f data/luxury-hunter.sqlite3 ] || echo "::warning::No hay ningún estado sano: se empieza de cero."
+
       # Pausa mínima entre ejecuciones (RUN_GAP_MINUTES), antes de abrir ningún navegador.
       - name: Pause between runs
         run: node scripts/run-gap.mjs
@@ -324,10 +347,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p lh-upload
-          cp data/luxury-hunter.sqlite3 lh-upload/
+          # Copia COHERENTE (abrir la base recupera lo que se quedara a medias si el servidor se cortó a la fuerza).
+          node scripts/repair-db.mjs data/luxury-hunter.sqlite3 || true
+          node scripts/seal-state.mjs data/luxury-hunter.sqlite3 lh-upload/luxury-hunter.sqlite3 || cp data/luxury-hunter.sqlite3 lh-upload/
           # Copia en el propio servidor, por si GitHub falla al guardar el artefacto.
           mkdir -p "$HOME/.lh-state"
-          cp data/luxury-hunter.sqlite3 "$HOME/.lh-state/luxury-hunter.sqlite3.tmp" && mv -f "$HOME/.lh-state/luxury-hunter.sqlite3.tmp" "$HOME/.lh-state/luxury-hunter.sqlite3" || true
+          cp lh-upload/luxury-hunter.sqlite3 "$HOME/.lh-state/luxury-hunter.sqlite3.tmp" && mv -f "$HOME/.lh-state/luxury-hunter.sqlite3.tmp" "$HOME/.lh-state/luxury-hunter.sqlite3" || true
           # Si esta ejecución no renovó la sesión de Xianyu, conserva la anterior.
           if [ ! -f lh-upload/xianyu-state.enc ] && [ -f .state/xianyu-state.enc ]; then
             cp .state/xianyu-state.enc lh-upload/
@@ -374,7 +399,7 @@ jobs:
       # Encadena la siguiente ejecución al terminar (cobertura continua) si
       # la variable de repositorio SELF_CHAIN vale 'true'. El cron sigue como red de seguridad.
       - name: Chain next run
-        if: always() && vars.SELF_CHAIN == 'true' && steps.run_due_tasks.outputs.started == 'true'
+        if: always() && vars.SELF_CHAIN == 'true' && vars.BOT_PAUSED != 'true' && steps.run_due_tasks.outputs.started == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
