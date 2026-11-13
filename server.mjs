@@ -5385,7 +5385,11 @@ function taskResults(taskId) {
     WHERE ss.task_id=?
     GROUP BY l.id
     ORDER BY CASE a.decision WHEN 'STRONG BUY' THEN 1 WHEN 'BUY' THEN 2 WHEN 'WATCH' THEN 3 WHEN 'REVIEW' THEN 4 WHEN 'REJECT' THEN 6 ELSE 5 END,
-      COALESCE(a.opportunity_score,-1) DESC, task_last_seen DESC`).all(Number(taskId),Number(taskId)).filter(xianyuListingHasVerificationTag));
+      COALESCE(a.opportunity_score,-1) DESC, task_last_seen DESC`).all(Number(taskId),Number(taskId)).filter(xianyuListingHasVerificationTag).map(r=>{
+    // Fecha de publicación del anuncio (ISO) para el filtro de timing de la app.
+    let ms=null;try{ms=listingPublishedAtMs(r);}catch{}
+    return {...r,published_at:Number.isFinite(ms)&&ms>0?new Date(ms).toISOString():null};
+  }));
 }
 function createTaskRecord(body) {
   const t=validateTaskInput(body);
