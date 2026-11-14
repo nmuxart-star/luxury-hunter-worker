@@ -16,6 +16,8 @@ import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
 import {descTokens,descIndex,descScore,refSheetDoubt} from './scripts/ref-retrieval.mjs';
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
+import {radarPrioritize,radarBuildList,radarParseWeights,radarYieldFactors,radarRowsFor,radarPriceBand} from './scripts/radar-priority.mjs';
+import {picksByInterest,capByInterest,pageIsSaturated,mergeUniqueById} from './scripts/interest-pick.mjs';
 import {macOneMapReady,macOneMapSnapshot,macXianyuSearch} from './scripts/onemap-mac-client.mjs';
 // Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
 const VESTIAIRE_LIVE_REALIZATION=0.90;
@@ -1669,7 +1671,7 @@ async function xianyuHumanType(locator,value){
 async function xianyuPageHard(page){
   try{return xianyuHardText(await page.evaluate(()=>document.body?document.body.innerText.slice(0,3000):''));}catch{return false;}
 }
-async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile=null}={}){
+async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile=null,morePages=false}={}){
   const x=await getXianyuDirect(stateFile);
   const page=await x.context.newPage();
   try{
@@ -1745,7 +1747,34 @@ async function xianyuDirectSearchOnce(keyword,{minCny=null,maxCny=null,stateFile
         }
       }catch{}
     }
-    return {risk:false,sorted,priced,items:parseXianyuSearchJson(json),ret:json?.ret||null};
+    let items=parseXianyuSearchJson(json);
+    let pages=1;
+    // Página 2 solo si la 1 sale llena y todo de las últimas 24 h (quedan anuncios del modelo dentro del margen sin ver).
+    if(morePages&&pageIsSaturated(items,{maxAgeHours:clampInt(process.env.XIANYU_SEARCH_MAX_AGE_HOURS??24,24,1,720)})){
+      try{
+        const next=page.waitForResponse(r=>{
+          if(!r.url().includes(XIANYU_SEARCH_API)||r.request().method()!=='POST')return false;
+          let body='';try{body=decodeURIComponent(r.request().postData()||'');}catch{}
+          // Cualquier nueva respuesta del buscador tras el scroll es la página siguiente (si el cuerpo dice qué página es, ≥ 2).
+          const m=body.match(/"pageNumber"\s*:\s*(\d+)/);
+          return !m||Number(m[1])>=2;
+        },{timeout:20000});
+        next.catch(()=>{});
+        await page.mouse.move(400+Math.random()*400,300+Math.random()*200,{steps:6}).catch(()=>{});
+        for(let i=0;i<4;i++){
+          await sleep(700+Math.random()*700);
+          await page.mouse.wheel(0,900+Math.random()*500);
+        }
+        const j2=await (await next).json().catch(()=>null);
+        if(xianyuAuthIn(j2))return {login:true,where:'sesión caducada'};
+        if(xianyuRiskIn(j2))return {risk:true,hard:await xianyuPageHard(page)};
+        if(j2?.data?.resultList?.length){
+          items=mergeUniqueById(items,parseXianyuSearchJson(j2));
+          pages=2;
+        }
+      }catch{}
+    }
+    return {risk:false,sorted,priced,items,pages,ret:json?.ret||null};
   }finally{
     await page.close().catch(()=>{});
   }
@@ -1764,6 +1793,21 @@ function xianyuMarkSearch(){
   try{saveSetting('xianyu_search_log',[...xianyuSearchesLastHour(),Date.now()].slice(-300));}catch{}
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_search',?,?)
     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(String(Date.now()),new Date().toISOString());
+}
+// Lecturas de la página 2 (solo tareas de bolsos de 3 h o más): como mucho XIANYU_PAGE2_MAX_PER_DAY al día, y solo si el ritmo
+// autorregulado no ha bajado de XIANYU_PAGE2_MIN_RATE (una verificación reciente lo baja). XIANYU_PAGE2=0 lo apaga.
+function xianyuPage2Room(){
+  if(['0','off','false','no'].includes(String(process.env.XIANYU_PAGE2??'1').toLowerCase()))return false;
+  if(xianyuRateLevel()<Number(process.env.XIANYU_PAGE2_MIN_RATE??0.7))return false;
+  const since=Date.now()-24*3600e3;
+  const used=(getSetting('xianyu_page2_log',[])||[]).filter(t=>Number(t)>since).length;
+  return used<Number(process.env.XIANYU_PAGE2_MAX_PER_DAY??60);
+}
+function xianyuMarkPage2(){
+  try{
+    const since=Date.now()-24*3600e3;
+    saveSetting('xianyu_page2_log',[...(getSetting('xianyu_page2_log',[])||[]).filter(t=>Number(t)>since),Date.now()].slice(-300));
+  }catch{}
 }
 function xianyuMarkProvider(provider){
   db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('xianyu_last_provider',?,?)
@@ -2118,7 +2162,7 @@ async function xianyuSplitRoute(){
   return xianyuSplitDecide({macReady,macHold,cloudBlocked,turn:xianyuSplitTurn});
 }
 
-async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto',slotReserved=false,route=null}){
+async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,sessionId,product,accountStateFile=null,accountStrategy='auto',slotReserved=false,route=null,morePages=false,bandFor=null}){
   // Como mucho una búsqueda de Xianyu cada XIANYU_MIN_INTERVAL_MIN minutos
   // (entre todas las tareas y ejecuciones). Menos peticiones = menos verificaciones.
   const minInterval=Number(process.env.XIANYU_MIN_INTERVAL_MIN??360);
@@ -2171,14 +2215,20 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     saveSetting('xianyu_query_turn',turns);
     if(n%2)all=[all[1],all[0],...all.slice(2)];
   }
+  // Página 2: solo si la tarea lo pide, el ritmo no está bajado por verificaciones y no se ha llegado al tope diario.
+  const page2Allowed=!!morePages&&xianyuPage2Room();
   let done=0;
   for(const keyword of all.slice(0,2)){
     // La 2ª búsqueda solo si XIANYU_MAX_QUERIES=2 o si la 1ª salió vacía.
     if(done>=maxQueries&&kept>0)break;
     done++;
     let res;
-    const minCny=Number.isFinite(Number(minEur))&&Number(minEur)>0?Math.floor(eurTo(Number(minEur),'CNY')||0)||null:null;
-    const maxCny=Number.isFinite(Number(maxEur))&&Number(maxEur)>0?Math.ceil(eurTo(Number(maxEur),'CNY')||0)||null:null;
+    // Radar: banda de precio propia del modelo (ver radarBandFor); el resto de tareas usa el rango de la tarea.
+    const band=typeof bandFor==='function'?bandFor(keyword):null;
+    const kMin=band?band.minEur:minEur,kMax=band?band.maxEur:maxEur;
+    if(band)console.log(`Radar: «${keyword}» con precio de ${band.minEur} a ${band.maxEur} € (venta media ${band.resale} € de ${band.n} fichas, tras tus costes).`);
+    const minCny=Number.isFinite(Number(kMin))&&Number(kMin)>0?Math.floor(eurTo(Number(kMin),'CNY')||0)||null:null;
+    const maxCny=Number.isFinite(Number(kMax))&&Number(kMax)>0?Math.ceil(eurTo(Number(kMax),'CNY')||0)||null:null;
     const fixed=accountStrategy==='fixed'
       ?files.find(file=>path.basename(file)===path.basename(String(accountStateFile||'')))||null
       :null;
@@ -2206,7 +2256,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
       files,preferred:xianyuActiveAccount,failed:xianyuFailedAccounts,
       fixed:accountStrategy==='fixed'?fixed||'missing':null,
       search:async stateFile=>{
-        try{xianyuNoteIp('cloud');return await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile});}
+        try{xianyuNoteIp('cloud');return await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile,morePages:page2Allowed});}
         catch(e){return {noResponse:true,where:e.message};}
       }
     });
@@ -2217,7 +2267,7 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     if(res.login&&!mac.used&&files.length&&accountStrategy!=='fixed'){
       console.log('Xianyu: todas las sesiones disponibles caducaron; probando resultados públicos sin sesión.');
       try{
-        res=await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile:null});
+        res=await xianyuDirectSearchOnce(keyword,{minCny,maxCny,stateFile:null,morePages:page2Allowed});
         if(!res.login&&!res.noResponse&&!res.risk){
           publicFallback=true;
           xianyuActiveAccount=null;
@@ -2270,13 +2320,14 @@ async function searchXianyuDirect({queries,maxItems=30,minEur=null,maxEur=null,s
     const rejected={noVerificationTag:0,missingCoreFields:0,invalidPrice:0,missingImage:0,missingSellerInfo:0,missingPublicationTime:0,listingTooOld:0,futurePublication:0,belowMin:0,aboveMax:0};
     let localKept=0;
     for(const it of res.items.slice(0,Math.max(1,Number(maxItems)))){
-      const result=saveXianyuCandidate(it,{sessionId,sourceQuery:keyword,minEur,maxEur});
+      const result=saveXianyuCandidate(it,{sessionId,sourceQuery:keyword,minEur:kMin,maxEur:kMax});
       if(result.kept){localKept++;kept++;}
       else if(rejected[result.reason]!==undefined)rejected[result.reason]++;
     }
     xianyuRiskStreakClear();
     xianyuRateGood();
-    perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
+    if(res.pages>1)xianyuMarkPage2();
+    perQuery.push({query:keyword,account:accountLabel(xianyuActiveAccount),accountsExpired:failedLabels,publicFallback,sortedNewest:res.sorted,priceFiltered:!!res.priced,pages:res.pages||1,...(band?{band}:{}),found:res.items.length,kept:localKept,rejected,...(res.items.length?{}:{ret:res.ret})});
     // Pausa de persona entre búsquedas: las ráfagas son lo que dispara las verificaciones.
     await sleep(2500+Math.random()*2500);
   }
@@ -2351,7 +2402,7 @@ async function searchXianyuAlternate(opts){
   const runAccount=async()=>{
     const fn=searchXianyuDirect;
     // La cuenta revisa sus 30 anuncios: la página ya trae 30.
-    const accountOpts={...opts,slotReserved:true,maxItems:30};
+    const accountOpts={...opts,slotReserved:true,maxItems:opts.morePages?60:30};
     const res=(!macOk&&xianyuDirectSessionBlock())||await fn({...accountOpts,route});
     const verification=(route!=='mac'&&String(process.env.XIANYU_SESSION_STATUS||'').trim()==='risk_control')||
       (res.perQuery||[]).some(q=>q?.risk&&!q.grace)||(res.state==='paused'&&xianyuPauseCode==='risk');
@@ -5167,50 +5218,44 @@ const RADAR_STEP={xianyu:2,japan:2,bunjang:2};
 // Cada búsqueda de la lista rotativa del Radar es un modelo (ej. «圣罗兰 niki»). Con las fichas de la pestaña «Radar oportunidades»
 // de la hoja se puntúa cada modelo: interés (likes), rotación (lo vendido) y representación (cuántas fichas hay). El Radar busca
 // más a menudo los que más puntúan, sin dejar de pasar por los demás.
-const RADAR_BRANDS=[['普拉达','prada'],['香奈儿','chanel'],['迪奥','dior'],['爱马仕','hermes'],['lv','louisvuitton'],['celine','celine'],['罗意威','loewe'],
-  ['芬迪','fendi'],['圣罗兰','saintlaurent'],['戈雅','goyard'],['葆蝶家','bottega'],['古驰','gucci'],['miumiu','miumiu'],['蔻依','chloe']];
-const RADAR_MODEL_ALIAS={'22bag':'22','box':'classic'};
-const radarNorm=x=>String(x||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]/g,'');
-function radarQueryKey(q){
-  const t=String(q||'').toLowerCase();
-  const b=RADAR_BRANDS.find(([k])=>t.includes(k));
-  const words=(t.match(/[a-z0-9]+/g)||[]).filter(w=>!['lv','celine','miumiu','bag'].includes(w)||/^22bag$/.test(w));
-  const joined=words.join('');
-  return {brand:b?b[1]:null,model:RADAR_MODEL_ALIAS[joined]||joined};
+// Las funciones de puntuación y prioridad (y los modelos nuevos de la hoja) están en scripts/radar-priority.mjs.
+// Lo que ha traído cada búsqueda del Radar últimamente: solo cuentan las que de verdad se hicieron (no las pausadas ni
+// las frenadas por el tope), para bajar el peso de las consultas que salen vacías una y otra vez.
+// Precio máximo (y mínimo) de la búsqueda de un modelo del Radar, con TUS costes (14-11-2026): se vende a la media de las fichas
+// del modelo en la hoja y se resta la comisión de la plataforma de reventa y todo el coste puesto en España (envío interno,
+// comisión del agente, envío internacional, arancel, IVA, verificación…). El máximo es el precio de compra más alto con el que aún
+// queda el margen mínimo de la tarea. Sin fichas suficientes o sin margen posible no hay banda (se usa el rango de la tarea).
+function radarBandFor(q,task){
+  try{
+    if(['0','off','false','no'].includes(String(process.env.RADAR_PRICE_BAND??'1').toLowerCase()))return null;
+    const fichas=Object.entries(vestiaireSheetCache?.tasks||{}).find(([k])=>/^radar/i.test(k))?.[1]?.fichas;
+    if(!fichas?.length)return null;
+    const values=radarRowsFor(fichas,q).map(refValueForGate).filter(v=>v>0);
+    return radarPriceBand({
+      values,
+      fee:resalePlatform(task.task_name).fee/100,
+      minProfit:Number(task.notify_min_profit_eur)||200,
+      landedFn:price=>Number(importEconomics({price_eur:price,source:'xianyu',title:q})?.importedTotalEur)||0,
+      taskMin:task.min_eur,taskMax:task.max_eur
+    });
+  }catch(e){console.warn('Radar: sin banda de precio para',q,e.message);return null;}
 }
-function radarScoreModels(fichas,queries){
-  const pct=(vals,v)=>{const a=[...vals].sort((x,y)=>x-y);if(a.length<2)return 0.5;let lo=a.findIndex(x=>x>=v-1e-9);if(lo<0)lo=a.length-1;return lo/(a.length-1);};
-  const stats=queries.map(q=>{
-    const k=radarQueryKey(q);
-    const rows=(fichas||[]).filter(f=>k.model&&radarNorm(f.size).includes(k.model)&&(!k.brand||radarNorm(f.brand).includes(k.brand)));
-    const likes=rows.map(f=>Number(f.likes)).filter(Number.isFinite).sort((a,b)=>a-b);
-    const median=likes.length?likes[Math.floor(likes.length/2)]:0;
-    const mean=likes.length?likes.reduce((a,b)=>a+b,0)/likes.length:0;
-    const n=rows.length,sold=rows.filter(f=>f.sold).length;
-    return {q,n,sold,likes:0.5*median+0.5*mean,ratio:(sold+1)/(n+10)};
-  });
-  const have=stats.filter(x=>x.n>0);
-  const out=new Map();
-  for(const x of stats){
-    if(!x.n){out.set(x.q,{...x,score:0.35});continue;}
-    const likesR=pct(have.map(y=>y.likes),x.likes);
-    const rotR=0.5*pct(have.map(y=>y.ratio),x.ratio)+0.5*pct(have.map(y=>y.sold),x.sold);
-    const repR=pct(have.map(y=>y.n),x.n);
-    // Interés y rotación mandan (40 % cada uno); la representación suma el 20 %.
-    out.set(x.q,{...x,score:0.4*likesR+0.4*rotR+0.2*repR});
-  }
-  return out;
-}
-// Ordena la lista del Radar: primero la búsqueda más «urgente» = tiempo desde la última vez × peso del modelo (0,3–2,2).
-function radarPrioritize(queries,fichas,now=Date.now(),last={}){
-  const scores=radarScoreModels(fichas,queries);
-  const rated=queries.map(q=>{
-    const sc=scores.get(q)?.score??0.35;
-    const w=0.2+3*sc*sc;   // peso 0,3–2,2: el mejor sale ~7 veces más que el peor, y ninguno deja de salir
-    const since=Math.max(1,(now-(Number(last[q])||0))/3600e3);
-    return {q,w,urgency:since*w,score:sc};
-  }).sort((a,b)=>b.urgency-a.urgency);
-  return {order:rated.map(x=>x.q),rated};
+function radarYieldHistory(queries){
+  const want=new Set(queries);const hist={};
+  try{
+    const rows=db.prepare(`SELECT json_extract(query_plan_json,'$.xianyu[0]') AS q,
+        CAST(json_extract(source_status_json,'$.xianyu.kept') AS INTEGER) AS kept
+      FROM search_sessions
+      WHERE product_query LIKE 'Radar%' AND status='finished'
+        AND json_extract(source_status_json,'$.xianyu.ok')=1
+        AND COALESCE(json_extract(source_status_json,'$.xianyu.state'),'') NOT IN ('paused','throttled')
+      ORDER BY started_at DESC LIMIT 600`).all();
+    for(const r of rows){
+      if(!want.has(r.q)||!Number.isFinite(r.kept))continue;
+      (hist[r.q]=hist[r.q]||[]).push(r.kept);
+    }
+  }catch(e){console.warn('Radar: sin historial de rendimiento:',e.message);}
+  return hist;
 }
 function radarRotatePlan(plan,taskId){
   if(!taskId)return plan;
@@ -5227,14 +5272,24 @@ function radarRotatePlan(plan,taskId){
   // Prioridad por likes / rotación / representación según la hoja (si no se pudo leer, queda la rotación de arriba).
   try{
     const fichas=Object.entries(vestiaireSheetCache?.tasks||{}).find(([k])=>/^radar/i.test(k))?.[1]?.fichas;
-    const list=Array.isArray(plan.xianyu)?plan.xianyu:[];
-    if(fichas?.length&&list.length>1){
+    const configured=Array.isArray(plan.xianyu)?plan.xianyu:[];
+    if(fichas?.length&&configured.length>1){
+      // El listado sale de la hoja (14-11-2026): los modelos con más fichas, más vendidos y más likes (RADAR_LIST_SIZE, 30). Si la
+      // hoja no da para un listado, queda la lista fija de la configuración.
+      const weights=radarParseWeights(process.env.RADAR_WEIGHTS??'1,1,1');
+      const built=radarBuildList(fichas,configured,{size:Number(process.env.RADAR_LIST_SIZE??30),weights});
+      const list=built.length>=5?built.map(x=>x.q):[...configured];
       const last=getSetting('radar_query_last',{})||{};
-      const {order,rated}=radarPrioritize(list,fichas,Date.now(),last);
+      const yieldFactor=radarYieldFactors(radarYieldHistory(list));
+      const {order,rated}=radarPrioritize(list,fichas,Date.now(),last,yieldFactor,weights);
       out.xianyu=order;
       last[order[0]]=Date.now();
       saveSetting('radar_query_last',last);
-      console.log(`Radar: busca primero «${order[0]}» (puntuación ${rated.find(r=>r.q===order[0]).score.toFixed(2)}; siguientes: ${order.slice(1,4).join(' · ')}).`);
+      const top=rated.slice().sort((a,b)=>b.score-a.score).slice(0,8).map(r=>`${r.q} ${r.score.toFixed(2)}`).join(' · ');
+      const dropped=configured.filter(q=>!list.includes(q));
+      console.log(`Radar: busca primero «${order[0]}» (puntuación ${rated.find(r=>r.q===order[0]).score.toFixed(2)}${yieldFactor[order[0]]?`, peso ×${yieldFactor[order[0]]} por rendimiento`:''}; siguientes: ${order.slice(1,4).join(' · ')}).`);
+      console.log(`Radar: listado de ${list.length} modelos sacado de la hoja (${built.filter(x=>!x.fromConfig).length} con búsqueda automática; ${dropped.length} de la lista fija quedan fuera por puntuar poco). Mejor puntuados: ${top}.`);
+      if(Object.keys(yieldFactor).length)console.log(`Radar: pesan menos por traer poco: ${Object.entries(yieldFactor).map(([q,f])=>`${q} ×${f}`).join(' · ')}.`);
     }
   }catch(e){console.warn('Radar: prioridad por hoja no disponible:',e.message);}
   // PORTADA DE BOLSOS (regla de Nil, 11-11-2026): cada XIANYU_PORTADA_EVERY (3) pasadas del radar, la búsqueda de
@@ -5348,6 +5403,12 @@ async function globalSearch(body) {
     personalOnly:!!body.personal_only,freeShipping:!!body.free_shipping,newPublishOption:body.new_publish_option||null,region:body.region||null,
     accountStateFile:body.account_state_file||null,accountStrategy:body.account_strategy||'auto',fastLane,auctionLane
   };
+  // Segunda página de Xianyu (14-11-2026): solo bolsos de 3 h o más (intervalo ≥ INTEREST_MIN_INTERVAL_MIN) con 2 páginas configuradas.
+  try{
+    const trow=taskId?db.prepare('SELECT task_name,interval_minutes,max_pages,min_eur,max_eur,notify_min_profit_eur FROM tasks WHERE id=?').get(taskId):null;
+    if(trow&&/^radar\b/i.test(String(trow.task_name||'')))opts.bandFor=q=>radarBandFor(q,trow);
+    opts.morePages=!!trow&&!fastLane&&!auctionLane&&Number(trow.max_pages)>=2&&!isWatchTask(trow.task_name)&&picksByInterest(trow,INTEREST_MIN_INTERVAL_MIN);
+  }catch{opts.morePages=false;}
   // Todas las fuentes a la vez; cada una guarda cuánto ha tardado (ms).
   const jobs=[];
   const run=(name,fn)=>{
@@ -6310,7 +6371,11 @@ const AI_PRIORITY_MARGIN_PCT=Number(process.env.AI_PRIORITY_MARGIN_PCT??100);
 const sheetNetOf=x=>Number.isFinite(x?._sheetProfit?.net)?x._sheetProfit.net:-1e9;
 
 const XIANYU_RECENT_HOURS=Math.max(0.25,Number(process.env.XIANYU_RECENT_HOURS||3));
+// Tareas de intervalo largo (≥ INTEREST_MIN_INTERVAL_MIN min, 180 por defecto; 0 = apagado): se analizan los más interesantes por
+// precio de las últimas 24 h, no los más recientes, con tope = máx. de anuncios de la tarea.
+const INTEREST_MIN_INTERVAL_MIN=Number(process.env.INTEREST_MIN_INTERVAL_MIN??180);
 function prioritizeForAnalysis(taskId,items,task=null){
+  const byInterest=picksByInterest(task,INTEREST_MIN_INTERVAL_MIN);
   const median=taskMedianAskingEur(taskId);
   const ranked=items.map(item=>{
     const price=Number(item.price_eur);
@@ -6328,7 +6393,7 @@ function prioritizeForAnalysis(taskId,items,task=null){
   ranked.sort((a,b)=>
     Number(!!b.item._needsVerification)-Number(!!a.item._needsVerification) ||
     Number(!!b.item._aiPriority)-Number(!!a.item._aiPriority) ||
-    (a.item._aiPriority?0:Number(!!b.item._recent)-Number(!!a.item._recent)) ||
+    (a.item._aiPriority||byInterest?0:Number(!!b.item._recent)-Number(!!a.item._recent)) ||
     sheetNetOf(b.item)-sheetNetOf(a.item) ||
     (a.ratio??9)-(b.ratio??9)
   );
@@ -8279,6 +8344,18 @@ async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
           if(live.length>keep.length)console.log(`Task ${taskId}: ${keep.length} subastas con ≤${AUCTION_SHOW_HOURS} h y alguna puja (de ${live.length}); el resto no se analiza.`);
           pendingItems=[...pendingItems.filter(x=>x._needsVerification),...keep,...pendingItems.filter(x=>!x._needsVerification&&!ids.has(x.id))];
         }
+      }
+
+      // Tareas de 3 h, 6 h…: solo los más interesantes por precio (ya ordenados), hasta el máx. de anuncios de la tarea.
+      if(picksByInterest(task,INTEREST_MIN_INTERVAL_MIN)){
+        const cap=clampInt(task.max_items,20,5,100);
+        const {kept,dropped}=capByInterest(pendingItems,cap);
+        if(dropped.length){
+          for(const it of dropped)db.prepare('DELETE FROM search_session_items WHERE session_id=? AND listing_id=?').run(result.sessionId,it.id);
+          console.log(`Task ${taskId}: tarea de ${task.interval_minutes} min → se analizan los ${kept.filter(x=>!x._needsVerification).length} más interesantes por precio (tope ${cap}); ${dropped.length} menos interesantes quedan fuera.`);
+        }
+        result.status.prescreen.interestCap={cap,kept:kept.length,dropped:dropped.length};
+        pendingItems=kept;
       }
 
       // Japón: vendedor de Mercari/Rakuma con buenas valoraciones (regla de Nil).

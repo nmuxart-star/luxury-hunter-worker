@@ -83,8 +83,14 @@ jobs:
       ACTIVE_SOURCES: ${{ vars.ACTIVE_SOURCES || 'xianyu' }}
       # Carril rápido: lo más nuevo de cada modelo, cada FAST_LANE_MINUTES.
       # Los modelos con más anuncios nuevos por búsqueda en Xianyu (medido el 08-11-2026) y los que ya estaban.
-      FAST_TASKS: ${{ vars.FAST_TASKS || 'Lady Dior,Dior Saddle,Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Gucci Jackie,Celine Triomphe,Loewe Puzzle,Radar oportunidades,Cartier Santos y Tank,Omega Seamaster 300M,Omega Speedmaster,Tudor' }}
+      FAST_TASKS: ${{ vars.FAST_TASKS || 'Lady Dior,Chanel Classic Flap,Balenciaga Le City,Fendi Baguette,Gucci Jackie,Celine Triomphe,Loewe Puzzle,Radar oportunidades,Cartier Santos y Tank,Omega Seamaster 300M,Omega Speedmaster,Tudor' }}
       FAST_LANE_MINUTES: ${{ vars.FAST_LANE_MINUTES || '60' }}
+      # Intervalos fijados (minutos). 14-11-2026: Dior Saddle a cada 3 h (y fuera del carril rápido) para dar cupo al Radar.
+      TASK_INTERVAL_OVERRIDES: ${{ vars.TASK_INTERVAL_OVERRIDES || 'Radar oportunidades=30,Dior Saddle=180' }}
+      # Máx. de anuncios de la tarea: en las de intervalo ≥ INTEREST_MIN_INTERVAL_MIN (180) min se analizan solo los más interesantes
+      # por precio de las últimas 24 h, hasta ese máx. 14-11-2026: Dior Saddle, 10 (las demás usan el de su configuración, 20).
+      INTEREST_MIN_INTERVAL_MIN: ${{ vars.INTEREST_MIN_INTERVAL_MIN || '180' }}
+      TASK_MAX_ITEMS_OVERRIDES: ${{ vars.TASK_MAX_ITEMS_OVERRIDES || 'Dior Saddle=10' }}
       LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '0' }}
       # Cada ejecución, como mucho 38 min de tareas (+~6 min de preparación).
       RUN_BUDGET_MINUTES: ${{ vars.RUN_BUDGET_MINUTES || '38' }}
@@ -102,14 +108,29 @@ jobs:
       XIANYU_MAC_SHARE: ${{ vars.XIANYU_MAC_SHARE || '50' }}
       # Ritmo suave para no provocar verificaciones (regla de Nil, 11-11-2026): una búsqueda cada ~5 min,
       # como mucho 10 por hora y 30 min de pausa mínima entre una ejecución y la siguiente.
-      XIANYU_MAX_PER_HOUR: ${{ vars.XIANYU_MAX_PER_HOUR || '10' }}
-      XIANYU_MAC_GAP_SEC: ${{ vars.XIANYU_MAC_GAP_SEC || '300' }}
-      XIANYU_GAP_SEC: ${{ vars.XIANYU_GAP_SEC || '300' }}
+      # 14-11-2026: Nil pide «un poco más» de búsquedas, para el Radar de oportunidades: tope 12 por hora y pausas
+      # ~10 % más cortas (el ritmo sigue autorregulándose: cada verificación lo baja). Para volver atrás:
+      # XIANYU_MAX_PER_HOUR=10, XIANYU_GAP_SEC=300, XIANYU_MAC_GAP_SEC=300, LAUNCH_GAP_MIN_SEC=270,
+      # LAUNCH_GAP_MAX_SEC=510, LAUNCH_BREAK_PROB=0.15, RADAR_EXTRA_PER_RUN=0 (variables del repositorio).
+      XIANYU_MAX_PER_HOUR: ${{ vars.XIANYU_MAX_PER_HOUR || '12' }}
+      XIANYU_MAC_GAP_SEC: ${{ vars.XIANYU_MAC_GAP_SEC || '270' }}
+      XIANYU_GAP_SEC: ${{ vars.XIANYU_GAP_SEC || '270' }}
       RUN_GAP_MINUTES: ${{ vars.RUN_GAP_MINUTES || '10' }}
-      # Salidas repartidas: entre una tarea y la siguiente 4,5-8,5 min y, a veces, un descanso largo.
-      LAUNCH_GAP_MIN_SEC: ${{ vars.LAUNCH_GAP_MIN_SEC || '270' }}
-      LAUNCH_GAP_MAX_SEC: ${{ vars.LAUNCH_GAP_MAX_SEC || '510' }}
-      LAUNCH_BREAK_PROB: ${{ vars.LAUNCH_BREAK_PROB || '0.15' }}
+      # Salidas repartidas: entre una tarea y la siguiente 4-7,5 min y, a veces, un descanso largo.
+      LAUNCH_GAP_MIN_SEC: ${{ vars.LAUNCH_GAP_MIN_SEC || '240' }}
+      LAUNCH_GAP_MAX_SEC: ${{ vars.LAUNCH_GAP_MAX_SEC || '450' }}
+      LAUNCH_BREAK_PROB: ${{ vars.LAUNCH_BREAK_PROB || '0.12' }}
+      # Cupo extra del Radar de oportunidades: salidas añadidas por ejecución (detrás de las normales) y modelos de la hoja
+      # que entran en su rotación además de la lista fija.
+      RADAR_EXTRA_PER_RUN: ${{ vars.RADAR_EXTRA_PER_RUN || '1' }}
+      # Salida extra de cada ejecución: 2 de cada 3 para el reloj que más lleva sin salir, 1 de cada 3 para el Radar (rinde menos por
+      # búsqueda). El Radar pesa 1,3 en el reparto (antes 1,8) y los relojes pueden acumular retraso hasta 8 (antes 4) para no quedarse
+      # días sin salir. Volver atrás: EXTRA_SLOT_PATTERN=radar, RADAR_WEIGHT=1.8, WATCH_RATIO_CLAMP=4.
+      EXTRA_SLOT_PATTERN: ${{ vars.EXTRA_SLOT_PATTERN || 'watch,radar,watch' }}
+      RADAR_WEIGHT: ${{ vars.RADAR_WEIGHT || '1.3' }}
+      WATCH_RATIO_CLAMP: ${{ vars.WATCH_RATIO_CLAMP || '8' }}
+      RADAR_EXTRA_EVERY: ${{ vars.RADAR_EXTRA_EVERY || '3' }}
+      RADAR_AUTO_MAX: ${{ vars.RADAR_AUTO_MAX || '15' }}
       # Bloqueo de red de Xianyu («tráfico inusual», sin captcha): se para todo Xianyu estas horas.
       XIANYU_HARD_BLOCK_HOURS: ${{ vars.XIANYU_HARD_BLOCK_HOURS || '4' }}
       # Recientes: se analizan antes los publicados hace menos de XIANYU_RECENT_HOURS h; y nada de más de XIANYU_SEARCH_MAX_AGE_HOURS h.

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import {shouldRunAllTasks,isDue as due,nextDueTask,rankLaunches,launchSpacingMs} from './github-run-schedule.mjs';
+import {shouldRunAllTasks,isDue as due,nextDueTask,rankLaunches,launchSpacingMs,withExtraSlots,isRadarTaskName,isWatchTaskName} from './github-run-schedule.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -77,6 +77,24 @@ const RUN_MIN_MINUTES=envInt('RUN_MIN_MINUTES',0,0,300);
 // una ejecución vacía no encadena la siguiente y el bot se quedaba parado
 // hasta el cron de GitHub, que llega con horas de retraso.
 const IDLE_WAIT_MAX_MINUTES=envInt('IDLE_WAIT_MAX_MINUTES',90,0,240);
+// SALIDAS EXTRA (regla de Nil, 14-11-2026): al subir un poco el ritmo de Xianyu, lo que se gana va a relojes atrasados y al Radar.
+// En cada ejecución se añaden RADAR_EXTRA_PER_RUN salidas a la cola (una cada RADAR_EXTRA_EVERY salidas normales); qué tarea es cada
+// una lo decide EXTRA_SLOT_PATTERN. 0 = apagado.
+const RADAR_EXTRA_PER_RUN=envInt('RADAR_EXTRA_PER_RUN',1,0,4);
+const RADAR_EXTRA_EVERY=envInt('RADAR_EXTRA_EVERY',3,1,10);
+// Qué va en cada salida extra (14-11-2026): «watch» = el reloj que más lleva sin salir; «radar» = el Radar. Se recorre con el nº de
+// ejecución de GitHub. Por defecto 2 de cada 3 son relojes: el Radar rinde menos por búsqueda.
+const EXTRA_SLOT_PATTERN=String(process.env.EXTRA_SLOT_PATTERN??'watch,radar,watch');
+// Intervalos que mandan sobre los de la configuración cifrada. Regla de Nil, 11-11-2026: el Radar de oportunidades tiene la
+// máxima prioridad (30 min). 14-11-2026: Dior Saddle pasa a cada 3 h para dejar cupo de búsquedas al Radar (y sale del
+// carril rápido, ver FAST_TASKS en el workflow). Formato: "Nombre=minutos,Otro=minutos". Estas tareas tampoco se ajustan
+// por rendimiento: su intervalo es el que se fija aquí.
+// Máx. de anuncios de la tarea (en las de 3 h, 6 h… es el tope de los que se analizan: los más interesantes por precio de las
+// últimas 24 h). 14-11-2026: Dior Saddle, 10. Formato: "Nombre=número,Otro=número".
+const MAX_ITEMS_OVERRIDES=Object.fromEntries(String(process.env.TASK_MAX_ITEMS_OVERRIDES??'Dior Saddle=10')
+  .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Math.min(100,Math.max(5,Math.round(Number(v))))]));
+const INTERVAL_OVERRIDES=Object.fromEntries(String(process.env.TASK_INTERVAL_OVERRIDES??'Radar oportunidades=30,Dior Saddle=180')
+  .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Number(v)]));
 // 0 = sin máximo de relojes por ejecución (solo manda el tiempo).
 // CARRIL RÁPIDO (regla de Nil, 07-11-2026): los modelos que más rotan se
 // buscan solo en Xianyu y Mercari (lo más nuevo primero) en cada ejecución,
@@ -169,7 +187,7 @@ async function awaitAvailable(maxMin){
 function adjustTasks(list){
   return list.map(t=>{
     const f=Number(yieldFactor[t.id]);
-    if(!f||!t.interval_minutes||/^radar\b/i.test(String(t.task_name||'')))return t;
+    if(!f||!t.interval_minutes||/^radar\b/i.test(String(t.task_name||''))||INTERVAL_OVERRIDES[t.task_name])return t;
     return {...t,interval_minutes:Math.max(15,Math.round(Number(t.interval_minutes)/f))};
   });
 }
@@ -217,13 +235,14 @@ try{
     await api('POST','/api/health/report',{key:'xianyu-risk',clear:true}).catch(()=>{});
   }
   const existing=(await api('GET','/api/tasks')).tasks||[];
-  // Intervalos que mandan sobre los de la configuración cifrada (regla de Nil, 11-11-2026: el Radar de
-  // oportunidades tiene la máxima prioridad, como los modelos de 60 min). Formato: "Nombre=minutos,Otro=minutos".
-  const intervalOverrides=Object.fromEntries(String(process.env.TASK_INTERVAL_OVERRIDES??'Radar oportunidades=30')
-    .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Number(v)]));
   for(const t0 of cfg.tasks||[]){
-    const t=intervalOverrides[t0.task_name]?{...t0,interval_minutes:intervalOverrides[t0.task_name]}:t0;
-    if(t!==t0)console.log(`Intervalo de ${t.task_name}: ${t0.interval_minutes} → ${t.interval_minutes} min (prioridad máxima, mucha presencia).`);
+    let t=INTERVAL_OVERRIDES[t0.task_name]?{...t0,interval_minutes:INTERVAL_OVERRIDES[t0.task_name]}:t0;
+    if(t!==t0)console.log(`Intervalo de ${t.task_name}: ${t0.interval_minutes} → ${t.interval_minutes} min (fijado en TASK_INTERVAL_OVERRIDES).`);
+    // Máx. de anuncios de la tarea (TASK_MAX_ITEMS_OVERRIDES, 14-11-2026: Dior Saddle analiza solo los 10 más interesantes).
+    if(MAX_ITEMS_OVERRIDES[t.task_name]&&MAX_ITEMS_OVERRIDES[t.task_name]!==t.max_items){
+      console.log(`Anuncios por búsqueda de ${t.task_name}: ${t.max_items} → ${MAX_ITEMS_OVERRIDES[t.task_name]} (TASK_MAX_ITEMS_OVERRIDES).`);
+      t={...t,max_items:MAX_ITEMS_OVERRIDES[t.task_name]};
+    }
     const old=existing.find(x=>x.task_name===t.task_name);
     if(old) await api('PATCH',`/api/tasks/${old.id}`,t);
     else await api('POST','/api/tasks',t);
@@ -301,11 +320,20 @@ try{
         }
       }
     }
-    const ranked=rankLaunches(items,{laneMinutes:Number(process.env.FAST_LANE_MINUTES)||60});
+    const rankedBase=rankLaunches(items,{laneMinutes:Number(process.env.FAST_LANE_MINUTES)||60});
+    // Salidas extra del Radar (no en un lanzamiento manual que ya fuerza todas las tareas, ni con Xianyu parado).
+    const radarTask=tasks.find(t=>t.enabled&&isRadarTaskName(t.task_name));
+    const watchTasks=tasks.filter(t=>t.enabled&&isWatchTaskName(t.task_name));
+    const runNumber=Number(process.env.GITHUB_RUN_NUMBER)||Math.floor(Date.now()/(40*60e3));
+    const ranked=(runAllTasks||hardBlockedMin>0)?rankedBase:withExtraSlots(rankedBase,{radarTask,watchTasks,extra:RADAR_EXTRA_PER_RUN,every:RADAR_EXTRA_EVERY,runNumber:runNumber+cycle,pattern:EXTRA_SLOT_PATTERN});
     console.log(`\n##### CICLO ${cycle}: ${runnable.length}/${tasks.length} revisiones completas + ${ranked.length-runnable.length} del carril rápido, concurrencia ${TASK_CONCURRENCY}${RUN_BUDGET_MINUTES?`, máximo ${RUN_BUDGET_MINUTES} min`:''} #####`);
-    if(ranked.length)console.log('Orden de salida (más urgente primero): '+ranked.map(x=>`${x.task.task_name}${x.mode==='fast'?' (rápido)':''} ${x.urgency.toFixed(2)}`).join(' · '));
+    if(ranked.length)console.log('Orden de salida (más urgente primero): '+ranked.map(x=>`${x.task.task_name}${x.mode==='fast'?' (rápido)':''}${x.extra?' (cupo extra)':''} ${x.urgency.toFixed(2)}`).join(' · '));
+    // Un mismo modelo no puede estar ejecutándose dos veces a la vez (el servidor lo rechaza): las salidas del Radar van en fila.
+    let radarChain=Promise.resolve();
     await runPool(ranked,TASK_CONCURRENCY,async item=>{
       const task=item.task,fast=item.mode==='fast';
+      let releaseRadar=null;
+      if(!fast&&isRadarTaskName(task.task_name)){const prev=radarChain;radarChain=new Promise(r=>{releaseRadar=r;});await prev;}
       try{
         const q=await launchGate(async()=>{
           if(hardBlockedMin>0||stopLaunching)return null;
@@ -338,6 +366,8 @@ try{
       }catch(e){
         if(!fast)taskResults.push({task_id:task.id,task_name:task.task_name,status:'error',error:e?.message||String(e)});
         console.error(`FAILED ${fast?'rápido ':''}${task.task_name}:`,e?.message||e);
+      }finally{
+        if(releaseRadar)releaseRadar();
       }
     });
     if(RUN_BUDGET_MINUTES){
