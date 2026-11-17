@@ -20,6 +20,7 @@ import {radarPrioritize,radarBuildList,radarParseWeights,radarYieldFactors,radar
 import {picksByInterest,capByInterest,pageIsSaturated,mergeUniqueById} from './scripts/interest-pick.mjs';
 import {fetchRevolutRate,fxDailyMessage,madridParts,madridAfter} from './scripts/fx-revolut.mjs';
 import {SUMMARY_TAB,parseSummaryValues,lookupSummary,priceForMargin} from './scripts/sheet-summary.mjs';
+import {luxeVerdict,tooCheapVerdict} from './scripts/luxe-gate.mjs';
 import {macOneMapReady,macOneMapSnapshot,macXianyuSearch} from './scripts/onemap-mac-client.mjs';
 // Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
 const VESTIAIRE_LIVE_REALIZATION=0.90;
@@ -6228,8 +6229,19 @@ function xianyuReplicaTerm(item){
   return XIANYU_REPLICA_TERMS.find(t=>text.includes(t))||null;
 }
 const XIANYU_MIN_PRICE_SHARE=0.30;
+// 17-11-2026 (Nil): un Miu Miu Wander «con caja» a ~320 € salía una y otra vez como compra y era réplica. Suelo por marca (MIUMIU_MIN_PRICE_EUR,
+// 450 €: los originales que han salido valían 600-800 €) y, para cualquier modelo, nada por debajo del XIANYU_SUMMARY_MIN_SHARE (30 %) del
+// precio de referencia del Resumen (antes era el 27 % del p25 de lo pedido, demasiado bajo).
+const XIANYU_BRAND_FLOORS=[{re:/缪缪|miu\s?miu|miumiu|ミュウミュウ/i,min:Number(process.env.MIUMIU_MIN_PRICE_EUR??450),label:'Miu Miu'}];
 function xianyuTooCheapVeto(item,task){
-  if(String(item?.source||'').toLowerCase()!=='xianyu'||!task?.task_name)return null;
+  if(String(item?.source||'').toLowerCase()!=='xianyu')return null;
+  {
+    const h=task?.task_name?summaryHitFor(item,task):null;
+    const extra=tooCheapVerdict({title:`${item?.title||''}`,price:item?.price_eur,brandFloors:XIANYU_BRAND_FLOORS,
+      summaryRef:h?.hit?.ref??null,summaryN:h?.hit?.n??0,minShare:Number(process.env.XIANYU_SUMMARY_MIN_SHARE??0.30)});
+    if(extra)return {code:'xianyu_too_cheap',term:extra.term,reasons:[extra.reason]};
+  }
+  if(!task?.task_name)return null;
   const price=Number(item?.price_eur);
   const r=vestiaireRefs().tasks?.[task.task_name];
   if(!Number.isFinite(price)||price<=0||!r)return null;
@@ -6389,7 +6401,7 @@ function vetoUnverifiableXianyuAnalyses(){
 // gasta IA en él. Antes un tercio del gasto se iba en anuncios así.
 // A cuánto tendría que bajar un anuncio para dejar el margen mínimo (TARGET_MARGIN_PCT, 30 % del coste puesto) vendiendo al precio de
 // referencia de la pestaña «Resumen» (el segmento más específico que se conozca del anuncio: variante, material y color por el título).
-function summaryTargetFor(item,task){
+function summaryHitFor(item,task){
   try{
     const rows=vestiaireSheetCache?.summary;
     if(!rows?.length||!task?.task_name||listingAuction(item))return null;
@@ -6404,13 +6416,51 @@ function summaryTargetFor(item,task){
     const material=mc==='tela'?'Tela / sintético':mc==='exotica'?'Exótico':mc==='piel'?'Piel':'';
     const hit=lookupSummary(rows,{tipo:watch?'Reloj':'Bolso',model,variant,material,color});
     if(!hit)return null;
-    const margin=Number(process.env.TARGET_MARGIN_PCT??30);
-    const target=priceForMargin({resale:hit.ref,feePct:resalePlatform(task.task_name).fee,marginPct:margin,
-      landedFn:p=>Number(importEconomics({...item,price_eur:p})?.importedTotalEur)||0});
     const r=hit.row;
-    const label=[r.model,r.variant,r.material,r.color,r.condition].filter(x=>String(x||'').trim()).join(' · ');
-    return target>0?{target,ref:hit.ref,n:hit.n,level:hit.level,margin,label}:null;
+    return {hit,label:[r.model,r.variant,r.material,r.color,r.condition].filter(x=>String(x||'').trim()).join(' · ')};
   }catch{return null;}
+}
+function summaryTargetFor(item,task,{marginPct=null}={}){
+  try{
+    const h=summaryHitFor(item,task);
+    if(!h)return null;
+    const margin=marginPct!=null?Number(marginPct):Number(process.env.TARGET_MARGIN_PCT??30);
+    const target=priceForMargin({resale:h.hit.ref,feePct:resalePlatform(task.task_name).fee,marginPct:margin,
+      landedFn:p=>Number(importEconomics({...item,price_eur:p})?.importedTotalEur)||0});
+    return target>0?{target,ref:h.hit.ref,n:h.hit.n,level:h.hit.level,margin,label:h.label}:null;
+  }catch{return null;}
+}
+// Línea para los avisos de lo que SÍ interesa (17-11-2026): según el Resumen, hasta cuánto se puede pagar (30 %) y a cuánto apuntar para
+// negociar (OFFER_MARGIN_PCT, 40 % de margen) con el modelo y sus condiciones.
+function summaryAlertLine(x){
+  try{
+    if(!x?._task_name)return '';
+    const task={task_name:x._task_name};
+    const max=summaryTargetFor(x,task);
+    if(!max)return '';
+    const offerMargin=Number(process.env.OFFER_MARGIN_PCT??40);
+    const ideal=summaryTargetFor(x,task,{marginPct:offerMargin});
+    const price=Number(x.price_eur);
+    const head=`📊 <b>Según tu Resumen</b> (${htmlEsc(max.label)} · ${max.n} fichas): venta de referencia ${eur0(max.ref)}`;
+    if(!(price>0))return head;
+    if(price>max.target)return `${head}\n⛔ Por encima del máximo: para un ${max.margin} % de margen tendría que bajar a <b>${max.target} €</b>`;
+    if(ideal&&price>ideal.target){
+      const pct=Math.round((1-ideal.target/price)*100);
+      return `${head}\n💬 Puedes pagar hasta <b>${max.target} €</b> (${max.margin} %) · para negociar apunta a <b>${ideal.target} €</b> (−${pct} %, ${offerMargin} % de margen)`;
+    }
+    return `${head}\n✅ El precio actual ya está en el ideal (≤ ${ideal?ideal.target:max.target} €)`;
+  }catch{return '';}
+}
+// ¿Va este aviso también al chat Altagama Luxe? Más exigente que el chat principal (ver scripts/luxe-gate.mjs). LUXE_STRICT=0 lo apaga.
+function luxeAllows(x){
+  if(['0','off','false','no'].includes(String(process.env.LUXE_STRICT??'1').toLowerCase()))return {ok:true,why:''};
+  let v={};try{v=JSON.parse(x.verification_json||'{}')||{};}catch{}
+  const noRefs=v.final?.no_refs_interesting===true&&!(Number(v.final?.resale_mean_eur)>0);
+  const t=x._task_name?summaryTargetFor(x,{task_name:x._task_name}):null;
+  const cleanPct=Number(v.final?.clean_margin_pct);
+  return luxeVerdict({risk:x.authenticity_risk,price:x.price_eur,netLow:x.net_profit_low_eur??null,landed:x.landed_cost_eur,
+    marginPct:Number.isFinite(cleanPct)?cleanPct:null,noRefs,summary:t?{target:t.target,n:t.n,margin:t.margin}:null,
+    minMarginPct:Number(process.env.LUXE_MIN_MARGIN_PCT??35)});
 }
 function summaryTargetNote(item,task){
   const t=summaryTargetFor(item,task);
@@ -6793,7 +6843,11 @@ async function telegramSendListingTo(text,x,chat=null){
 async function telegramSendListing(text,x,{luxe:toLuxe=true}={}){
   if(!telegramConfigured())return {sent:false};
   const r=await telegramSendListingTo(text,x,null);
-  const luxe=toLuxe?telegramLuxeChat():'';
+  let luxe=toLuxe?telegramLuxeChat():'';
+  if(luxe){
+    const gate=luxeAllows(x);
+    if(!gate.ok){console.log(`Luxe: «${String(x.title||'').slice(0,40)}» no se envía a Luxe (solo al chat principal): ${gate.why}.`);luxe='';}
+  }
   // Un fallo en el chat Luxe nunca debe afectar al chat principal.
   if(luxe)await telegramSendListingTo(text,x,luxe).catch(e=>console.error('Telegram Luxe:',e.message));
   return r;
@@ -7581,6 +7635,7 @@ function instantAlertText(x,{soft=false}={}){
       :sale?`📈 Venta orientativa <b>${eur0(sale)}</b>${n?` · ${n} igual${n===1?'':'es'}${soldN?` (${soldN} vendida${soldN===1?'':'s'})`:''}`:''}`:'',
     !norefs&&sale?`✅ Beneficio limpio <b>${eur0(clean)}</b>${margin!=null?` (${margin} %)`:''} · coste puesto ${eur0(x.landed_cost_eur)}`:'',
     !norefs&&sale&&!auc?targetPriceLines(x,v):'',
+    !auc?summaryAlertLine(x):'',
     alertQuality(x,v),
     norefs?'':alertRefs(v),
     o?`💬 Ofrece <b>¥${o.openCny}</b> · tu máximo ¥${o.maxCny} (${eur0(o.profitMax)} limpios)`:'',
