@@ -151,3 +151,13 @@ test('urgencia: un reloj muy atrasado supera a un bolso de 60 min con el tope nu
   const radar={task:{task_name:'Radar oportunidades',interval_minutes:30,last_run_at:new Date(now-3*3600e3).toISOString()},mode:'full'};
   assert.ok(launchUrgency(radar,{...o,radarWeight:1.3})<launchUrgency(radar,{...o,radarWeight:1.8}));
 });
+
+import {parseNameSet,nameFold} from '../scripts/github-run-schedule.mjs';
+test('tareas desactivadas: nombres sin tildes ni mayúsculas',()=>{
+  const set=parseNameSet('Alaia Le Teckel, Otra tarea ,');
+  assert.equal(set.has(nameFold('Alaïa Le Teckel')),true);
+  assert.equal(set.has(nameFold('ALAIA le teckel')),true);
+  assert.equal(set.has(nameFold('Lady Dior')),false);
+  assert.equal(parseNameSet('').size,0);
+  assert.equal(parseNameSet(undefined).size,0);
+});

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import {shouldRunAllTasks,isDue as due,nextDueTask,rankLaunches,launchSpacingMs,withExtraSlots,isRadarTaskName,isWatchTaskName} from './github-run-schedule.mjs';
+import {shouldRunAllTasks,isDue as due,nextDueTask,rankLaunches,launchSpacingMs,withExtraSlots,isRadarTaskName,isWatchTaskName,parseNameSet,nameFold} from './github-run-schedule.mjs';
 import {msUntilMadrid} from './fx-revolut.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -94,6 +94,7 @@ const EXTRA_SLOT_PATTERN=String(process.env.EXTRA_SLOT_PATTERN??'watch,radar,wat
 // últimas 24 h). 14-11-2026: Dior Saddle, 10. Formato: "Nombre=número,Otro=número".
 const MAX_ITEMS_OVERRIDES=Object.fromEntries(String(process.env.TASK_MAX_ITEMS_OVERRIDES??'Dior Saddle=10')
   .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Math.min(100,Math.max(5,Math.round(Number(v))))]));
+const DISABLED_TASKS=parseNameSet(process.env.DISABLED_TASKS??'Alaia Le Teckel');
 const INTERVAL_OVERRIDES=Object.fromEntries(String(process.env.TASK_INTERVAL_OVERRIDES??'Radar oportunidades=30,Dior Saddle=180')
   .split(',').map(x=>x.split('=').map(y=>y.trim())).filter(([k,v])=>k&&Number(v)>0).map(([k,v])=>[k,Number(v)]));
 // 0 = sin máximo de relojes por ejecución (solo manda el tiempo).
@@ -257,6 +258,10 @@ try{
   const existing=(await api('GET','/api/tasks')).tasks||[];
   for(const t0 of cfg.tasks||[]){
     let t=INTERVAL_OVERRIDES[t0.task_name]?{...t0,interval_minutes:INTERVAL_OVERRIDES[t0.task_name]}:t0;
+    if(DISABLED_TASKS.has(nameFold(t.task_name))&&t.enabled!==false){
+      console.log(`Tarea desactivada por DISABLED_TASKS: ${t.task_name}.`);
+      t={...t,enabled:false};
+    }
     if(t!==t0)console.log(`Intervalo de ${t.task_name}: ${t0.interval_minutes} → ${t.interval_minutes} min (fijado en TASK_INTERVAL_OVERRIDES).`);
     // Máx. de anuncios de la tarea (TASK_MAX_ITEMS_OVERRIDES, 14-11-2026: Dior Saddle analiza solo los 10 más interesantes).
     if(MAX_ITEMS_OVERRIDES[t.task_name]&&MAX_ITEMS_OVERRIDES[t.task_name]!==t.max_items){

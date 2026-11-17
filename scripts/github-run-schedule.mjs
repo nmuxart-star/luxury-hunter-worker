@@ -165,3 +165,8 @@ export function withExtraSlots(ranked,{radarTask=null,watchTasks=[],extra=1,ever
   while(added<extras.length){out.push(extras[added]);added++;}
   return out;
 }
+
+// TAREAS DESACTIVADAS (regla de Nil, 14-11-2026): lista de nombres (sin tildes ni mayúsculas) que el lanzador deja siempre apagadas aunque la
+// configuración cifrada las traiga activas. Por defecto, «Alaia Le Teckel» (sin avisos y sin pestaña en la hoja).
+export const nameFold=s=>String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().trim();
+export const parseNameSet=text=>new Set(String(text??'').split(',').map(nameFold).filter(Boolean));
