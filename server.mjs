@@ -6460,7 +6460,7 @@ function luxeAllows(x){
   const cleanPct=Number(v.final?.clean_margin_pct);
   return luxeVerdict({risk:x.authenticity_risk,price:x.price_eur,netLow:x.net_profit_low_eur??null,landed:x.landed_cost_eur,
     marginPct:Number.isFinite(cleanPct)?cleanPct:null,noRefs,summary:t?{target:t.target,n:t.n,margin:t.margin}:null,
-    minMarginPct:Number(process.env.LUXE_MIN_MARGIN_PCT??35)});
+    minMarginPct:Number(process.env.LUXE_MIN_MARGIN_PCT??30)});
 }
 function summaryTargetNote(item,task){
   const t=summaryTargetFor(item,task);

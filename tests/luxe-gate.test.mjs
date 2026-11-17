@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {luxeVerdict,tooCheapVerdict} from '../scripts/luxe-gate.mjs';
 
-test('Luxe: el margen exigido sube al 35 % y el riesgo alto nunca entra',()=>{
+test('Luxe: el margen exigido es el 30 % (antes bastaba el 20 %) y el riesgo alto nunca entra',()=>{
   assert.equal(luxeVerdict({price:600,netLow:250,landed:700}).ok,true);          // 36 %
-  assert.equal(luxeVerdict({price:600,netLow:210,landed:700}).ok,false);         // 30 %: antes pasaba
+  assert.equal(luxeVerdict({price:600,netLow:210,landed:700}).ok,true);          // 30 %: justo en el mínimo
+  assert.equal(luxeVerdict({price:600,netLow:175,landed:700}).ok,false);         // 25 %: antes entraba como aviso suave
   assert.equal(luxeVerdict({risk:'HIGH',price:600,netLow:400,landed:700}).ok,false);
   assert.equal(luxeVerdict({price:600}).ok,false);                                // sin margen ni Resumen
 });

@@ -1,12 +1,12 @@
 // FILTRO DEL CHAT «ALTAGAMA LUXE» (regla de Nil, 17-11-2026): ese chat recibe solo lo que de verdad compensa, más exigente que el chat
 // principal (que sigue recibiéndolo todo). Un aviso entra en Luxe si:
 //   · el riesgo de autenticidad no es alto;
-//   · el beneficio limpio sobre el coste puesto es al menos minMarginPct (35 %; antes bastaba 20-30 %);
+//   · el beneficio limpio sobre el coste puesto es al menos minMarginPct (30 %, lo que busca Nil; antes los avisos suaves entraban desde el 20 %);
 //   · si el Resumen de precios conoce el modelo (≥ minN fichas), el precio no supera el máximo de compra para el 30 % de margen;
 //   · un aviso «sin pronóstico» solo entra si el Resumen lo conoce y el precio está dentro de ese máximo (sin Resumen no hay con qué
 //     comprobar que sea rentable).
 // Función pura: el servidor le pasa lo que sabe del anuncio y del Resumen.
-export function luxeVerdict({risk='',price,netLow=null,landed=null,marginPct=null,noRefs=false,summary=null,minMarginPct=35,minN=5}={}){
+export function luxeVerdict({risk='',price,netLow=null,landed=null,marginPct=null,noRefs=false,summary=null,minMarginPct=30,minN=5}={}){
   if(String(risk).toUpperCase()==='HIGH')return {ok:false,why:'riesgo alto de autenticidad'};
   const p=Number(price);
   const known=summary&&summary.target>0&&summary.n>=minN;
