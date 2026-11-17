@@ -6407,13 +6407,22 @@ function summaryTargetFor(item,task){
     const margin=Number(process.env.TARGET_MARGIN_PCT??30);
     const target=priceForMargin({resale:hit.ref,feePct:resalePlatform(task.task_name).fee,marginPct:margin,
       landedFn:p=>Number(importEconomics({...item,price_eur:p})?.importedTotalEur)||0});
-    return target>0?{target,ref:hit.ref,n:hit.n,level:hit.level,margin}:null;
+    const r=hit.row;
+    const label=[r.model,r.variant,r.material,r.color,r.condition].filter(x=>String(x||'').trim()).join(' · ');
+    return target>0?{target,ref:hit.ref,n:hit.n,level:hit.level,margin,label}:null;
   }catch{return null;}
 }
 function summaryTargetNote(item,task){
   const t=summaryTargetFor(item,task);
   if(!t||!(Number(item.price_eur)>t.target))return '';
-  return ` Para un margen del ${t.margin} % sobre el coste tendría que bajar a ${t.target} € (venta de referencia ${t.ref} € · ${t.n} fichas · ${t.level.toLowerCase()}).`;
+  return ` Para un margen del ${t.margin} % sobre el coste, ${t.label} tendría que bajar a ${t.target} € (venta de referencia ${t.ref} € · ${t.n} fichas).`;
+}
+// La misma idea para el mensaje de Telegram de un anuncio descartado: este modelo, con estas condiciones, tiene que bajar a X € para ser rentable.
+function summaryTargetFeedLine(x,task){
+  const t=summaryTargetFor(x,task);
+  const price=Number(x.price_eur);
+  if(!t||!(price>t.target))return '';
+  return `📉 <b>Para ser rentable</b> (≥ ${t.margin} % sobre el coste) ${htmlEsc(t.label)} tendría que bajar a <b>${t.target} €</b> (ahora ${Math.round(price)} €) · venta de referencia ${t.ref} € · ${t.n} fichas`;
 }
 function priceCeilingVeto(item,task){
   if(['0','off','false','no'].includes(String(process.env.PRICE_PRESCREEN||'').toLowerCase()))return null;
@@ -7694,6 +7703,7 @@ function xianyuFeedText(x){
     htmlEsc(title),
     `💶 <b>${alertMoney(x)}</b>${ago?` · ${ago}`:''} · Xianyu`,
     `🛡️ 验货宝 · vendedor 信用极好${reviewed}`,
+    (x._task_name?summaryTargetFeedLine(x,{task_name:x._task_name}):''),
     repeats?`🔁 Mismo anuncio de ${repeats} vendedor${repeats===1?'':'es'} más (solo te enseño uno)`:'',
     alertLink(x)
   ].filter(Boolean).join('\n');

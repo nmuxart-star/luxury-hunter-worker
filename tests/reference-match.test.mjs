@@ -444,6 +444,7 @@ function feedHarness({env={},already=new Set(),feedback={}}={}){
     instantAlertText:x=>`<b>🔥 COMPRA</b> · ${x._task_name}\nLady Dior · 1.000 €\n🔗 ${x.url}`,
     telegramConfigured:()=>true,telegramSend:async(text,photo,opts)=>{sent.push({text,photo,opts});return {sent:true};},
     listingTelegramImages:x=>x.image_url?[x.image_url]:[],alertButtons:id=>[[{callback_data:`ok:${id}`}]],
+    summaryTargetFeedLine:x=>x.id===99?'📉 Para ser rentable (≥ 30 % sobre el coste) Lady Dior · Mini · Negro tendría que bajar a 640 € (ahora 900 €)':'',
     listingFeedback:id=>feedback[id]||null,listingRepeatCount:id=>({10:2})[id]||0,sleep:async()=>{},
     db:{prepare:sql=>/SELECT 1 FROM notifications/.test(sql)?{get:id=>already.has(id)?{1:1}:undefined}:{run:(...a)=>marks.push(a)}}});
   vm.runInContext(extract('const FEED_NO_CODES','async function sendInstantAlerts('),ctx);
@@ -453,6 +454,13 @@ const feedItem=(id,{credit='卖家信用极好',tag='验货宝',decision=null,ve
   id,source:'xianyu',url:`https://www.goofish.com/item?id=${id}`,title:`戴妃包 ${id} 感兴趣的话点“我想要”`,price_eur:price,original_price:price*7.8,currency:'CNY',
   first_seen:new Date(Date.now()-age*60e3).toISOString(),decision,opportunity_score:decision?70:null,verification_json:JSON.stringify(verification),
   raw_json:JSON.stringify({'商品信息':{'商品标签':[tag,credit].filter(Boolean)}}),image_url:'https://img.example/a.jpg',...extra});
+test('feed Xianyu: un descartado por caro lleva a cuánto tendría que bajar este modelo con estas condiciones',async()=>{
+  const h=feedHarness();
+  await h.ctx.sendXianyuFeed({id:1,task_name:'Lady Dior'},5,[feedItem(99,{decision:'REJECT'}),feedItem(98,{decision:'REJECT'})]);
+  const con=h.sent.find(m=>/戴妃包 99\b/.test(m.text)),sin=h.sent.find(m=>/戴妃包 98\b/.test(m.text));
+  assert.match(con.text,/📉 Para ser rentable/);assert.match(con.text,/Lady Dior · Mini · Negro tendría que bajar a 640 €/);
+  assert.ok(!/Para ser rentable/.test(sin.text),'sin referencia en el Resumen, no se inventa nada');
+});
 test('feed Xianyu: solo vendedor de crédito máximo con 验货宝; sin ellos no sale',()=>{
   const {ctx}=feedHarness();
   assert.equal(ctx.xianyuFeedEligible(feedItem(1)),true);
