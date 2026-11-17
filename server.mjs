@@ -6401,6 +6401,11 @@ function vetoUnverifiableXianyuAnalyses(){
 // gasta IA en él. Antes un tercio del gasto se iba en anuncios así.
 // A cuánto tendría que bajar un anuncio para dejar el margen mínimo (TARGET_MARGIN_PCT, 30 % del coste puesto) vendiendo al precio de
 // referencia de la pestaña «Resumen» (el segmento más específico que se conozca del anuncio: variante, material y color por el título).
+// Palabras chinas de los modelos de reloj de las tareas (los títulos de Xianyu a menudo no llevan el nombre en letras latinas).
+const ZH_WATCH_MODELS=[[/碧湾|碧灣/,'Black Bay'],[/领潜|領潛|潜行者/,'Pelagos'],[/超霸/,'Speedmaster'],[/海马|海馬/,'Seamaster Diver 300 M'],[/天梭|爱彼/,''],
+  [/山度士|山度|桑托斯/,'Santos'],[/坦克/,'Tank'],[/猎豹|獵豹|黑豹/,'Panthère'],[/蓝气球|藍氣球|蓝气/,'Ballon Bleu'],[/蚝式恒动|蠔式恆動/,'Oyster Perpetual'],[/空中霸王/,'Air King'],
+  [/飞行员|飛行員/,'Pilot'],[/航空计时|航空計時/,'Navitimer'],[/机械计时|機械計時/,'Chronomat'],[/路美诺|路密诺|卢米诺/,'Luminor'],[/摩纳哥|摩納哥/,'Monaco'],[/卡莱拉|卡萊拉/,'Carrera'],
+  [/卡地亚.*(?:钢带|坦克)/,'Tank'],[/芝柏|大蛇/,'']];
 function summaryHitFor(item,task){
   try{
     const rows=vestiaireSheetCache?.summary;
@@ -6408,9 +6413,24 @@ function summaryHitFor(item,task){
     const info=baseReferenceRows(task,item);
     if(!info?.tab)return null;
     const watch=isWatchTask(task.task_name);
-    const model=/^radar/i.test(info.tab)?(info.model||''):info.tab;
-    const title=`${item.title||''} ${item.description||''}`;
-    const variant=watch?'':(vestiaireSizeLabel(title)||'');
+    // Lo que la IA identificó del anuncio (si ya se analizó) ayuda a reconocer modelo, variante, material y color.
+    let hints='';
+    try{const v=JSON.parse(item.verification_json||'{}')||{};const e=v.exact||{};hints=[e.family,e.exact_variant_label,e.size,e.material,e.main_color].filter(x=>x&&!/unknown|desconocid/i.test(String(x))).join(' ');}catch{}
+    if(isWatchTask(task.task_name))hints+=' '+ZH_WATCH_MODELS.filter(([re,m])=>m&&re.test(`${item.title||''} ${item.description||''}`)).map(([,m])=>m).join(' ');
+    const title=`${item.title||''} ${item.description||''} ${hints}`;
+    const nrm=t=>String(t||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    let model=/^radar/i.test(info.tab)?(info.model||''):info.tab;
+    let wref='';
+    if(watch){
+      // En el Resumen los relojes van por modelo («Black Bay»), no por pestaña («Tudor»): se reconoce el modelo más largo de la marca de la
+      // tarea que aparezca en el texto, y la referencia si se nombra. Si no se reconoce ninguno, mejor no sugerir nada que sugerir un modelo equivocado.
+      const hay=nrm(title),tn=nrm(task.task_name);
+      const cand=rows.filter(r=>r.tipo==='Reloj'&&r.level==='Modelo'&&tn.startsWith(nrm(r.brand))&&hay.includes(nrm(r.model))).sort((a,b)=>nrm(b.model).length-nrm(a.model).length)[0];
+      if(!cand)return null;
+      model=cand.model;
+      wref=(rows.filter(r=>r.tipo==='Reloj'&&r.model===model&&r.level==='Modelo + variante'&&nrm(r.variant).length>=4&&hay.includes(nrm(r.variant))).sort((a,b)=>b.n-a.n)[0]||{}).variant||'';
+    }
+    const variant=watch?wref:(vestiaireSizeLabel(title)||'');
     const color=(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(title))||[])[0]||'';
     const mc=watch?null:materialClass(title);
     const material=mc==='tela'?'Tela / sintético':mc==='exotica'?'Exótico':mc==='piel'?'Piel':'';
