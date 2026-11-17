@@ -155,3 +155,15 @@ test('radarBuildList: el listado son los modelos más presentes, más vendidos y
   assert.equal(L.find(x=>x.q==='圣罗兰 niki').fromConfig,true);
   assert.deepEqual(radarBuildList([],cfg),[]);
 });
+
+test('radarPriceBand con margen %: el máximo deja ese % de beneficio sobre el coste puesto',()=>{
+  const landed=p=>p*1.3+75;
+  const values=[1400,1500,1500,1500,1600,1500,1500];
+  const b=radarPriceBand({values,fee:0.2,landedFn:landed,marginPct:30,taskMax:2200});
+  // venta 1.500 → neto 1.200; coste = 1.200/1,30 = 923 → precio = (923-75)/1,3 ≈ 652
+  assert.ok(b.maxEur>=640&&b.maxEur<=660,String(b.maxEur));
+  const l=landed(b.maxEur);
+  assert.ok((1500*0.8-l)/l>=0.295,'margen real ≥ 30 %');
+  const sinMargen=radarPriceBand({values,fee:0.2,landedFn:landed,minProfit:200});
+  assert.ok(sinMargen.maxEur>b.maxEur,'el criterio de 120 € era más laxo que el 30 %');
+});

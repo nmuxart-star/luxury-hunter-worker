@@ -74,7 +74,7 @@ function harness({screen,photo,extraRows=[],extra={},landed=1000,colour=null,liv
     sameModelRows:(tab,rows)=>({key:'lady dior',rows}),isWatchTask:()=>watch,
     vestiaireLiveOn:()=>liveOn,vestiaireTaskQuery:()=>'lady dior',vestiaireLiveQuery:()=>null,
     vestiaireLiveSearchRows:async()=>({status:'ok',model:'Lady Dior',rows:liveRows}),
-    importEconomics:()=>({importedTotalEur:landed}),detectMarketplaceVerification:()=>({status:'AVAILABLE'}),
+    importEconomics:()=>({importedTotalEur:landed}),summaryTargetNote:()=>'',detectMarketplaceVerification:()=>({status:'AVAILABLE'}),
     resalePlatform:()=>({name:'Vestiaire',fee:20}),VESTIAIRE_DEFAULT_REALIZATION:0.92,VESTIAIRE_LIVE_REALIZATION:0.92,
     listingAuction:()=>null,fetchGeminiImageParts:async(it,n)=>watch?[]:Array.from({length:n},()=>({inline_data:{mime_type:'image/jpeg',data:'AA=='}})),aiModel:()=>'m',verifyBudgetLeftUsd:()=>1,
     verifyTierStore:{enterWith(){}},isAiPolicyFlag:()=>false,vestiaireSheetFresh:()=>true,roundMoney:n=>Math.round(n*100)/100,

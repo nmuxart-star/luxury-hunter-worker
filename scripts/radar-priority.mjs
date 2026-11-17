@@ -156,17 +156,21 @@ export function radarYieldFactors(history){
 // beneficio limpio ≥ tolerance × beneficio mínimo). Así las 30 plazas de la página 1 son de anuncios que pueden ser rentables.
 // El mínimo baja si hace falta (floorRatio del máximo) para que un modelo barato no se quede sin banda.
 // values: precios de venta de referencia de las fichas (€); landedFn(precio) = coste puesto en España de un anuncio a ese precio.
-export function radarPriceBand({values,fee=0.15,minProfit=200,landedFn,taskMin=null,taskMax=null,tolerance=0.6,floorRatio=0.4,minRefs=5,trim=0.1}={}){
+// marginPct > 0 (14-11-2026: 30): el máximo es el que deja ese % de beneficio limpio sobre el coste puesto (en vez de un mínimo en euros).
+export function radarPriceBand({values,fee=0.15,minProfit=200,landedFn,taskMin=null,taskMax=null,tolerance=0.6,floorRatio=0.4,minRefs=5,trim=0.1,marginPct=0}={}){
   const v=(values||[]).map(Number).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b);
   if(v.length<minRefs||typeof landedFn!=='function')return null;
   const cut=Math.floor(v.length*trim);
   const mid=v.slice(cut,v.length-cut);
   const resale=mid.reduce((a,b)=>a+b,0)/mid.length;
   const need=minProfit*tolerance;
-  const clean=price=>resale*(1-fee)-landedFn(price);
-  if(!(clean(1)>=need))return null;                       // ni regalado deja el margen mínimo
+  const ok=price=>{
+    const landed=landedFn(price),clean=resale*(1-fee)-landed;
+    return marginPct>0?clean>=landed*marginPct/100:clean>=need;
+  };
+  if(!ok(1))return null;                                   // ni regalado deja el margen mínimo
   let lo=1,hi=resale;                                      // el coste puesto siempre supera al precio: el máximo está por debajo de la venta
-  for(let i=0;i<40;i++){const m=(lo+hi)/2;if(clean(m)>=need)lo=m;else hi=m;}
+  for(let i=0;i<40;i++){const m=(lo+hi)/2;if(ok(m))lo=m;else hi=m;}
   let maxEur=Math.floor(lo/10)*10;
   if(Number(taskMax)>0)maxEur=Math.min(maxEur,Number(taskMax));
   if(!(maxEur>=30))return null;

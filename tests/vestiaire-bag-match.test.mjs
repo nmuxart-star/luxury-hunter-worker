@@ -103,7 +103,7 @@ test('loader reads unknown tabs and all rows without overwriting a shared task m
   const properties=[{title:'Balenciaga Fotos',gridProperties:{rowCount:100,columnCount:26}},
     {title:'Balenciaga Le City',gridProperties:{rowCount:2505,columnCount:28}},
     {title:'New bag model',gridProperties:{rowCount:120,columnCount:24}}];
-  const ctx=vm.createContext({process:{env:{VESTIAIRE_SHEET_ID:'fixture'}},AbortSignal,Date,
+  const ctx=vm.createContext({process:{env:{VESTIAIRE_SHEET_ID:'fixture'}},AbortSignal,Date,SUMMARY_TAB:'Resumen',parseSummaryValues:()=>[],
     googleSheetsAuth:async()=>({headers:{},query:''}),
     vestiaireSheetTaskName:t=>t.startsWith('Balenciaga')?'Balenciaga Le City':null,
     vestiaireSheetTab:values=>({source:'sheet',fichas:[{id:values[0]}]}),

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import {shouldRunAllTasks,isDue as due,nextDueTask,rankLaunches,launchSpacingMs,withExtraSlots,isRadarTaskName,isWatchTaskName} from './github-run-schedule.mjs';
+import {msUntilMadrid} from './fx-revolut.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const base='http://127.0.0.1:8200';
@@ -104,6 +105,25 @@ const FAST_TASKS=String(process.env.FAST_TASKS||'').split(',').map(x=>x.trim()).
 const ACTIVE_SOURCES=String(process.env.ACTIVE_SOURCES||'xianyu,buyee').split(',').map(x=>x.trim()).filter(Boolean);
 const FAST_LABEL=ACTIVE_SOURCES.includes('buyee')?'Xianyu + Mercari':'Xianyu';
 const workerStartedAt=Date.now();
+// MENSAJE DIARIO DEL CAMBIO YUAN → EURO (Nil, 14-11-2026): a las 13:30 (Madrid) el servidor manda a Telegram el cambio de Revolut y si ha
+// subido o bajado respecto a ayer. El servidor decide si toca (hora, ya enviado hoy); aquí solo se le avisa a la hora exacta si esta
+// ejecución sigue en marcha a las 13:30 y, en cada ciclo, por si la hora pasó mientras no había ninguna ejecución. FX_DAILY=0 lo apaga.
+const FX_DAILY=!['0','off','false','no'].includes(String(process.env.FX_DAILY??'1').toLowerCase());
+async function fxDailyCheck(){
+  if(!FX_DAILY)return;
+  try{
+    const r=await api('POST','/api/fx/daily-report',{});
+    if(r?.sent)console.log(`Mensaje diario del cambio enviado a Telegram: 1 € = ${r.rate} ¥ (${r.source}).`);
+  }catch(e){console.warn('Mensaje diario del cambio:',e?.message||e);}
+}
+function scheduleFxDaily(){
+  if(!FX_DAILY)return;
+  const ms=msUntilMadrid(13,30);
+  if(ms>0&&ms<(RUN_BUDGET_MINUTES+10)*60e3){
+    console.log(`Mensaje diario del cambio programado dentro de ${Math.round(ms/60000)} min (13:30, Madrid).`);
+    setTimeout(()=>{fxDailyCheck();},ms+1500).unref();
+  }
+}
 // El presupuesto de RUN_BUDGET_MINUTES empieza a contar tras esa espera.
 let budgetStartedAt=workerStartedAt;
 const elapsedMinutes=()=>(Date.now()-budgetStartedAt)/60000;
@@ -263,6 +283,8 @@ try{
   let cycle=0;
   while(true){
     cycle++;
+    await fxDailyCheck();
+    if(cycle===1)scheduleFxDaily();
     const cycleStartedAt=Date.now();
     if(cycle>1)budgetStartedAt=cycleStartedAt;
     await xianyuBlockMinutes();

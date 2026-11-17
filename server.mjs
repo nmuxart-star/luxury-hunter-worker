@@ -11,13 +11,15 @@ import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
-import {sameModelRows,sameMaterialRows} from './scripts/vestiaire-model.mjs';
+import {sameModelRows,sameMaterialRows,materialClass} from './scripts/vestiaire-model.mjs';
 import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
 import {descTokens,descIndex,descScore,refSheetDoubt} from './scripts/ref-retrieval.mjs';
 import {MATCH_VERSION,refCandidates,refTable,refValue,priceFromRefs,combinePrices,decideFromNumbers} from './scripts/reference-match.mjs';
 import {yahooAuctionImageUrl} from './scripts/yahoo-auction-image.mjs';
 import {radarPrioritize,radarBuildList,radarParseWeights,radarYieldFactors,radarRowsFor,radarPriceBand} from './scripts/radar-priority.mjs';
 import {picksByInterest,capByInterest,pageIsSaturated,mergeUniqueById} from './scripts/interest-pick.mjs';
+import {fetchRevolutRate,fxDailyMessage,madridParts,madridAfter} from './scripts/fx-revolut.mjs';
+import {SUMMARY_TAB,parseSummaryValues,lookupSummary,priceForMargin} from './scripts/sheet-summary.mjs';
 import {macOneMapReady,macOneMapSnapshot,macXianyuSearch} from './scripts/onemap-mac-client.mjs';
 // Precio pedido × 0,90 = lo que de verdad se acaba vendiendo (referencias de Vestiaire).
 const VESTIAIRE_LIVE_REALIZATION=0.90;
@@ -354,7 +356,8 @@ const DEFAULT_ECONOMICS = {
   lowValueDutyFlatEur: 3,
   // Gestión aduanera: 25 € fijos en cada importación (lo que cobran a Nil, 07-11-2026).
   sources: {
-    xianyu: { label:'Xianyu / China', domesticShippingEur:5, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0, paymentFeePercent:3, verificationFeeCny:80 },
+    // 14-11-2026 (Nil): sin envío interno en China, sin comisión de agente; verificación 79 ¥; Alipay 3 % del producto; arancel, IVA y gestión de aduana como estaban.
+    xianyu: { label:'Xianyu / China', domesticShippingEur:0, agentFeePercent:0, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0, paymentFeePercent:3, verificationFeeCny:79 },
     bunjang: { label:'Bunjang / Corea', domesticShippingEur:4, agentFeePercent:5, agentFeeFixedEur:0, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0 },
     buyee: { label:'Japón', domesticShippingEur:8, agentFeePercent:0, agentFeeFixedEur:5, internationalShippingEur:30, customsDutyPercent:3, clearanceFeeEur:25, authenticationFeeEur:0, otherEur:0 },
     // One Map: ¥500 de servicio, envío nacional/internacional estimado,
@@ -398,11 +401,21 @@ function mergeEconomics(input={}){
   }
   return out;
 }
-function getEconomics(){ return mergeEconomics(getSetting('economics', DEFAULT_ECONOMICS)); }
+const ECONOMICS_VERSION=2;
+function getEconomics(){
+  const stored=getSetting('economics',null);
+  const merged=mergeEconomics(stored||DEFAULT_ECONOMICS);
+  // Una configuración guardada antes de la corrección de costes de Xianyu (v2) los pisaría con los valores viejos: se corrigen una vez.
+  if(stored&&Number(stored._v)!==ECONOMICS_VERSION){
+    for(const k of ['domesticShippingEur','agentFeePercent','agentFeeFixedEur','paymentFeePercent','verificationFeeCny'])merged.sources.xianyu[k]=DEFAULT_ECONOMICS.sources.xianyu[k];
+    try{saveSetting('economics',{...merged,_v:ECONOMICS_VERSION});}catch{}
+  }
+  return merged;
+}
 function saveEconomics(value){
   const clean=mergeEconomics(value);
   const now=new Date().toISOString();
-  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('economics',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify(clean),now);
+  db.prepare(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('economics',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`).run(JSON.stringify({...clean,_v:ECONOMICS_VERSION}),now);
   return clean;
 }
 function roundMoney(n){ return Math.round((Number(n)+Number.EPSILON)*100)/100; }
@@ -648,6 +661,74 @@ function upsertListing(x, sessionId=null, sourceQuery='') {
   return row?.id || null;
 }
 
+// CAMBIO DE REVOLUT (Nil, 14-11-2026): el yuan se convierte con el cambio de Revolut, leído cada vez que arranca una tarea (como mucho
+// cada FX_REVOLUT_MIN_AGE_MIN minutos, 5, para no abrir la página en cada arranque simultáneo). Si Revolut no responde se queda el último
+// cambio de Revolut guardado (hasta 36 h) y, si no, el del BCE. FX_REVOLUT=0 lo apaga.
+let revolutFxPromise=null;
+async function refreshRevolutFx({force=false}={}){
+  if(['0','off','false','no'].includes(String(process.env.FX_REVOLUT??'1').toLowerCase()))return {rate:null,source:'BCE',off:true};
+  const fallback=failed=>{
+    const row=db.prepare('SELECT per_eur,source,updated_at FROM fx_rates WHERE currency=?').get('CNY');
+    return {rate:row?.per_eur||null,source:row?.source==='Revolut'?'Revolut (último guardado)':'BCE',failed:!!failed};
+  };
+  const st=getSetting('fx_revolut',null);
+  if(!force&&st?.rate&&Date.now()-Date.parse(st.at)<Number(process.env.FX_REVOLUT_MIN_AGE_MIN??5)*60e3)return {rate:st.rate,source:'Revolut',cached:true};
+  // Tras un fallo no se insiste durante 10 min (cada intento puede costar hasta 45 s).
+  const fail=getSetting('fx_revolut_fail',null);
+  if(!force&&fail?.at&&Date.now()-Date.parse(fail.at)<10*60e3)return fallback(true);
+  if(revolutFxPromise)return revolutFxPromise;
+  revolutFxPromise=(async()=>{
+    try{
+      const browser=await getBunjangPublicationBrowser();
+      const got=await Promise.race([fetchRevolutRate(browser),new Promise((_,rej)=>setTimeout(()=>rej(new Error('tiempo agotado')),45000))]);
+      db.prepare(`INSERT INTO fx_rates(currency, per_eur, source, updated_at) VALUES('CNY',?,?,?)
+        ON CONFLICT(currency) DO UPDATE SET per_eur=excluded.per_eur, source=excluded.source, updated_at=excluded.updated_at`).run(got.rate,'Revolut',got.at);
+      saveSetting('fx_revolut',{rate:got.rate,at:got.at});
+      saveSetting('fx_revolut_fail',null);
+      console.log(`Cambio de Revolut: 1 € = ${got.rate} ¥.`);
+      return {rate:got.rate,source:'Revolut'};
+    }catch(e){
+      console.warn('Cambio de Revolut no disponible:',e.message);
+      saveSetting('fx_revolut_fail',{at:new Date().toISOString(),error:String(e.message).slice(0,160)});
+      return {...fallback(true),error:e.message};
+    }finally{revolutFxPromise=null;}
+  })();
+  return revolutFxPromise;
+}
+// Mensaje diario de Telegram (13:30, hora de Madrid) con el cambio yuan → euro y si ha subido o bajado respecto al día anterior.
+async function sendDailyFxReport({force=false}={}){
+  const now=Date.now(),mp=madridParts(now);
+  if(!force){
+    if(!madridAfter(13,30,now))return {sent:false,reason:'todavía no son las 13:30'};
+    if((getSetting('fx_daily',{})||{}).sentDate===mp.date)return {sent:false,reason:'ya enviado hoy'};
+    // Pasadas las 16:30 no se manda un mensaje «de las 13:30» a deshora, pero se guarda el cambio de hoy para poder comparar mañana.
+    if(mp.hour>16||(mp.hour===16&&mp.minute>=30)){
+      const hist=getSetting('fx_daily_history',{})||{};
+      if(!hist[mp.date]){
+        const got=await refreshRevolutFx().catch(()=>null);
+        if(got?.rate>0&&String(got.source).startsWith('Revolut')){hist[mp.date]=got.rate;saveSetting('fx_daily_history',hist);}
+      }
+      return {sent:false,reason:'fuera de hora (pasadas las 16:30): se salta hoy',baseline:!!(getSetting('fx_daily_history',{})||{})[mp.date]};
+    }
+  }
+  if(!telegramConfigured())return {sent:false,reason:'telegram-not-configured'};
+  const got=await refreshRevolutFx({force:true});
+  if(!(got.rate>0))return {sent:false,reason:'sin cambio disponible'};
+  const hist=getSetting('fx_daily_history',{})||{};
+  const prevDate=Object.keys(hist).filter(d=>d<mp.date).sort().pop();
+  const time=`${String(mp.hour).padStart(2,'0')}:${String(mp.minute).padStart(2,'0')}`;
+  const text=fxDailyMessage({today:{rate:got.rate,date:mp.date,time},prev:prevDate?{rate:hist[prevDate],date:prevDate}:null,
+    source:got.source,note:got.failed?'Revolut no respondió':''});
+  const r=await telegramSend(text,null,{noPreview:true});
+  if(r?.sent){
+    hist[mp.date]=got.rate;
+    for(const d of Object.keys(hist).sort().slice(0,-20))delete hist[d];
+    saveSetting('fx_daily_history',hist);
+    saveSetting('fx_daily',{sentDate:mp.date,at:new Date().toISOString(),rate:got.rate});
+  }
+  return {sent:!!r?.sent,rate:got.rate,source:got.source,prev:prevDate||null};
+}
+
 async function updateFx() {
   const r = await fetch('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml');
   if (!r.ok) throw new Error(`ECB HTTP ${r.status}`);
@@ -658,6 +739,10 @@ async function updateFx() {
   for (const currency of wanted) {
     const m = xml.match(new RegExp(`currency=['"]${currency}['"]\\s+rate=['"]([^'"]+)['"]`));
     if (!m) continue;
+    if (currency === 'CNY') {
+      const cur = db.prepare('SELECT source,updated_at FROM fx_rates WHERE currency=?').get('CNY');
+      if (cur?.source === 'Revolut' && Date.now() - Date.parse(cur.updated_at) < 36 * 3600e3) continue;   // el de Revolut manda
+    }
     db.prepare(`INSERT INTO fx_rates(currency, per_eur, source, updated_at) VALUES(?,?,?,?)
       ON CONFLICT(currency) DO UPDATE SET per_eur=excluded.per_eur, source=excluded.source, updated_at=excluded.updated_at`)
       .run(currency, Number(m[1]), 'ECB', now);
@@ -3999,7 +4084,10 @@ async function loadVestiaireSheet(){
   }catch(e){console.warn('Hoja de Vestiaire: sin fotos',e.message);}
   const today=new Date().toISOString().slice(0,10);
   const tasks={};
+  let summary=[];
   (j.valueRanges||[]).forEach((vr,i)=>{
+    // La pestaña «Resumen» (primera de la hoja) no tiene fichas: es el resumen de precios por modelo, variante, material y color.
+    if(tabs[i].t===SUMMARY_TAB){summary=parseSummaryValues(vr.values||[]);return;}
     const parsed=vestiaireSheetTab(vr.values||[],today,fj.valueRanges?.[i]?.values||null);
     if(parsed?.fichas?.length){
       // Preserve both tabs if several names map to the same task.
@@ -4007,7 +4095,7 @@ async function loadVestiaireSheet(){
       tasks[name]={...parsed,tab:tabs[i].t};
     }
   });
-  return {loadedAt:Date.now(),tasks,tabs:tabs.map(x=>x.t)};
+  return {loadedAt:Date.now(),tasks,tabs:tabs.map(x=>x.t),summary};
 }
 async function refreshVestiaireSheet({force=false}={}){
   if(!vestiaireSheetConfigured())return vestiaireSheetCache;
@@ -4020,7 +4108,7 @@ async function refreshVestiaireSheet({force=false}={}){
       vestiaireSheetReadFailed=false;
       vestiaireRefsCache=null;
       const counts=Object.entries(fresh.tasks).map(([k,v])=>`${k} ${v.fichas.length}`).join(', ');
-      console.log(`Hoja de Vestiaire leída: ${counts||'sin pestañas de tareas'}.`);
+      console.log(`Hoja de Vestiaire leída: ${counts||'sin pestañas de tareas'}${fresh.summary?.length?` · Resumen: ${fresh.summary.length} filas`:''}.`);
       clearHealthIssue?.('vestiaire-sheet');
     }catch(e){
       vestiaireSheetReadFailed=true;
@@ -5044,7 +5132,7 @@ async function analyzeByReferences({key,item,task,taskId,analyzeImages,reportPro
     notes:[d.completeness_es,d.condition_grade].filter(Boolean).join(' · ')
   };
   const priceNote=unprofitableAnyway
-    ?`Ni contando como iguales todas las referencias posibles sale rentable: precio de venta realista ${combined?.realistic??combined?.mean} €, beneficio limpio en ${platform.name} ${dec.clean} € (margen ${dec.margin} %).`
+    ?`Ni contando como iguales todas las referencias posibles sale rentable: precio de venta realista ${combined?.realistic??combined?.mean} €, beneficio limpio en ${platform.name} ${dec.clean} € (margen ${dec.margin} %).${summaryTargetNote(item,task)}`
     :combined
     ?`Precio orientativo ${combined.realistic??combined.mean} € con ${combined.n} referencias iguales comprobadas con foto${d.same_colour?.length?` (${d.same_colour.length} del mismo color)`:''} (media ${combined.mean} €, franja ${combined.low}-${combined.high})${d.price_reason_es?`: ${d.price_reason_es}`:''}; beneficio limpio en ${platform.name} ${dec.clean} € · margen ${dec.margin} %.`
     :photoCheck?.error?'No se pudieron comprobar las referencias con fotos: sin precio.'
@@ -5236,7 +5324,8 @@ function radarBandFor(q,task){
       fee:resalePlatform(task.task_name).fee/100,
       minProfit:Number(task.notify_min_profit_eur)||200,
       landedFn:price=>Number(importEconomics({price_eur:price,source:'xianyu',title:q})?.importedTotalEur)||0,
-      taskMin:task.min_eur,taskMax:task.max_eur
+      taskMin:task.min_eur,taskMax:task.max_eur,
+      marginPct:Number(process.env.RADAR_MIN_MARGIN_PCT??30)      // 30 % de beneficio limpio sobre el coste puesto (Nil, 14-11-2026)
     });
   }catch(e){console.warn('Radar: sin banda de precio para',q,e.message);return null;}
 }
@@ -6298,6 +6387,34 @@ function vetoUnverifiableXianyuAnalyses(){
 // PRECIO SIN IA (07-11-2026): si ni vendiéndolo al precio alto de la base de
 // Nil para ese modelo (el 10 % más caro de sus fichas) queda beneficio, no se
 // gasta IA en él. Antes un tercio del gasto se iba en anuncios así.
+// A cuánto tendría que bajar un anuncio para dejar el margen mínimo (TARGET_MARGIN_PCT, 30 % del coste puesto) vendiendo al precio de
+// referencia de la pestaña «Resumen» (el segmento más específico que se conozca del anuncio: variante, material y color por el título).
+function summaryTargetFor(item,task){
+  try{
+    const rows=vestiaireSheetCache?.summary;
+    if(!rows?.length||!task?.task_name||listingAuction(item))return null;
+    const info=baseReferenceRows(task,item);
+    if(!info?.tab)return null;
+    const watch=isWatchTask(task.task_name);
+    const model=/^radar/i.test(info.tab)?(info.model||''):info.tab;
+    const title=`${item.title||''} ${item.description||''}`;
+    const variant=watch?'':(vestiaireSizeLabel(title)||'');
+    const color=(VESTIAIRE_COLOR_RE.find(([,re])=>re.test(title))||[])[0]||'';
+    const mc=watch?null:materialClass(title);
+    const material=mc==='tela'?'Tela / sintético':mc==='exotica'?'Exótico':mc==='piel'?'Piel':'';
+    const hit=lookupSummary(rows,{tipo:watch?'Reloj':'Bolso',model,variant,material,color});
+    if(!hit)return null;
+    const margin=Number(process.env.TARGET_MARGIN_PCT??30);
+    const target=priceForMargin({resale:hit.ref,feePct:resalePlatform(task.task_name).fee,marginPct:margin,
+      landedFn:p=>Number(importEconomics({...item,price_eur:p})?.importedTotalEur)||0});
+    return target>0?{target,ref:hit.ref,n:hit.n,level:hit.level,margin}:null;
+  }catch{return null;}
+}
+function summaryTargetNote(item,task){
+  const t=summaryTargetFor(item,task);
+  if(!t||!(Number(item.price_eur)>t.target))return '';
+  return ` Para un margen del ${t.margin} % sobre el coste tendría que bajar a ${t.target} € (venta de referencia ${t.ref} € · ${t.n} fichas · ${t.level.toLowerCase()}).`;
+}
 function priceCeilingVeto(item,task){
   if(['0','off','false','no'].includes(String(process.env.PRICE_PRESCREEN||'').toLowerCase()))return null;
   let info;try{info=baseReferenceRows(task,item);}catch{return null;}
@@ -6315,7 +6432,7 @@ function priceCeilingVeto(item,task){
   const clean=top*(1-fee)-landed;
   if(clean>=minProfit*0.6)return null;
   return {code:'price_ceiling',term:'precio alto',
-    reasons:[`Precio: ni vendiéndolo al precio alto de las ${vals.length} fichas más parecidas de tu base (${Math.round(top)} €) queda beneficio (${Math.round(clean)} € limpios con un coste puesto de ${Math.round(landed)} €). Descartado sin usar IA.`]};
+    reasons:[`Precio: ni vendiéndolo al precio alto de las ${vals.length} fichas más parecidas de tu base (${Math.round(top)} €) queda beneficio (${Math.round(clean)} € limpios con un coste puesto de ${Math.round(landed)} €). Descartado sin usar IA.${summaryTargetNote(item,task)}`]};
 }
 function storePrescreenReject(taskId,item,pre){
   const now=new Date().toISOString();
@@ -8058,6 +8175,8 @@ async function executeTask(taskId, runId=null, opts={}) {
   return aiCategoryStore.run(isWatchTask(t?.task_name)?'watch':'bag',()=>executeTaskInner(taskId,runId,opts));
 }
 async function executeTaskInner(taskId, runId=null, {fast=false}={}) {
+  // Cambio yuan → euro de Revolut en el momento de arrancar la tarea (máx. 50 s; si falla, sigue con el último).
+  await Promise.race([refreshRevolutFx().catch(()=>{}),sleep(50000)]);
   // Base de datos de Vestiaire de Nil al día antes de analizar (máx. 25 s).
   await Promise.race([refreshVestiaireSheet().catch(()=>{}),sleep(25000)]);
   if(runId && runIsAborted(runId)){
@@ -10333,6 +10452,14 @@ const server=http.createServer(async(req,res)=>{
     const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
     if(req.method==='GET'&&u.pathname==='/api/status') return json(res,200,statusPayload());
     if(req.method==='POST'&&u.pathname==='/api/fx/update') return json(res,200,{updated:await updateFx(),fx:statusPayload().fx});
+    if(u.pathname==='/api/fx/daily-report'&&req.method==='POST'){
+      const body=await readBody(req).catch(()=>({}));
+      try{return json(res,200,await sendDailyFxReport({force:!!body?.force}));}
+      catch(e){return json(res,200,{sent:false,reason:String(e.message||e).slice(0,160)});}
+    }
+    if(u.pathname==='/api/fx'&&req.method==='GET'){
+      return json(res,200,{cny:db.prepare('SELECT * FROM fx_rates WHERE currency=?').get('CNY')||null,revolut:getSetting('fx_revolut',null),fail:getSetting('fx_revolut_fail',null),daily:getSetting('fx_daily',null)});
+    }
     if(req.method==='POST'&&u.pathname==='/api/email/global-digest'){
       const b=await readBody(req);
       return json(res,200,await sendGlobalDigest({
@@ -10633,6 +10760,7 @@ server.listen(PORT,'127.0.0.1',async()=>{
   try{pruneOldData();}catch(e){console.error('Limpieza de la memoria del bot:',e.message);}
   try{vetoUnverifiableXianyuAnalyses();}catch(e){console.error('Xianyu veto:',e.message);}
   try{const n=await updateFx();console.log(`FX updated (${n})`);}catch(e){console.log(`FX update skipped: ${e.message}`);}
+  refreshRevolutFx().catch(()=>{});
   if(vestiaireSheetConfigured())await refreshVestiaireSheet({force:true}).catch(()=>{});
   else console.log('Hoja de Vestiaire no configurada (VESTIAIRE_SHEET_ID + GOOGLE_SHEETS_SA_JSON o GOOGLE_SHEETS_SA_FILE): se usa la copia fija.');
   const schedulerDisabled=String(process.env.DISABLE_SCHEDULER||'').toLowerCase();
