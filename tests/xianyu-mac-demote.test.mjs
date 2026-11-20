@@ -1,35 +1,31 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import {noteMacVerification,isMacDemoted,tickMacDemote,DEMOTE_DEFAULTS} from '../scripts/xianyu-mac-demote.mjs';
+import {noteMacVerification,macDemoteActive,expireMacDemote,DEMOTE_DEFAULTS} from '../scripts/xianyu-mac-demote.mjs';
 const H=3600e3,M=60e3;
 test('3 verificaciones en menos de 3 h degradan el Mac',()=>{
-  let s=noteMacVerification(null,0);s=noteMacVerification(s,60*M);assert.equal(isMacDemoted(s),false);
-  s=noteMacVerification(s,150*M);assert.equal(isMacDemoted(s),true);
+  let s=noteMacVerification(null,0);s=noteMacVerification(s,60*M);assert.equal(macDemoteActive(s,60*M),false);
+  s=noteMacVerification(s,150*M);assert.equal(macDemoteActive(s,150*M),true);
 });
 test('3 verificaciones repartidas en más de 3 h no degradan',()=>{
   let s=noteMacVerification(null,0);s=noteMacVerification(s,2*H);s=noteMacVerification(s,4*H);
-  assert.equal(isMacDemoted(s),false);assert.equal(s.events.length,2);
+  assert.equal(macDemoteActive(s,4*H),false);assert.equal(s.events.length,2);
 });
 test('la misma verificación en varias búsquedas seguidas cuenta una vez',()=>{
   let s=noteMacVerification(null,0);s=noteMacVerification(s,2*M);s=noteMacVerification(s,5*M);
-  assert.equal(s.events.length,1);assert.equal(isMacDemoted(s),false);
+  assert.equal(s.events.length,1);
 });
-test('se recupera tras 4 h de bot en la nube con el Mac conectado',()=>{
-  let s=noteMacVerification(null,0);s=noteMacVerification(s,30*M);s=noteMacVerification(s,60*M);assert.equal(isMacDemoted(s),true);
-  let t=2*H;s=tickMacDemote(s,{now:t,macConnected:true,routeIsCloud:true});
-  for(let i=0;i<15;i++){t+=15*M;s=tickMacDemote(s,{now:t,macConnected:true,routeIsCloud:true});}
-  assert.equal(isMacDemoted(s),true);          // 3 h 45 min: todavía no
-  t+=15*M;s=tickMacDemote(s,{now:t,macConnected:true,routeIsCloud:true});t+=15*M;s=tickMacDemote(s,{now:t,macConnected:true,routeIsCloud:true});
-  assert.equal(isMacDemoted(s),false);
-});
-test('con el Mac apagado o sin buscar en la nube no se cuenta tiempo',()=>{
+test('caduca solo: 2 h de espera + 4 h en la nube desde la tercera verificación',()=>{
   let s=noteMacVerification(null,0);s=noteMacVerification(s,30*M);s=noteMacVerification(s,60*M);
-  let t=2*H;for(let i=0;i<40;i++){t+=15*M;s=tickMacDemote(s,{now:t,macConnected:false,routeIsCloud:true});}
-  assert.equal(isMacDemoted(s),true);assert.equal(s.demote.cloudMs,0);
-  for(let i=0;i<40;i++){t+=15*M;s=tickMacDemote(s,{now:t,macConnected:true,routeIsCloud:false});}
-  assert.equal(s.demote.cloudMs,0);
+  const t0=60*M;
+  assert.equal(macDemoteActive(s,t0+5.9*H),true);
+  assert.equal(macDemoteActive(s,t0+6.01*H),false);
+  assert.equal(expireMacDemote(s,t0+7*H).demote,null);
+  assert.notEqual(expireMacDemote(s,t0+1*H).demote,null);
 });
-test('un hueco largo entre llamadas solo suma 15 min',()=>{
+test('tras caducar, nuevas verificaciones vuelven a contar desde cero',()=>{
   let s=noteMacVerification(null,0);s=noteMacVerification(s,30*M);s=noteMacVerification(s,60*M);
-  s=tickMacDemote(s,{now:2*H,macConnected:true,routeIsCloud:true});s=tickMacDemote(s,{now:10*H,macConnected:true,routeIsCloud:true});
-  assert.equal(s.demote.cloudMs,DEMOTE_DEFAULTS.tickMaxMs);
+  s=expireMacDemote(s,10*H);assert.equal(s.demote,null);
+  s=noteMacVerification(s,10*H);assert.equal(macDemoteActive(s,10*H),false);
+});
+test('ajustes por entorno',()=>{
+  assert.equal(DEMOTE_DEFAULTS.verifs,3);assert.equal(DEMOTE_DEFAULTS.switchMs,2*H);assert.equal(DEMOTE_DEFAULTS.recoverMs,4*H);
 });

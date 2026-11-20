@@ -10,7 +10,7 @@ import { load as loadHtml } from 'cheerio';
 import nodemailer from 'nodemailer';
 import {xianyuAccountFiles,availableXianyuAccounts,accountLabel,tryXianyuAccounts} from './scripts/xianyu-account-pool.mjs';
 import {extractXianyuTags,hasXianyuVerificationTag,xianyuListingHasVerificationTag} from './scripts/xianyu-verification.mjs';
-import {noteMacVerification,isMacDemoted,tickMacDemote,demoteFromEnv} from './scripts/xianyu-mac-demote.mjs';
+import {noteMacVerification,macDemoteActive,expireMacDemote,demoteFromEnv} from './scripts/xianyu-mac-demote.mjs';
 import {oneMapSearchUrl,parseOneMapAuctions,parseOneMapDetail,oneMapJsonCards} from './scripts/onemap-auctions.mjs';
 import {sameModelRows,sameMaterialRows,materialClass} from './scripts/vestiaire-model.mjs';
 import {compWeight,refAgeDays} from './scripts/vestiaire-bag-match.mjs';
@@ -2142,8 +2142,8 @@ function xianyuCalendarDecide({cloudDay,macReady,macHold,cloudBlocked,last,now=D
 }
 // ── Degradar el Mac (regla de Nil, 20-11-2026) ──────────────────────────────────────────────
 // 3 verificaciones en el Chrome del Mac en ~3 h (Nil lo está usando) → el bot pasa a la nube aunque el Mac esté encendido
-// (con la transición de IP de XIANYU_SWITCH_HOURS = 2 h) y así sigue hasta que haya buscado ~4 h desde la nube con el Mac
-// conectado. Ajustes: XIANYU_MAC_DEMOTE_VERIFS (3), XIANYU_MAC_DEMOTE_WINDOW_H (3), XIANYU_MAC_RECOVER_H (4); XIANYU_MAC_DEMOTE=0 lo apaga.
+// (con la transición de IP de XIANYU_SWITCH_HOURS = 2 h) y pasadas XIANYU_MAC_RECOVER_H (4) h más se vuelve a comprobar si el Mac
+// está encendido. Todo lo demás funciona como siempre. Ajustes: XIANYU_MAC_DEMOTE_VERIFS (3), XIANYU_MAC_DEMOTE_WINDOW_H (3); XIANYU_MAC_DEMOTE=0 lo apaga.
 const xianyuMacDemoteOn=()=>String(process.env.XIANYU_MAC_DEMOTE??'1')!=='0';
 const xianyuMacDemoteState=()=>getSetting('xianyu_mac_demote',null)||{events:[],demote:null};
 function xianyuMacDemoteNote(){
@@ -2152,7 +2152,7 @@ function xianyuMacDemoteNote(){
     const before=xianyuMacDemoteState();
     const st=noteMacVerification(before,Date.now(),demoteFromEnv());
     saveSetting('xianyu_mac_demote',st);
-    if(isMacDemoted(st)&&!isMacDemoted(before))console.log(`Xianyu: ${st.events.length} verificaciones en el Mac en poco tiempo; el bot pasa a la nube aunque el Mac esté encendido hasta que lleve unas horas buscando sin problemas.`);
+    if(macDemoteActive(st)&&!macDemoteActive(before))console.log(`Xianyu: ${st.events.length} verificaciones en el Mac en poco tiempo; el bot salta a la nube (tras la espera de ${Math.round(demoteFromEnv().switchMs/3600e3)} h) y volverá a comprobar el Mac pasadas unas horas.`);
   }catch(e){console.log('Xianyu: no se pudo apuntar la verificación del Mac:',e.message);}
 }
 let xianyuCalendarNote='';
@@ -2169,17 +2169,13 @@ async function xianyuCalendarRoute(){
   // XIANYU_MAC_FORCE_CLOUD_UNTIL (ISO): fuerza el bot en la nube hasta esa hora (orden manual de Nil), con o sin verificaciones previas.
   const forceUntil=Date.parse(String(process.env.XIANYU_MAC_FORCE_CLOUD_UNTIL||'').trim());
   const forced=Number.isFinite(forceUntil)&&Date.now()<forceUntil;
-  const demoted=forced||(!!dem&&isMacDemoted(dem));
+  const demoted=forced||macDemoteActive(dem);
   // Degradado: el Mac no es prioritario salvo que la nube no pueda buscar (entonces es mejor el Mac que nada).
   if(demoted&&!cloudBlocked)macReady=false;
   const d=xianyuCalendarDecide({cloudDay:xianyuCloudDay(),macReady,macHold,cloudBlocked,last:getSetting('xianyu_ip_route',null)});
   xianyuCalendarNote=[d.note,demoted?'Mac degradado por verificaciones repetidas: el bot sale por la nube':''].filter(Boolean).join(' · ');
-  if(demoted&&dem&&isMacDemoted(dem)){
-    try{
-      const next=tickMacDemote(dem,{now:Date.now(),macConnected,routeIsCloud:d.route==='cloud'},demoteFromEnv());
-      saveSetting('xianyu_mac_demote',next);
-      if(!isMacDemoted(next))console.log('Xianyu: el bot ya lleva unas horas buscando desde la nube con el Mac conectado; el Mac vuelve a tener prioridad.');
-    }catch{}
+  if(dem&&dem.demote&&!macDemoteActive(dem)){
+    try{saveSetting('xianyu_mac_demote',expireMacDemote(dem));console.log('Xianyu: han pasado unas horas desde las verificaciones del Mac; se vuelve a comprobar si el Mac está encendido.');}catch{}
   }
   return d.route;
 }
