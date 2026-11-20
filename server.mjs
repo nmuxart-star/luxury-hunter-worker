@@ -2166,12 +2166,15 @@ async function xianyuCalendarRoute(){
     !!(xianyuPausedReason&&Date.now()-xianyuPausedAt<=xianyuPauseLen)||
     !!xianyuDirectSessionBlock();
   const dem=xianyuMacDemoteOn()?xianyuMacDemoteState():null;
-  const demoted=!!dem&&isMacDemoted(dem);
+  // XIANYU_MAC_FORCE_CLOUD_UNTIL (ISO): fuerza el bot en la nube hasta esa hora (orden manual de Nil), con o sin verificaciones previas.
+  const forceUntil=Date.parse(String(process.env.XIANYU_MAC_FORCE_CLOUD_UNTIL||'').trim());
+  const forced=Number.isFinite(forceUntil)&&Date.now()<forceUntil;
+  const demoted=forced||(!!dem&&isMacDemoted(dem));
   // Degradado: el Mac no es prioritario salvo que la nube no pueda buscar (entonces es mejor el Mac que nada).
   if(demoted&&!cloudBlocked)macReady=false;
   const d=xianyuCalendarDecide({cloudDay:xianyuCloudDay(),macReady,macHold,cloudBlocked,last:getSetting('xianyu_ip_route',null)});
   xianyuCalendarNote=[d.note,demoted?'Mac degradado por verificaciones repetidas: el bot sale por la nube':''].filter(Boolean).join(' · ');
-  if(demoted){
+  if(demoted&&dem&&isMacDemoted(dem)){
     try{
       const next=tickMacDemote(dem,{now:Date.now(),macConnected,routeIsCloud:d.route==='cloud'},demoteFromEnv());
       saveSetting('xianyu_mac_demote',next);

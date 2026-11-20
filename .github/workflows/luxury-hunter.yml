@@ -101,6 +101,8 @@ jobs:
       # Mac si está encendido; si no, la nube. 2 h de transición al cambiar de IP (XIANYU_SWITCH_HOURS).
       XIANYU_CLOUD_DAYS: ${{ vars.XIANYU_CLOUD_DAYS || 'all' }}
       XIANYU_SWITCH_HOURS: ${{ vars.XIANYU_SWITCH_HOURS || '2' }}
+      XIANYU_MAC_FORCE_CLOUD_UNTIL: ${{ vars.XIANYU_MAC_FORCE_CLOUD_UNTIL || '' }}
+      XIANYU_MAC_DEMOTE: ${{ vars.XIANYU_MAC_DEMOTE || '1' }}
       # Ritmo que se autorregula: empieza a medias y sube con las búsquedas buenas; baja con cada verificación.
       XIANYU_RATE_START: ${{ vars.XIANYU_RATE_START || '0.8' }}
       XIANYU_RATE_MIN: ${{ vars.XIANYU_RATE_MIN || '0.25' }}
